@@ -1,0 +1,31 @@
+{
+  "page_number": 75,
+  "detected_numbers": [
+    5
+  ],
+  "classification": "single-divider",
+  "accepted": true,
+  "confidence": 0.85,
+  "reasons": [
+    "low word count (3)",
+    "moderate drawing count (26)",
+    "visually sparse page (dark ratio 0.102)",
+    "image count boost (31)",
+    "no quantity markers",
+    "resolved bag number 5 after dropping page number 75"
+  ],
+  "dark_pixel_ratio": 0.102,
+  "text_excerpt": "5\n75\n75",
+  "word_count": 3,
+  "drawing_count": 26,
+  "image_count": 31,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/bag_start/21325_21325_01_candidate_page_075.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21325/21325_01/pages/page_075.png",
+  "review": {
+    "label": "bag_start",
+    "action": "copy",
+    "reviewed_at": "2026-04-14T18:21:55.362511+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21325/21325_01/candidates/candidate_page_075.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21325/21325_01/candidates/candidate_page_075.png"
+  }
+}

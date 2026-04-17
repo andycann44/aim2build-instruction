@@ -1,0 +1,36 @@
+{
+  "page_number": 426,
+  "detected_numbers": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "classification": "overview",
+  "accepted": false,
+  "confidence": 0.55,
+  "reasons": [
+    "contains 4 bag-like numbers",
+    "contains ascending run of 4",
+    "low word count (22)",
+    "moderate drawing count (47)",
+    "visually sparse page (dark ratio 0.094)",
+    "image count boost (25)",
+    "contains quantity markers typical of step pages",
+    "rejected by tightened overview gate"
+  ],
+  "dark_pixel_ratio": 0.0939,
+  "text_excerpt": "2x\n2x\n4x\n4x\n2x\n2x\n2x\n2x\n2x\n2x\n585\n585\n1\n2\n3\n4\n2x\n2x\n2x\n2x\n426\n426",
+  "word_count": 22,
+  "drawing_count": 47,
+  "image_count": 25,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/normal_step/21330_21330_01_candidate_page_426.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages/page_426.png",
+  "review": {
+    "label": "normal_step",
+    "action": "copy",
+    "reviewed_at": "2026-03-27T18:33:27.156398+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_426.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_426.png"
+  }
+}

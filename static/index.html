@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LEGO PDF Reader</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">LEGO Manual Reader</p>
+        <h1>Download first, then read locally.</h1>
+        <p class="intro">
+          Paste a LEGO-hosted PDF link and this reader will save it to the project before opening it in the browser.
+        </p>
+        <div class="quick-links">
+          <a class="chip-link" href="/debug-viewer">Open Candidate Debug Viewer</a>
+        </div>
+      </section>
+
+      <section class="panel controls">
+        <form id="download-form">
+          <label for="pdf-url">LEGO PDF URL</label>
+          <div class="input-row">
+            <input
+              id="pdf-url"
+              name="pdf-url"
+              type="url"
+              placeholder="https://www.lego.com/cdn/product-assets/product.bi.core.pdf/..."
+              required
+            />
+            <button type="submit">Download &amp; Open</button>
+          </div>
+        </form>
+
+        <div class="status-wrap">
+          <p id="status" class="status idle">Waiting for a LEGO PDF URL.</p>
+          <a id="open-link" class="link hidden" href="#" target="_blank" rel="noreferrer">Open PDF in new tab</a>
+        </div>
+      </section>
+
+      <section class="panel viewer-panel">
+        <div class="viewer-header">
+          <div>
+            <p class="viewer-label">Local Preview</p>
+            <h2 id="viewer-title">No PDF loaded yet</h2>
+          </div>
+        </div>
+        <iframe id="viewer" title="PDF viewer"></iframe>
+      </section>
+    </main>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

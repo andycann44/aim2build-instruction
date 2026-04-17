@@ -1,0 +1,31 @@
+{
+  "page_number": 104,
+  "detected_numbers": [
+    7,
+    8,
+    9,
+    10
+  ],
+  "classification": "bag-start-like",
+  "accepted": false,
+  "confidence": 0.5,
+  "reasons": [
+    "low word count (7)",
+    "moderate drawing count (22)",
+    "no quantity markers"
+  ],
+  "dark_pixel_ratio": 0.1151,
+  "text_excerpt": "7\n8\n9\n10\n10\n104\n104",
+  "word_count": 7,
+  "drawing_count": 22,
+  "image_count": 14,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/normal_step/21330_21330_01_candidate_page_104.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages/page_104.png",
+  "review": {
+    "label": "normal_step",
+    "action": "copy",
+    "reviewed_at": "2026-03-27T18:31:09.689759+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_104.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_104.png"
+  }
+}

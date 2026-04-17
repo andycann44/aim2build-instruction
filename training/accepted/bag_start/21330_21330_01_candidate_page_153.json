@@ -1,0 +1,41 @@
+{
+  "page_number": 153,
+  "detected_numbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    9
+  ],
+  "classification": "bag-start-like",
+  "accepted": true,
+  "confidence": 0.95,
+  "reasons": [
+    "rejected: contains quantity markers",
+    "strong bag badge detected (0.950) -> promoted to bag start",
+    "top-left bag badge score 0.950 (+0.10)"
+  ],
+  "dark_pixel_ratio": 0.1381,
+  "bag_badge_score": 0.95,
+  "bag_badge_reasons": [
+    "top-left outer rectangle found",
+    "nested inner rectangle found",
+    "compact badge-like structure found",
+    "possible connector shape near badge"
+  ],
+  "text_excerpt": "2x\n2x\n2x\n2x\n1x1x\n1x1x\n3x\n3x\n1x1x\n1x1x\n4x\n4x\n185\n185\n1\n2\n3\n4\n5\n6\n9\n153\n153",
+  "word_count": 23,
+  "drawing_count": 73,
+  "image_count": 41,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/bag_start/21330_21330_01_candidate_page_153.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages/page_153.png",
+  "review": {
+    "label": "bag_start",
+    "action": "copy",
+    "reviewed_at": "2026-04-15T11:39:53.847284+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_153.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_153.png"
+  }
+}

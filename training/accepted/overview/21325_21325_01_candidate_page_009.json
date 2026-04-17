@@ -1,0 +1,45 @@
+{
+  "page_number": 9,
+  "detected_numbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "classification": "overview",
+  "accepted": true,
+  "confidence": 0.95,
+  "reasons": [
+    "contains 14 bag-like numbers",
+    "contains ascending run of 14",
+    "low word count (20)",
+    "moderate drawing count (112)",
+    "image count boost (261)",
+    "no quantity markers",
+    "accepted with tightened overview gate"
+  ],
+  "dark_pixel_ratio": 0.2784,
+  "text_excerpt": "1\n3\n2\n4\n5\n9\n11\n0\n10\n2\n12\n4\n14\n14\n3\n13\n6\n8\n7\n9",
+  "word_count": 20,
+  "drawing_count": 112,
+  "image_count": 261,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/overview/21325_21325_01_candidate_page_009.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21325/21325_01/pages/page_009.png",
+  "review": {
+    "label": "overview",
+    "action": "copy",
+    "reviewed_at": "2026-04-14T18:21:46.547951+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21325/21325_01/candidates/candidate_page_009.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21325/21325_01/candidates/candidate_page_009.png"
+  }
+}

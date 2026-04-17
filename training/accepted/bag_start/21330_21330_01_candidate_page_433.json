@@ -1,0 +1,42 @@
+{
+  "page_number": 433,
+  "detected_numbers": [
+    24
+  ],
+  "classification": "single-divider",
+  "accepted": true,
+  "confidence": 0.85,
+  "reasons": [
+    "low word count (4)",
+    "moderate drawing count (23)",
+    "visually sparse page (dark ratio 0.089)",
+    "image count boost (30)",
+    "no quantity markers",
+    "resolved bag number 24 after dropping page number 433"
+  ],
+  "dark_pixel_ratio": 0.0893,
+  "bag_badge_score": 0.45,
+  "bag_badge_reasons": [
+    "outer white frame found",
+    "small sticker-like box rejected"
+  ],
+  "bag_icon_score": 0.85,
+  "bag_icon_reasons": [
+    "outer white frame found",
+    "inner bag-like region found",
+    "arrow/connector-like contour found nearby"
+  ],
+  "text_excerpt": "24\n24\n433\n433",
+  "word_count": 4,
+  "drawing_count": 23,
+  "image_count": 30,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/bag_start/21330_21330_01_candidate_page_433.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages/page_433.png",
+  "review": {
+    "label": "bag_start",
+    "action": "copy",
+    "reviewed_at": "2026-04-15T19:45:46.873372+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_433.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_433.png"
+  }
+}

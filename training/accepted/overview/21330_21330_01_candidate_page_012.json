@@ -1,0 +1,45 @@
+{
+  "page_number": 12,
+  "detected_numbers": [
+    7,
+    8,
+    9,
+    12,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24
+  ],
+  "classification": "overview",
+  "accepted": true,
+  "confidence": 0.99,
+  "reasons": [
+    "contains 12 bag-like numbers",
+    "contains ascending run of 8",
+    "low word count (17)",
+    "moderate drawing count (69)",
+    "visually sparse page (dark ratio 0.101)",
+    "image count boost (133)",
+    "no quantity markers",
+    "accepted with tightened overview gate"
+  ],
+  "dark_pixel_ratio": 0.1005,
+  "text_excerpt": "24\n24\n7\n17\n8\n18\n9\n19\n20\n20\n21\n22\n22\n23\n23\n12\n12",
+  "word_count": 17,
+  "drawing_count": 69,
+  "image_count": 133,
+  "image_path": "/Users/olly/aim2build-instruction/training/accepted/overview/21330_21330_01_candidate_page_012.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages/page_012.png",
+  "reviewed_expected_bags": [],
+  "review": {
+    "label": "overview",
+    "action": "copy",
+    "reviewed_at": "2026-04-14T18:17:24.310517+00:00",
+    "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_012.json",
+    "source_candidate_image": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_012.png"
+  }
+}
