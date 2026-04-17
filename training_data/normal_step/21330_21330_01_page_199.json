@@ -1,0 +1,12 @@
+{
+  "set_num": "21330",
+  "pdf_name": "21330_01",
+  "page_number": 199,
+  "label": "normal_step",
+  "image_path": "/Users/olly/aim2build-instruction/training_data/normal_step/21330_21330_01_page_199.png",
+  "top_left_crop_path": "/Users/olly/aim2build-instruction/training_data/normal_step/21330_21330_01_page_199_top_left.png",
+  "top_right_crop_path": "/Users/olly/aim2build-instruction/training_data/normal_step/21330_21330_01_page_199_top_right.png",
+  "top_center_crop_path": "/Users/olly/aim2build-instruction/training_data/normal_step/21330_21330_01_page_199_top_center.png",
+  "source_image_path": "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages/page_199.png",
+  "source_candidate_json": "/Users/olly/aim2build-instruction/debug/21330/21330_01/candidates/candidate_page_199.json"
+}

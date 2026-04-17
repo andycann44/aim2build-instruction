@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Candidate Debug Viewer</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Candidate Review</p>
+        <h1>Review grouped bag evidence.</h1>
+        <p class="intro">
+          Browse exported candidate snippets and the current grouped review output, including confirmed starts,
+          overview pages, and missing-bag candidates.
+        </p>
+        <div class="quick-links">
+          <a class="chip-link" href="/">Back to PDF Reader</a>
+        </div>
+      </section>
+
+      <section class="panel controls debug-controls">
+        <div class="debug-toolbar">
+          <label class="control-field" for="set-select">
+            <span>Set</span>
+            <select id="set-select"></select>
+          </label>
+          <label class="control-field" for="pdf-select">
+            <span>PDF</span>
+            <select id="pdf-select"></select>
+          </label>
+          <button id="load-candidates" type="button">Load Review</button>
+        </div>
+        <p id="debug-status" class="status idle">Loading debug folders...</p>
+      </section>
+
+      <section id="manual-review-panel" class="panel review-section manual-review-panel">
+        <div class="review-section-header">
+          <div>
+            <p class="viewer-label">Manual Labeling</p>
+            <h2>Label and advance through review pages</h2>
+          </div>
+        </div>
+        <div id="manual-review-shell" class="manual-review-shell"></div>
+      </section>
+
+      <section id="review-summary" class="review-summary"></section>
+      <section id="review-sections" class="review-sections"></section>
+
+      <section class="panel raw-candidates-panel">
+        <div class="viewer-header raw-header">
+          <div>
+            <p class="viewer-label">Raw Candidates</p>
+            <h2>All exported candidate pages</h2>
+          </div>
+        </div>
+        <div id="candidate-grid" class="candidate-grid candidate-grid-padded"></div>
+      </section>
+    </main>
+
+    <script src="/assets/debug.js"></script>
+  </body>
+</html>
