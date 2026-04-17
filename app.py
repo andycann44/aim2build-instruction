@@ -466,6 +466,16 @@ def read_bag_number(number_img):
 
     gray = cv2.cvtColor(number_img, cv2.COLOR_BGR2GRAY)
     up = cv2.resize(gray, None, fx=8, fy=8, interpolation=cv2.INTER_CUBIC)
+    up = cv2.GaussianBlur(up, (3, 3), 0)
+    
+    h, w = up.shape
+    cx1 = int(w * 0.25)
+    cx2 = int(w * 0.75)
+    cy1 = int(h * 0.20)
+    cy2 = int(h * 0.80)
+    up = up[cy1:cy2, cx1:cx2]
+
+    up = cv2.GaussianBlur(up, (3, 3), 0)
 
     full_variants = []
 
@@ -491,7 +501,7 @@ def read_bag_number(number_img):
         for c in cnts:
             x, y, w, h = cv2.boundingRect(c)
             area = w * h
-            if area < (W * H) * 0.02:
+            if area < (W * H) * 0.008:
                 continue
             if h < H * 0.35:
                 continue
@@ -530,6 +540,17 @@ def read_bag_number(number_img):
         hits = _ocr_hits_from_images(full_variants, configs)
 
     if not hits:
+        # fallback: try OCR on raw upscaled image directly
+        raw = pytesseract.image_to_string(
+            up,
+            config="--psm 8 -c tessedit_char_whitelist=0123456789"
+        ).strip()
+
+        digits = "".join(ch for ch in raw if ch.isdigit())
+
+        if digits:
+            return int(digits), raw
+
         return None, ""
 
     counts = {}
@@ -539,6 +560,17 @@ def read_bag_number(number_img):
         raw_map[val] = raw
 
     best_val = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+
+    # --- sanity correction for 2 vs 9 ---
+    h, w = gray.shape[:2]
+    bottom_half = gray[int(h * 0.55):, :]
+
+    bottom_dark_ratio = float((bottom_half < 120).sum()) / max(1, bottom_half.size)
+
+    # If OCR says 2 but bottom has strong dark pixels, it's likely a 9.
+    if best_val == 2 and bottom_dark_ratio > 0.12:
+        return 9, raw_map[best_val]
+
     return best_val, raw_map[best_val]
 
 # --------------------------------------------------
@@ -906,55 +938,119 @@ def run_generic_sequence_scan(
     confidence_key="confidence",
     structure_key="strong_structure",
 ):
+    ordered_rows = sorted(
+        rows,
+        key=lambda item: (
+            int(item.get("page", 0) or 0),
+            int(item.get(number_key, -1) or -1),
+        ),
+    )
+
     expected_next = start_number
     accepted = []
     deferred = []
     structure_only_start_candidates = []
+    page_debug_log = []
 
-    for r in rows:
+    for r in ordered_rows:
+        page = int(r.get("page", 0) or 0)
         detected_number = r.get(number_key)
         confidence = float(r.get(confidence_key, 0.0) or 0.0)
         strong_structure = bool(r.get(structure_key))
+        debug_entry = {
+            "page": page,
+            "detected_number": detected_number,
+            "confidence": confidence,
+            "expected_next_before": expected_next,
+            "expected_next_after": expected_next,
+            "strong_structure": strong_structure,
+            "action": "no_number_detected" if detected_number is None else "ignored_non_bag_signal",
+        }
+
+        if detected_number is not None and (detected_number < start_number or detected_number > end_number):
+            debug_entry["action"] = "ignored_out_of_scan_range"
+            page_debug_log.append(debug_entry)
+            continue
 
         if detected_number == expected_next and confidence >= min_confidence:
             accepted.append({
-                "page": r["page"],
+                "page": page,
                 "number": detected_number,
                 "bag_number": detected_number,
                 "confidence": confidence,
                 "reason": "accepted_expected_number",
             })
             expected_next += 1
+            debug_entry["action"] = "accepted_expected_number"
+            debug_entry["expected_next_after"] = expected_next
+            page_debug_log.append(debug_entry)
+            continue
+
+        if detected_number is not None and detected_number == expected_next:
+            deferred.append({
+                "page": page,
+                "number": detected_number,
+                "bag_number": detected_number,
+                "confidence": confidence,
+                "reason": f"deferred_low_confidence_expected_{expected_next}",
+            })
+            debug_entry["action"] = "deferred_low_confidence_expected_number"
+            page_debug_log.append(debug_entry)
+            continue
+
+        if (
+            not accepted
+            and detected_number is None
+            and strong_structure
+            and allow_structure_only_start
+            and expected_next == start_number
+            and confidence >= min_confidence
+        ):
+            structure_only_start_candidates.append({
+                "page": page,
+                "expected_number": start_number,
+                "confidence": confidence,
+                "reason": "strong_structure_no_number_start_candidate",
+            })
+            accepted.append({
+                "page": page,
+                "number": start_number,
+                "bag_number": start_number,
+                "confidence": confidence,
+                "reason": "accepted_from_structure_start_fallback",
+            })
+            expected_next = start_number + 1
+            debug_entry["action"] = "accepted_from_structure_start_fallback"
+            debug_entry["expected_next_after"] = expected_next
+            page_debug_log.append(debug_entry)
             continue
 
         if detected_number is not None and detected_number > expected_next:
             deferred.append({
-                "page": r["page"],
+                "page": page,
                 "number": detected_number,
                 "bag_number": detected_number,
                 "confidence": confidence,
                 "reason": f"deferred_waiting_for_{expected_next}",
             })
+            debug_entry["action"] = "deferred_higher_number_waiting_for_missing_bag"
+            debug_entry["waiting_for"] = expected_next
+            page_debug_log.append(debug_entry)
             continue
 
-        if (
-            detected_number is None and
-            strong_structure and
-            allow_structure_only_start and
-            expected_next == start_number
-        ):
-            structure_only_start_candidates.append({
-                "page": r["page"],
-                "expected_number": start_number,
-                "confidence": confidence,
-                "reason": "strong_structure_no_number_start_candidate",
-            })
+        if detected_number is not None and detected_number < expected_next:
+            debug_entry["action"] = "ignored_already_passed_number"
+            page_debug_log.append(debug_entry)
+            continue
+
+        if detected_number is None:
+            page_debug_log.append(debug_entry)
 
     accepted_numbers = sorted({r["bag_number"] for r in accepted})
     missing = [n for n in range(start_number, end_number + 1) if n not in accepted_numbers]
     expected_next_debug = None
     if expected_next <= end_number:
-        expected_next_debug = build_missing_bag_debug(rows, accepted, deferred, expected_next)
+        expected_next_debug = build_missing_bag_debug(ordered_rows, accepted, deferred, expected_next)
 
     return {
         "accepted_sequence": accepted,
@@ -964,6 +1060,7 @@ def run_generic_sequence_scan(
         "missing_numbers": missing,
         "expected_next": expected_next,
         "expected_next_debug": expected_next_debug,
+        "page_debug_log": page_debug_log,
         "scan_config": {
             "start_number": start_number,
             "end_number": end_number,
@@ -973,8 +1070,8 @@ def run_generic_sequence_scan(
             "confidence_key": confidence_key,
             "structure_key": structure_key,
         },
-        "total_pages": len(rows),
-        "rows": rows,
+        "total_pages": len(ordered_rows),
+        "rows": ordered_rows,
     }
 
 
@@ -994,6 +1091,76 @@ def run_sequential_scan(
     )
 
 
+def compute_bag_ranges(accepted_sequence, last_page):
+    starts = []
+    for item in accepted_sequence:
+        if not isinstance(item, dict):
+            continue
+        page = item.get("page")
+        number = item.get("number", item.get("bag_number"))
+        if not isinstance(page, int) or not isinstance(number, int):
+            continue
+        starts.append({
+            "number": number,
+            "page": page,
+        })
+
+    starts.sort(key=lambda item: (item["page"], item["number"]))
+
+    bag_ranges = []
+    for idx, item in enumerate(starts):
+        start_page = item["page"]
+        if idx + 1 < len(starts):
+            end_page = starts[idx + 1]["page"] - 1
+        else:
+            end_page = last_page
+
+        if end_page < start_page:
+            end_page = start_page
+
+        bag_ranges.append({
+            "bag_number": item["number"],
+            "start_page": start_page,
+            "end_page": end_page,
+        })
+
+    return bag_ranges
+
+
+
+def build_bag_ranges_payload(
+    *,
+    start_number=1,
+    end_number=24,
+    min_confidence=0.70,
+    allow_structure_only_start=True,
+):
+    data = run_sequential_scan(
+        start_number=start_number,
+        end_number=end_number,
+        min_confidence=min_confidence,
+        allow_structure_only_start=allow_structure_only_start,
+    )
+    pages = list_pages()
+    last_page = pages[-1] if pages else 0
+    accepted_sequence = [
+        {
+            "number": item["number"],
+            "page": item["page"],
+        }
+        for item in data["accepted_sequence"]
+        if isinstance(item.get("number"), int) and isinstance(item.get("page"), int)
+    ]
+    bag_ranges = compute_bag_ranges(data["accepted_sequence"], last_page)
+    return {
+        "accepted_sequence": accepted_sequence,
+        "bag_ranges": bag_ranges,
+        "missing_numbers": data["missing_numbers"],
+        "last_page": last_page,
+        "scan_config": data["scan_config"],
+    }
+
+
 # --------------------------------------------------
 # ROUTES
 # --------------------------------------------------
@@ -1006,6 +1173,8 @@ def root():
         "scan_top": "/debug/top-bags",
         "sequence_scan": "/api/sequence-scan",
         "sequence_debug": "/debug/sequential",
+        "bag_ranges": "/api/bag-ranges",
+        "bags_debug": "/debug/bags",
         "missing_bag_debug": "/api/missing-bag-debug?bag_number=7",
         "missing_bag_view": "/debug/missing-bag?bag_number=7",
     }
@@ -1067,6 +1236,24 @@ def api_sequence_scan(
         raise HTTPException(status_code=400, detail="end_number must be >= start_number")
 
     return run_sequential_scan(
+        start_number=start_number,
+        end_number=end_number,
+        min_confidence=min_confidence,
+        allow_structure_only_start=allow_structure_only_start,
+    )
+
+
+@app.get("/api/bag-ranges")
+def api_bag_ranges(
+    start_number: int = Query(1, ge=1),
+    end_number: int = Query(24, ge=1),
+    min_confidence: float = Query(0.70, ge=0.0, le=1.0),
+    allow_structure_only_start: bool = Query(True),
+):
+    if end_number < start_number:
+        raise HTTPException(status_code=400, detail="end_number must be >= start_number")
+
+    return build_bag_ranges_payload(
         start_number=start_number,
         end_number=end_number,
         min_confidence=min_confidence,
@@ -1476,6 +1663,146 @@ def debug_sequential(
           </thead>
           <tbody>
             {''.join(start_rows)}
+          </tbody>
+        </table>
+      </div>
+    </body>
+    </html>
+    """
+
+
+@app.get("/debug/bags", response_class=HTMLResponse)
+def debug_bags(
+    start_number: int = Query(1, ge=1),
+    end_number: int = Query(24, ge=1),
+    min_confidence: float = Query(0.70, ge=0.0, le=1.0),
+    allow_structure_only_start: bool = Query(True),
+):
+    if end_number < start_number:
+        raise HTTPException(status_code=400, detail="end_number must be >= start_number")
+
+    payload = build_bag_ranges_payload(
+        start_number=start_number,
+        end_number=end_number,
+        min_confidence=min_confidence,
+        allow_structure_only_start=allow_structure_only_start,
+    )
+    query_string = (
+        f"start_number={start_number}&"
+        f"end_number={end_number}&"
+        f"min_confidence={min_confidence:.2f}&"
+        f"allow_structure_only_start={str(allow_structure_only_start).lower()}"
+    )
+
+    accepted_rows = []
+    for item in payload["accepted_sequence"]:
+        accepted_rows.append(f"""
+        <tr>
+          <td>{item['number']}</td>
+          <td>{item['page']}</td>
+          <td><a href="/api/analyze?page={item['page']}" target="_blank">json</a></td>
+          <td><a href="/api/annotated?page={item['page']}" target="_blank">image</a></td>
+        </tr>
+        """)
+
+    range_rows = []
+    for item in payload["bag_ranges"]:
+        range_rows.append(f"""
+        <tr>
+          <td>{item['bag_number']}</td>
+          <td>{item['start_page']}</td>
+          <td>{item['end_page']}</td>
+          <td><a href="/api/analyze?page={item['start_page']}" target="_blank">json</a></td>
+          <td><a href="/api/annotated?page={item['start_page']}" target="_blank">image</a></td>
+        </tr>
+        """)
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Bag ranges</title>
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          margin: 16px;
+          background: #f2f2f2;
+        }}
+        .card {{
+          background: #fff;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          padding: 12px;
+          margin-bottom: 16px;
+        }}
+        table {{
+          border-collapse: collapse;
+          width: 100%;
+          background: white;
+        }}
+        th, td {{
+          border: 1px solid #ddd;
+          padding: 8px;
+          text-align: left;
+          font-size: 14px;
+        }}
+        th {{
+          background: #eee;
+        }}
+        .btn {{
+          display: inline-block;
+          padding: 8px 12px;
+          background: #222;
+          color: #fff;
+          text-decoration: none;
+          border-radius: 6px;
+          margin-right: 8px;
+          margin-bottom: 8px;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <a class="btn" href="/debug/sequential?{query_string}">Back to sequential scan</a>
+        <a class="btn" href="/api/bag-ranges?{query_string}" target="_blank">Raw JSON bag ranges</a>
+        <h2>Bag ranges</h2>
+        <p><strong>Accepted sequence:</strong> {[item['number'] for item in payload['accepted_sequence']]}</p>
+        <p><strong>Missing numbers:</strong> {payload['missing_numbers']}</p>
+        <p><strong>Last page:</strong> {payload['last_page']}</p>
+      </div>
+
+      <div class="card">
+        <h3>Accepted sequence</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Bag number</th>
+              <th>Start page</th>
+              <th>JSON</th>
+              <th>Image</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(accepted_rows)}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>Bag ranges</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Bag number</th>
+              <th>Start page</th>
+              <th>End page</th>
+              <th>JSON</th>
+              <th>Image</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(range_rows)}
           </tbody>
         </table>
       </div>
