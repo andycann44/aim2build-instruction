@@ -1,18 +1,28 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import html
 import os
+from pathlib import Path
 import threading
+from urllib.parse import parse_qs
 import cv2
 import numpy as np
 import pytesseract
+
+from lego_reader.downloader import DownloadError, SetNotFoundError, download_set_pdfs
+from lego_reader.pdf_reader import read_pdf_pages
+from lego_reader.utils import ensure_dir, normalize_set_num
 
 app = FastAPI()
 
 BASE = "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages"
 REFERENCE_PAGE = 28
+PROJECT_ROOT = Path("/Users/olly/aim2build-instruction")
+INSTRUCTIONS_ROOT = PROJECT_ROOT / "instructions"
+DEBUG_ROOT = PROJECT_ROOT / "debug"
 
 FAST_PANEL_PRECHECK_CACHE = {}
 FAST_PANEL_PRECHECK_CACHE_LOCK = threading.Lock()
@@ -33,6 +43,108 @@ def _path_cache_key(path: str):
         return (path, stat.st_mtime_ns, stat.st_size)
     except OSError:
         return (path, None, None)
+
+
+def _clear_detector_caches():
+    with FAST_PANEL_PRECHECK_CACHE_LOCK:
+        FAST_PANEL_PRECHECK_CACHE.clear()
+    with ANALYZE_PAGE_CACHE_LOCK:
+        ANALYZE_PAGE_CACHE.clear()
+    with SEQUENCE_SCAN_ROWS_CACHE_LOCK:
+        SEQUENCE_SCAN_ROWS_CACHE.clear()
+
+
+
+def _switch_detector_pages_dir(pages_dir: Path):
+    global BASE, SHELL_TEMPLATE
+    BASE = pages_dir.as_posix()
+    _clear_detector_caches()
+    SHELL_TEMPLATE = make_shell_template()
+
+
+
+def _render_load_set_page(error_message=None, set_num_value=""):
+    safe_value = html.escape(set_num_value or "")
+    safe_base = html.escape(BASE)
+    error_html = ""
+    if error_message:
+        error_html = f'<p class="error">{html.escape(str(error_message))}</p>'
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Load LEGO Set</title>
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          margin: 16px;
+          background: #f2f2f2;
+        }}
+        .card {{
+          max-width: 560px;
+          background: #fff;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          padding: 16px;
+        }}
+        .btn {{
+          display: inline-block;
+          padding: 10px 14px;
+          background: #222;
+          color: #fff;
+          text-decoration: none;
+          border-radius: 6px;
+          border: 0;
+          cursor: pointer;
+        }}
+        .field {{
+          margin-bottom: 12px;
+        }}
+        label {{
+          display: block;
+          font-weight: bold;
+          margin-bottom: 6px;
+        }}
+        input[type="text"] {{
+          width: 100%;
+          box-sizing: border-box;
+          padding: 10px 12px;
+          border: 1px solid #ccc;
+          border-radius: 6px;
+          font-size: 16px;
+        }}
+        .hint {{
+          color: #555;
+          font-size: 14px;
+          margin-top: 8px;
+        }}
+        .error {{
+          color: #b00020;
+          font-weight: bold;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <a class="btn" href="/debug/bag-thumbs">Current Bag Thumbnails</a>
+        <h2>Load LEGO Set</h2>
+        <p>Enter a LEGO set number. The app will download the first official PDF, render its pages, switch the detector to that set, and redirect to the accepted bag thumbnails.</p>
+        {error_html}
+        <form method="post" action="/debug/load-set">
+          <div class="field">
+            <label for="set_num">Set Number</label>
+            <input id="set_num" name="set_num" type="text" value="{safe_value}" placeholder="21330" required />
+          </div>
+          <button class="btn" type="submit">Download And Analyze</button>
+        </form>
+        <p class="hint">One PDF is analyzed at a time. If LEGO provides multiple PDFs, this uses the first one.</p>
+        <p class="hint"><strong>Current pages dir:</strong> {safe_base}</p>
+      </div>
+    </body>
+    </html>
+    """
 
 
 def page_path(page: int) -> str:
@@ -2012,6 +2124,7 @@ def build_bag_ranges_payload(
 def root():
     return {
         "ok": True,
+        "load_set_ui": "/debug/load-set",
         "viewer": "/debug/compare?a=28&b=24",
         "scan_all": "/api/scan-all",
         "scan_top": "/debug/top-bags",
@@ -2019,9 +2132,60 @@ def root():
         "sequence_debug": "/debug/sequential",
         "bag_ranges": "/api/bag-ranges",
         "bags_debug": "/debug/bags",
+        "bag_thumbs": "/debug/bag-thumbs",
         "missing_bag_debug": "/api/missing-bag-debug?bag_number=7",
         "missing_bag_view": "/debug/missing-bag?bag_number=7",
     }
+
+
+@app.get("/debug/load-set", response_class=HTMLResponse)
+def debug_load_set_page():
+    return _render_load_set_page()
+
+
+@app.post("/debug/load-set")
+async def debug_load_set_submit(request: Request):
+    body = await request.body()
+    form_values = parse_qs(body.decode("utf-8"))
+    set_num = form_values.get("set_num", [""])[0]
+
+    try:
+        normalized_set_num = normalize_set_num(set_num)
+    except ValueError as error:
+        return HTMLResponse(_render_load_set_page(str(error), set_num), status_code=400)
+
+    instructions_dir = ensure_dir(INSTRUCTIONS_ROOT)
+    debug_dir = ensure_dir(DEBUG_ROOT)
+
+    try:
+        download_result = download_set_pdfs(
+            set_num=normalized_set_num,
+            instructions_dir=instructions_dir,
+        )
+    except SetNotFoundError as error:
+        return HTMLResponse(_render_load_set_page(str(error), normalized_set_num), status_code=404)
+    except DownloadError as error:
+        return HTMLResponse(_render_load_set_page(str(error), normalized_set_num), status_code=502)
+
+    if not download_result.pdfs:
+        return HTMLResponse(
+            _render_load_set_page("No instruction PDFs were returned by LEGO.", normalized_set_num),
+            status_code=404,
+        )
+
+    downloaded_pdf = download_result.pdfs[0]
+    per_pdf_debug_dir = debug_dir / normalized_set_num / downloaded_pdf.local_path.stem
+    pages_dir = per_pdf_debug_dir / "pages"
+
+    if not pages_dir.exists() or not any(pages_dir.glob("page_*.png")):
+        read_pdf_pages(
+            pdf_path=downloaded_pdf.local_path,
+            debug=True,
+            debug_dir=per_pdf_debug_dir,
+        )
+
+    _switch_detector_pages_dir(pages_dir)
+    return RedirectResponse(url="/debug/bag-thumbs", status_code=303)
 
 
 @app.get("/api/page")
