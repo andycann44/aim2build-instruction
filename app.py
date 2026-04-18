@@ -1,6 +1,10 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, Response
+import base64
+from concurrent.futures import ThreadPoolExecutor
+import copy
 import os
+import threading
 import cv2
 import numpy as np
 import pytesseract
@@ -9,6 +13,26 @@ app = FastAPI()
 
 BASE = "/Users/olly/aim2build-instruction/debug/21330/21330_01/pages"
 REFERENCE_PAGE = 28
+
+FAST_PANEL_PRECHECK_CACHE = {}
+FAST_PANEL_PRECHECK_CACHE_LOCK = threading.Lock()
+ANALYZE_PAGE_CACHE = {}
+ANALYZE_PAGE_CACHE_LOCK = threading.Lock()
+SEQUENCE_SCAN_ROWS_CACHE = {}
+SEQUENCE_SCAN_ROWS_CACHE_LOCK = threading.Lock()
+SEQUENCE_SCAN_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+
+def _clone_cached_value(value):
+    return copy.deepcopy(value)
+
+
+def _path_cache_key(path: str):
+    try:
+        stat = os.stat(path)
+        return (path, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (path, None, None)
 
 
 def page_path(page: int) -> str:
@@ -181,6 +205,120 @@ def find_bag_intro_panel(img):
     return panel
 
 
+def _fast_panel_precheck_once(
+    gray,
+    *,
+    search_w_ratio,
+    search_h_ratio,
+    min_area_ratio,
+    max_area_ratio,
+    max_x_ratio,
+    max_y_ratio,
+    min_roi_mean,
+    min_mid_edge_density,
+):
+    if gray is None or gray.size == 0:
+        return False
+
+    h, w = gray.shape[:2]
+    if float(np.mean(gray)) < 145:
+        return False
+
+    sx1, sy1 = 0, 0
+    sx2, sy2 = int(w * search_w_ratio), int(h * search_h_ratio)
+    search = gray[sy1:sy2, sx1:sx2]
+    if search.size == 0:
+        return False
+
+    th = cv2.threshold(search, 226, 255, cv2.THRESH_BINARY)[1]
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    page_area = float(w * h)
+
+    for contour in cnts:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area_ratio = (bw * bh) / max(1.0, page_area)
+        wh_ratio = bw / float(max(bh, 1))
+
+        if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+            continue
+        if wh_ratio < 1.1 or wh_ratio > 5.8:
+            continue
+        if x > int(w * max_x_ratio):
+            continue
+        if y > int(h * max_y_ratio):
+            continue
+
+        roi = gray[y:y + bh, x:x + bw]
+        if roi.size == 0:
+            continue
+        if float(np.mean(roi)) < min_roi_mean:
+            continue
+
+        left = roi[:, :max(1, int(bw * 0.30))]
+        mid = roi[:, int(bw * 0.30):max(int(bw * 0.48), int(bw * 0.30) + 1)]
+        right = roi[:, max(int(bw * 0.48), int(bw * 0.30) + 1):]
+        if left.size == 0 or mid.size == 0 or right.size == 0:
+            continue
+
+        left_std = float(np.std(left))
+        right_std = float(np.std(right))
+        if left_std < 4 and right_std < 4:
+            continue
+        if float(np.mean(left)) > 246:
+            continue
+
+        mid_edges = cv2.Canny(mid, 25, 100)
+        if float(np.mean(mid_edges > 0)) < min_mid_edge_density:
+            continue
+
+        return True
+
+    return False
+
+
+def _passes_fast_panel_precheck_path(path):
+    cache_key = _path_cache_key(path)
+    with FAST_PANEL_PRECHECK_CACHE_LOCK:
+        cached = FAST_PANEL_PRECHECK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    gray = cv2.imread(path, cv2.IMREAD_REDUCED_GRAYSCALE_4)
+    if gray is None:
+        gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        return True
+
+    passes = _fast_panel_precheck_once(
+        gray,
+        search_w_ratio=0.75,
+        search_h_ratio=0.48,
+        min_area_ratio=0.04,
+        max_area_ratio=0.40,
+        max_x_ratio=0.12,
+        max_y_ratio=0.14,
+        min_roi_mean=180.0,
+        min_mid_edge_density=0.002,
+    )
+
+    if not passes:
+        passes = _fast_panel_precheck_once(
+            gray,
+            search_w_ratio=0.90,
+            search_h_ratio=0.60,
+            min_area_ratio=0.04,
+            max_area_ratio=0.40,
+            max_x_ratio=0.42,
+            max_y_ratio=0.36,
+            min_roi_mean=175.0,
+            min_mid_edge_density=0.0015,
+        )
+
+    with FAST_PANEL_PRECHECK_CACHE_LOCK:
+        FAST_PANEL_PRECHECK_CACHE[cache_key] = passes
+    return passes
+
+
 # --------------------------------------------------
 # STAGE 2: SHELL TEMPLATE MATCH
 # --------------------------------------------------
@@ -231,6 +369,340 @@ def make_shell_template():
 
 
 SHELL_TEMPLATE = make_shell_template()
+
+
+def _box_iou(box_a, box_b):
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+
+    ax2 = ax + aw
+    ay2 = ay + ah
+    bx2 = bx + bw
+    by2 = by + bh
+
+    inter_x1 = max(ax, bx)
+    inter_y1 = max(ay, by)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = aw * ah
+    area_b = bw * bh
+    union_area = area_a + area_b - inter_area
+    if union_area <= 0:
+        return 0.0
+
+    return inter_area / float(union_area)
+
+
+def _border_center_stats(gray_roi):
+    if gray_roi is None or gray_roi.size == 0:
+        return None
+
+    h, w = gray_roi.shape[:2]
+    border = np.concatenate([
+        gray_roi[:max(1, h // 10), :].ravel(),
+        gray_roi[-max(1, h // 10):, :].ravel(),
+        gray_roi[:, :max(1, w // 10)].ravel(),
+        gray_roi[:, -max(1, w // 10):].ravel(),
+    ])
+    center = gray_roi[
+        max(1, int(h * 0.18)):max(h - 1, int(h * 0.82)),
+        max(1, int(w * 0.18)):max(w - 1, int(w * 0.82)),
+    ]
+    if border.size == 0 or center.size == 0:
+        return None
+
+    return {
+        "border_mean": float(np.mean(border)),
+        "center_mean": float(np.mean(center)),
+        "std": float(np.std(gray_roi)),
+    }
+
+
+def find_rectangle_candidates(panel_img):
+    if panel_img is None or panel_img.size == 0:
+        return []
+
+    ph, pw = panel_img.shape[:2]
+    gray = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
+
+    sx1, sy1 = 0, 0
+    sx2, sy2 = int(pw * 0.42), int(ph * 0.95)
+    search = gray[sy1:sy2, sx1:sx2]
+    if search.size == 0:
+        return []
+
+    dark_mask = cv2.threshold(search, 205, 255, cv2.THRESH_BINARY_INV)[1]
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    edge_mask = cv2.Canny(search, 35, 130)
+    candidate_mask = cv2.bitwise_or(dark_mask, edge_mask)
+    candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    cnts, _ = cv2.findContours(candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_total = float(search.shape[0] * search.shape[1])
+    candidates = []
+
+    for contour in cnts:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area_ratio = (bw * bh) / max(1.0, area_total)
+        wh_ratio = bw / float(max(bh, 1))
+
+        if area_ratio < 0.10 or area_ratio > 0.80:
+            continue
+        if wh_ratio < 0.75 or wh_ratio > 1.80:
+            continue
+
+        roi = search[y:y + bh, x:x + bw]
+        if roi.size == 0:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
+        if len(approx) < 4 or len(approx) > 10:
+            continue
+
+        stats = _border_center_stats(roi)
+        if stats is None:
+            continue
+
+        border_mean = stats["border_mean"]
+        center_mean = stats["center_mean"]
+        roi_std = stats["std"]
+        if border_mean < 175:
+            continue
+        if center_mean > border_mean - 4:
+            continue
+        if roi_std < 12:
+            continue
+
+        edge_density = float(np.mean(cv2.Canny(roi, 30, 120) > 0))
+        if edge_density < 0.01:
+            continue
+
+        score = 0.0
+        score += max(0.0, border_mean - center_mean) / 45.0
+        score += roi_std / 45.0
+        score += edge_density * 5.0
+        score += max(0.0, 1.2 - abs(wh_ratio - 1.1))
+        score -= abs(area_ratio - 0.38) * 2.0
+        score = max(0.0, min(1.0, score / 3.2))
+
+        candidates.append({
+            "box": (x + sx1, y + sy1, bw, bh),
+            "score": float(score),
+        })
+
+    deduped = []
+    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+        if any(_box_iou(candidate["box"], existing["box"]) > 0.70 for existing in deduped):
+            continue
+        deduped.append(candidate)
+
+    return deduped[:8]
+
+
+def _find_square_box_inside_candidate(candidate_img):
+    if candidate_img is None or candidate_img.size == 0:
+        return None, None
+
+    ch, cw = candidate_img.shape[:2]
+    gray = cv2.cvtColor(candidate_img, cv2.COLOR_BGR2GRAY)
+
+    search_x1, search_y1 = 0, 0
+    search_x2, search_y2 = int(cw * 0.88), ch
+    search = gray[search_y1:search_y2, search_x1:search_x2]
+    if search.size == 0:
+        return None, None
+
+    mask = cv2.threshold(search, 205, 255, cv2.THRESH_BINARY_INV)[1]
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidate_area = float(ch * cw)
+    best = None
+    best_score = None
+
+    for contour in cnts:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area_ratio = (bw * bh) / max(1.0, candidate_area)
+        wh_ratio = bw / float(max(bh, 1))
+
+        if area_ratio < 0.18 or area_ratio > 0.90:
+            continue
+        if wh_ratio < 0.75 or wh_ratio > 1.35:
+            continue
+        if bh < ch * 0.45:
+            continue
+        if x > int(cw * 0.32):
+            continue
+
+        roi = search[y:y + bh, x:x + bw]
+        if roi.size == 0:
+            continue
+
+        stats = _border_center_stats(roi)
+        if stats is None:
+            continue
+
+        border_mean = stats["border_mean"]
+        center_mean = stats["center_mean"]
+        roi_std = stats["std"]
+        if border_mean < 170:
+            continue
+        if center_mean > border_mean - 4:
+            continue
+        if roi_std < 12:
+            continue
+
+        edge_density = float(np.mean(cv2.Canny(roi, 30, 120) > 0))
+        if edge_density < 0.01:
+            continue
+
+        score = 0.0
+        score += max(0.0, border_mean - center_mean) / 45.0
+        score += roi_std / 45.0
+        score += edge_density * 5.0
+        score += max(0.0, 1.2 - abs(wh_ratio - 1.0))
+        score -= abs(area_ratio - 0.45) * 2.0
+        score = max(0.0, min(1.0, score / 3.0))
+
+        if best_score is None or score > best_score:
+            best_score = score
+            best = (x + search_x1, y + search_y1, bw, bh)
+
+    return best, (float(best_score) if best_score is not None else None)
+
+
+def _score_side_tail(candidate_img, square_box, side):
+    if candidate_img is None or candidate_img.size == 0 or square_box is None:
+        return 0.0
+
+    gray = cv2.cvtColor(candidate_img, cv2.COLOR_BGR2GRAY)
+    ch, cw = gray.shape[:2]
+    sx, sy, sw, sh = square_box
+
+    y1 = max(0, sy + int(sh * 0.15))
+    y2 = min(ch, sy + int(sh * 0.85))
+    if y2 <= y1:
+        return 0.0
+
+    if side == "right":
+        x1 = max(0, sx + sw - int(sw * 0.08))
+        x2 = cw
+        band_x1 = max(0, sx + sw - int(sw * 0.05))
+        band_x2 = min(cw, sx + sw + max(2, int(sw * 0.18)))
+    else:
+        x1 = 0
+        x2 = min(cw, sx + int(sw * 0.08))
+        band_x1 = max(0, sx - max(2, int(sw * 0.18)))
+        band_x2 = min(cw, sx + int(sw * 0.05))
+
+    if x2 - x1 < max(8, int(cw * 0.12)):
+        return 0.0
+
+    tail_roi = gray[y1:y2, x1:x2]
+    if tail_roi.size == 0:
+        return 0.0
+
+    tail_mask = cv2.threshold(tail_roi, 210, 255, cv2.THRESH_BINARY_INV)[1]
+    tail_mask = cv2.morphologyEx(tail_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    tail_mask = cv2.morphologyEx(tail_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    edge_density = float(np.mean(cv2.Canny(tail_roi, 30, 120) > 0))
+    dark_density = float(np.mean(tail_mask > 0))
+
+    cnts, _ = cv2.findContours(tail_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest_area_ratio = 0.0
+    tail_area = float(tail_roi.shape[0] * tail_roi.shape[1])
+    for contour in cnts:
+        _, _, bw, bh = cv2.boundingRect(contour)
+        largest_area_ratio = max(largest_area_ratio, (bw * bh) / max(1.0, tail_area))
+
+    connector_band = gray[y1:y2, band_x1:band_x2]
+    connector_dark_density = 0.0
+    if connector_band.size != 0:
+        connector_mask = cv2.threshold(connector_band, 210, 255, cv2.THRESH_BINARY_INV)[1]
+        connector_dark_density = float(np.mean(connector_mask > 0))
+
+    score = 0.0
+    score += edge_density * 6.0
+    score += dark_density * 1.5
+    score += largest_area_ratio * 2.0
+    score += connector_dark_density * 2.5
+    return max(0.0, min(1.0, score / 2.2))
+
+
+def _find_side_tail(candidate_img, square_box):
+    right_score = _score_side_tail(candidate_img, square_box, "right")
+    left_score = _score_side_tail(candidate_img, square_box, "left")
+
+    if right_score >= left_score and right_score >= 0.22:
+        return "right", right_score
+    if left_score > right_score and left_score >= 0.22:
+        return "left", left_score
+    return None, max(right_score, left_score)
+
+
+def _find_structured_shell_candidate_with_debug(panel_img):
+    rectangle_candidates = find_rectangle_candidates(panel_img)
+    if not rectangle_candidates:
+        return None, None, "shape_first"
+
+    best_partial_score = rectangle_candidates[0]["score"]
+    best_candidate = None
+
+    for rectangle_candidate in rectangle_candidates:
+        candidate_box = rectangle_candidate["box"]
+        candidate_img = crop(panel_img, candidate_box)
+        if candidate_img is None or candidate_img.size == 0:
+            continue
+
+        square_box, square_score = _find_square_box_inside_candidate(candidate_img)
+        if square_box is None or square_score is None:
+            continue
+
+        tail_side, tail_score = _find_side_tail(candidate_img, square_box)
+        if tail_side is None:
+            continue
+
+        square_img = crop(candidate_img, square_box)
+        bag_rel, bag_score = find_grey_bag_blob(square_img)
+        if bag_rel is None:
+            bag_rel, bag_score = find_grey_bag_blob(candidate_img)
+        if bag_rel is None:
+            continue
+
+        bag_quality = max(0.0, min(1.0, (bag_score + 40.0) / 80.0))
+        combined_score = (
+            (rectangle_candidate["score"] * 0.35)
+            + (square_score * 0.25)
+            + (tail_score * 0.20)
+            + (bag_quality * 0.20)
+        )
+        combined_score = max(0.0, min(0.99, combined_score))
+
+        candidate = {
+            "box": candidate_box,
+            "score": float(combined_score),
+            "method": f"shape_first_{tail_side}",
+        }
+        if best_candidate is None or candidate["score"] > best_candidate["score"]:
+            best_candidate = candidate
+
+    if best_candidate is None:
+        return None, float(best_partial_score), "shape_first"
+
+    return best_candidate["box"], best_candidate["score"], best_candidate["method"]
 
 
 def _find_square_bag_box_outline_fallback(panel_img):
@@ -314,49 +786,10 @@ def _find_square_bag_box_outline_fallback(panel_img):
 
 
 def find_square_bag_box_with_debug(panel_img):
-    global SHELL_TEMPLATE
-
     if panel_img is None or panel_img.size == 0:
-        return None, None, "none"
+        return None, None, "shape_first"
 
-    if SHELL_TEMPLATE is None:
-        SHELL_TEMPLATE = make_shell_template()
-        if SHELL_TEMPLATE is None:
-            fallback_box, fallback_score = _find_square_bag_box_outline_fallback(panel_img)
-            if fallback_box is not None:
-                return fallback_box, fallback_score, "outline_fallback"
-            return None, None, "none"
-
-    ph, pw = panel_img.shape[:2]
-    gray = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
-
-    sx1, sy1 = 0, 0
-    sx2, sy2 = int(pw * 0.42), int(ph * 0.95)
-    search = gray[sy1:sy2, sx1:sx2]
-
-    search_edges = cv2.Canny(search, 35, 130)
-
-    th, tw = SHELL_TEMPLATE["template_h"], SHELL_TEMPLATE["template_w"]
-    max_val = None
-
-    if search_edges.shape[0] >= th and search_edges.shape[1] >= tw:
-        result = cv2.matchTemplate(
-            search_edges,
-            SHELL_TEMPLATE["template_edges"],
-            cv2.TM_CCOEFF_NORMED,
-        )
-
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-        if max_val >= 0.25:
-            x, y = max_loc
-            return (x + sx1, y + sy1, tw, th), float(max_val), "template"
-
-    fallback_box, fallback_score = _find_square_bag_box_outline_fallback(panel_img)
-    if fallback_box is not None:
-        return fallback_box, fallback_score, "outline_fallback"
-
-    return None, (float(max_val) if max_val is not None else None), "template"
+    return _find_structured_shell_candidate_with_debug(panel_img)
 
 
 def find_square_bag_box(panel_img):
@@ -434,16 +867,202 @@ def find_grey_bag_blob(square_img):
 # --------------------------------------------------
 # STAGE 4: NUMBER CROP + OCR
 # --------------------------------------------------
+def _append_number_candidate(candidates, seen, box, img_w, img_h):
+    x, y, w, h = [int(round(v)) for v in box]
+    x = max(0, x)
+    y = max(0, y)
+    w = min(max(0, w), img_w - x)
+    h = min(max(0, h), img_h - y)
+
+    if w < 8 or h < 12:
+        return
+
+    key = (x, y, w, h)
+    if key in seen:
+        return
+
+    seen.add(key)
+    candidates.append(key)
+
+
+
+def _extract_digit_like_boxes(gray_img, *, min_area_ratio=0.01, max_area_ratio=0.35, min_height_ratio=0.28, min_width_ratio=0.05):
+    if gray_img is None or gray_img.size == 0:
+        return []
+
+    h, w = gray_img.shape[:2]
+    roi_area = float(h * w)
+    blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
+    masks = [
+        cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
+        cv2.threshold(blurred, 170, 255, cv2.THRESH_BINARY_INV)[1],
+    ]
+
+    boxes = []
+    for mask in masks:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for c in cnts:
+            x, y, bw, bh = cv2.boundingRect(c)
+            area_ratio = (bw * bh) / max(1.0, roi_area)
+
+            if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                continue
+            if bh < h * min_height_ratio:
+                continue
+            if bw < w * min_width_ratio:
+                continue
+
+            boxes.append((x, y, bw, bh))
+
+    deduped = []
+    for box in sorted(boxes, key=lambda item: (item[0], item[1], -(item[2] * item[3]))):
+        if any(
+            abs(box[0] - other[0]) <= 4 and
+            abs(box[1] - other[1]) <= 4 and
+            abs(box[2] - other[2]) <= 4 and
+            abs(box[3] - other[3]) <= 4
+            for other in deduped
+        ):
+            continue
+        deduped.append(box)
+
+    return deduped[:8]
+
+
+
+def _group_adjacent_digit_boxes(boxes, max_gap):
+    if not boxes:
+        return []
+
+    ordered = sorted(boxes, key=lambda item: (item[0], item[1]))
+    groups = []
+    current_group = [ordered[0]]
+
+    for box in ordered[1:]:
+        prev = current_group[-1]
+        gap = box[0] - (prev[0] + prev[2])
+        overlap = min(prev[1] + prev[3], box[1] + box[3]) - max(prev[1], box[1])
+        overlap_needed = min(prev[3], box[3]) * 0.30
+
+        if gap <= max_gap and overlap > overlap_needed:
+            current_group.append(box)
+        else:
+            groups.append(current_group)
+            current_group = [box]
+
+    groups.append(current_group)
+    return groups
+
+
+
+def _group_union_box(group):
+    gx1 = min(item[0] for item in group)
+    gy1 = min(item[1] for item in group)
+    gx2 = max(item[0] + item[2] for item in group)
+    gy2 = max(item[1] + item[3] for item in group)
+    return gx1, gy1, gx2 - gx1, gy2 - gy1
+
+
+
 def find_number_crop(bag_img):
     if bag_img is None or bag_img.size == 0:
-        return None
+        return []
 
     h, w = bag_img.shape[:2]
-    x = int(w * 0.20)
-    y = int(h * 0.20)
-    bw = int(w * 0.60)
-    bh = int(h * 0.55)
-    return (x, y, bw, bh)
+    candidates = []
+    seen = set()
+
+    gray = cv2.cvtColor(bag_img, cv2.COLOR_BGR2GRAY)
+
+    roi_x1 = int(w * 0.15)
+    roi_x2 = int(w * 0.85)
+    roi_y1 = int(h * 0.05)
+    roi_y2 = int(h * 0.72)
+    roi = gray[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    contour_boxes = []
+    has_multi_digit_group = False
+    if roi.size != 0:
+        roi_boxes = _extract_digit_like_boxes(
+            roi,
+            min_area_ratio=0.01,
+            max_area_ratio=0.35,
+            min_height_ratio=0.28,
+            min_width_ratio=0.05,
+        )
+        contour_boxes = [(roi_x1 + x, roi_y1 + y, bw, bh) for x, y, bw, bh in roi_boxes]
+
+        groups = _group_adjacent_digit_boxes(
+            contour_boxes,
+            max_gap=max(10, int(roi.shape[1] * 0.10)),
+        )
+
+        for group in groups:
+            if len(group) < 2:
+                continue
+
+            has_multi_digit_group = True
+            gx1, gy1, gw, gh = _group_union_box(group)
+
+            tight_pad_x = max(8, int(gw * 0.18))
+            tight_pad_y = max(6, int(gh * 0.16))
+            _append_number_candidate(
+                candidates,
+                seen,
+                (gx1 - tight_pad_x, gy1 - tight_pad_y, gw + (2 * tight_pad_x), gh + (2 * tight_pad_y)),
+                w,
+                h,
+            )
+
+            generous_pad_x = max(10, int(gw * 0.32))
+            generous_pad_y = max(8, int(gh * 0.24))
+            _append_number_candidate(
+                candidates,
+                seen,
+                (gx1 - generous_pad_x, gy1 - generous_pad_y, gw + (2 * generous_pad_x), gh + (2 * generous_pad_y)),
+                w,
+                h,
+            )
+
+        if not has_multi_digit_group:
+            for x, y, bw, bh in contour_boxes:
+                pad_x = max(10, int(bw * 1.00))
+                pad_y = max(8, int(bh * 0.35))
+                _append_number_candidate(
+                    candidates,
+                    seen,
+                    (x - pad_x, y - pad_y, bw + (2 * pad_x), bh + (2 * pad_y)),
+                    w,
+                    h,
+                )
+
+                generous_pad_x = max(12, int(bw * 1.20))
+                generous_pad_y = max(10, int(bh * 0.45))
+                _append_number_candidate(
+                    candidates,
+                    seen,
+                    (x - generous_pad_x, y - generous_pad_y, bw + (2 * generous_pad_x), bh + (2 * generous_pad_y)),
+                    w,
+                    h,
+                )
+
+    if has_multi_digit_group:
+        fallback_boxes = [
+            (int(w * 0.24), int(h * 0.16), int(w * 0.54), int(h * 0.56)),
+            (int(w * 0.20), int(h * 0.12), int(w * 0.60), int(h * 0.62)),
+        ]
+    else:
+        fallback_boxes = [
+            (int(w * 0.28), int(h * 0.16), int(w * 0.40), int(h * 0.54)),
+            (int(w * 0.24), int(h * 0.12), int(w * 0.46), int(h * 0.60)),
+        ]
+
+    for box in fallback_boxes:
+        _append_number_candidate(candidates, seen, box, w, h)
+
+    return candidates
 
 
 def _ocr_hits_from_images(images, configs):
@@ -573,6 +1192,148 @@ def read_bag_number(number_img):
 
     return best_val, raw_map[best_val]
 
+
+
+def _estimate_number_structure(gray_img):
+    if gray_img is None or gray_img.size == 0:
+        return {
+            "has_adjacent_pair": False,
+            "pair_aspect_ratio": 0.0,
+            "crop_aspect_ratio": 0.0,
+        }
+
+    h, w = gray_img.shape[:2]
+    roi_x1 = int(w * 0.10)
+    roi_x2 = int(w * 0.90)
+    roi_y1 = int(h * 0.08)
+    roi_y2 = int(h * 0.92)
+    roi = gray_img[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    boxes = _extract_digit_like_boxes(
+        roi,
+        min_area_ratio=0.006,
+        max_area_ratio=0.45,
+        min_height_ratio=0.24,
+        min_width_ratio=0.03,
+    )
+    groups = _group_adjacent_digit_boxes(boxes, max_gap=max(6, int(max(1, roi.shape[1]) * 0.12))) if boxes else []
+    pair_groups = [group for group in groups if len(group) >= 2]
+
+    pair_aspect_ratio = 0.0
+    if pair_groups:
+        best_group = max(pair_groups, key=lambda group: (_group_union_box(group)[2], len(group)))
+        _, _, gw, gh = _group_union_box(best_group)
+        pair_aspect_ratio = gw / float(max(gh, 1))
+
+    return {
+        "has_adjacent_pair": bool(pair_groups),
+        "pair_aspect_ratio": pair_aspect_ratio,
+        "crop_aspect_ratio": w / float(max(h, 1)),
+    }
+
+
+
+def read_bag_number_with_score(number_img):
+    if number_img is None or number_img.size == 0:
+        return None, "", -1.0
+
+    votes = {}
+
+    def add_vote(val, raw, conf_score):
+        if val is None or val < 1 or val > 24:
+            return
+
+        entry = votes.setdefault(val, {
+            "count": 0,
+            "best_conf": -1.0,
+            "raw": raw or str(val),
+        })
+        entry["count"] += 1
+        if conf_score > entry["best_conf"]:
+            entry["best_conf"] = conf_score
+            entry["raw"] = raw or str(val)
+
+    base_val, base_raw = read_bag_number(number_img)
+    if base_val is not None and 1 <= base_val <= 24:
+        add_vote(base_val, base_raw, 25.0)
+
+    gray = cv2.cvtColor(number_img, cv2.COLOR_BGR2GRAY)
+    structure = _estimate_number_structure(gray)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    variants = [
+        blurred,
+        cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
+    ]
+    configs = [
+        "--psm 13 -c tessedit_char_whitelist=0123456789",
+        "--psm 10 -c tessedit_char_whitelist=0123456789",
+        "--psm 8 -c tessedit_char_whitelist=0123456789",
+        "--psm 7 -c tessedit_char_whitelist=0123456789",
+    ]
+
+    for variant in variants:
+        up = cv2.resize(variant, None, fx=8, fy=8, interpolation=cv2.INTER_CUBIC)
+        for cfg in configs:
+            data = pytesseract.image_to_data(
+                up,
+                config=cfg,
+                output_type=pytesseract.Output.DICT,
+            )
+
+            for raw_text, conf_text in zip(data.get("text", []), data.get("conf", [])):
+                digits = "".join(ch for ch in raw_text if ch.isdigit())
+                if len(digits) == 0 or len(digits) > 2:
+                    continue
+
+                try:
+                    val = int(digits)
+                except ValueError:
+                    continue
+
+                try:
+                    conf_score = float(conf_text)
+                except (TypeError, ValueError):
+                    conf_score = -1.0
+
+                if conf_score < 0.0:
+                    continue
+
+                add_vote(val, digits, conf_score)
+
+    if not votes:
+        return None, "", -1.0
+
+    def total_vote_score(val, meta):
+        digit_len = len(meta["raw"])
+        total = meta["best_conf"] + ((meta["count"] - 1) * 4.0) + ((digit_len - 1) * 40.0)
+
+        if structure["has_adjacent_pair"]:
+            if digit_len >= 2:
+                total += 48.0
+                if structure["pair_aspect_ratio"] >= 0.85:
+                    total += 18.0
+            else:
+                total -= 34.0
+                if structure["crop_aspect_ratio"] >= 0.65:
+                    total -= 8.0
+        elif digit_len >= 2 and structure["crop_aspect_ratio"] < 0.58:
+            total -= 12.0
+
+        return total
+
+    best_val, best_meta = max(
+        votes.items(),
+        key=lambda item: (
+            total_vote_score(item[0], item[1]),
+            item[1]["best_conf"],
+            len(item[1]["raw"]),
+            item[1]["count"],
+        ),
+    )
+    best_score = total_vote_score(best_val, best_meta)
+    return best_val, best_meta["raw"], float(best_score)
+
 # --------------------------------------------------
 # SCORING
 # --------------------------------------------------
@@ -591,15 +1352,13 @@ def compute_confidence(panel_found, shell_found, grey_bag_found,
         score += 0.20
 
         if shell_score is not None:
-            # boost strong matches
             score += min(shell_score, 1.0) * 0.15
 
-    # Stage 3: grey bag (IMPORTANT FILTER)
+    # Stage 3: grey bag
     if grey_bag_found:
         score += 0.25
 
         if grey_bag_score is not None:
-            # stabilise score (avoid huge values)
             norm = max(0.0, min(1.0, (grey_bag_score + 40) / 80))
             score += norm * 0.15
 
@@ -609,7 +1368,9 @@ def compute_confidence(panel_found, shell_found, grey_bag_found,
 
     # Stage 5: OCR validity
     if bag_number is not None:
-        score += 0.25
+        score += 0.40
+    else:
+        score -= 0.30
 
     return round(min(score, 1.0), 3)
 
@@ -622,13 +1383,46 @@ def analyze_page(page: int, include_image: bool = True):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Page not found")
 
+    cache_key = None
+    if not include_image:
+        cache_key = _path_cache_key(path)
+        with ANALYZE_PAGE_CACHE_LOCK:
+            cached = ANALYZE_PAGE_CACHE.get(cache_key)
+        if cached is not None:
+            return _clone_cached_value(cached)
+
+        if not _passes_fast_panel_precheck_path(path):
+            fast_reject_result = {
+                "page": page,
+                "panel_found": False,
+                "panel_box": None,
+                "panel_source": "fast_reject",
+                "panel_score": None,
+                "shell_found": False,
+                "shell_box": None,
+                "shell_score": None,
+                "shell_method": "none",
+                "grey_bag_found": False,
+                "grey_bag_box": None,
+                "grey_bag_score": None,
+                "number_box_found": False,
+                "number_box": None,
+                "bag_number": None,
+                "ocr_raw": "",
+                "confidence": compute_confidence(False, False, False, False, None, None, None),
+            }
+            with ANALYZE_PAGE_CACHE_LOCK:
+                ANALYZE_PAGE_CACHE[cache_key] = _clone_cached_value(fast_reject_result)
+            return fast_reject_result
+
     img = cv2.imread(path)
     if img is None:
         raise HTTPException(status_code=500, detail="Could not read image")
 
-    vis = img.copy()
+    vis = img.copy() if include_image else None
 
     panel, panel_source, panel_score = find_bag_intro_panel_with_debug(img)
+
     square_abs = None
     shell_score = None
     shell_method = "none"
@@ -641,19 +1435,25 @@ def analyze_page(page: int, include_image: bool = True):
     if panel is not None and include_image:
         draw_box(vis, panel, (0, 255, 0), 4)
 
+    # --------------------------------------------------
+    # PANEL → SHELL → BAG → NUMBER
+    # --------------------------------------------------
     if panel is not None:
         panel_img = crop(img, panel)
+
         square_rel, shell_score, shell_method = find_square_bag_box_with_debug(panel_img)
 
         if square_rel is not None:
             px, py, _, _ = panel
             sx, sy, sw, sh = square_rel
+
             square_abs = (px + sx, py + sy, sw, sh)
 
             if include_image:
                 draw_box(vis, square_abs, (255, 0, 0), 3)
 
             square_img = crop(img, square_abs)
+
             bag_rel, bag_score = find_grey_bag_blob(square_img)
 
             if bag_rel is not None:
@@ -665,23 +1465,60 @@ def analyze_page(page: int, include_image: bool = True):
                     draw_box(vis, bag_abs, (0, 200, 255), 2)
 
                 bag_img = crop(img, bag_abs)
-                number_rel = find_number_crop(bag_img)
 
-                if number_rel is not None:
+                best_candidate = None
+                best_multi_digit_candidate = None
+
+                for number_rel in find_number_crop(bag_img):
                     gx2, gy2, _, _ = bag_abs
                     nx, ny, nw, nh = number_rel
-                    number_abs = (gx2 + nx, gy2 + ny, nw, nh)
 
-                    if include_image:
+                    number_abs_try = (gx2 + nx, gy2 + ny, nw, nh)
+                    number_img = crop(img, number_abs_try)
+
+                    val, raw, ocr_score = read_bag_number_with_score(number_img)
+                    if val is None:
+                        continue
+
+                    candidate = {
+                        "score": ocr_score,
+                        "number": val,
+                        "raw": raw,
+                        "box": number_abs_try,
+                    }
+
+                    if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                        best_candidate = candidate
+
+                    if len(str(val)) >= 2:
+                        if best_multi_digit_candidate is None or candidate["score"] > best_multi_digit_candidate["score"]:
+                            best_multi_digit_candidate = candidate
+
+                chosen_candidate = best_candidate
+                if (
+                    best_candidate is not None and
+                    best_multi_digit_candidate is not None and
+                    best_multi_digit_candidate["score"] >= 90.0 and
+                    best_multi_digit_candidate["score"] + 40.0 >= best_candidate["score"]
+                ):
+                    chosen_candidate = best_multi_digit_candidate
+
+                if chosen_candidate is not None:
+                    bag_number = chosen_candidate["number"]
+                    ocr_raw = chosen_candidate["raw"]
+                    number_abs = chosen_candidate["box"]
+
+                    if include_image and number_abs is not None:
                         draw_box(vis, number_abs, (0, 0, 255), 2)
 
-                    number_img = crop(img, number_abs)
-                    bag_number, ocr_raw = read_bag_number(number_img)
-
+    # --------------------------------------------------
+    # FLAGS
+    # --------------------------------------------------
     panel_found = panel is not None
     shell_found = square_abs is not None
     grey_bag_found = bag_abs is not None
     number_box_found = number_abs is not None
+
     confidence = compute_confidence(
         panel_found,
         shell_found,
@@ -692,6 +1529,9 @@ def analyze_page(page: int, include_image: bool = True):
         bag_score,
     )
 
+    # --------------------------------------------------
+    # DRAW LABELS
+    # --------------------------------------------------
     if include_image:
         if panel_found:
             panel_label = "BAG PANEL" if panel_source == "strict_top_left" else f"BAG PANEL {panel_source}"
@@ -796,6 +1636,9 @@ def analyze_page(page: int, include_image: bool = True):
         if not ok:
             raise HTTPException(status_code=500, detail="Encode failed")
         result["image_bytes"] = buf.tobytes()
+    elif cache_key is not None:
+        with ANALYZE_PAGE_CACHE_LOCK:
+            ANALYZE_PAGE_CACHE[cache_key] = _clone_cached_value(result)
 
     return result
 
@@ -910,20 +1753,34 @@ def analyze_missing_bag_debug(
     return data, gap
 
 
+def _build_sequence_scan_row(page: int):
+    row = analyze_page(page, include_image=False)
+    row["strong_structure"] = bool(
+        row["panel_found"] and
+        row["shell_found"] and
+        row["grey_bag_found"]
+    )
+    return row
+
+
 def build_sequence_scan_rows():
-    rows = []
-    for page in sorted(list_pages()):
-        r = analyze_page(page, include_image=False)
+    pages = sorted(list_pages())
+    cache_key = (BASE, tuple(_path_cache_key(page_path(page)) for page in pages))
 
-        strong_structure = (
-            r["panel_found"] and
-            r["shell_found"] and
-            r["grey_bag_found"]
-        )
+    with SEQUENCE_SCAN_ROWS_CACHE_LOCK:
+        cached_rows = SEQUENCE_SCAN_ROWS_CACHE.get(cache_key)
+    if cached_rows is not None:
+        return _clone_cached_value(cached_rows)
 
-        r["strong_structure"] = strong_structure
-        rows.append(r)
+    max_workers = min(SEQUENCE_SCAN_MAX_WORKERS, max(1, len(pages)))
+    if max_workers <= 1:
+        rows = [_build_sequence_scan_row(page) for page in pages]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            rows = list(executor.map(_build_sequence_scan_row, pages))
 
+    with SEQUENCE_SCAN_ROWS_CACHE_LOCK:
+        SEQUENCE_SCAN_ROWS_CACHE[cache_key] = _clone_cached_value(rows)
     return rows
 
 
@@ -957,20 +1814,15 @@ def run_generic_sequence_scan(
         detected_number = r.get(number_key)
         confidence = float(r.get(confidence_key, 0.0) or 0.0)
         strong_structure = bool(r.get(structure_key))
+
         debug_entry = {
             "page": page,
             "detected_number": detected_number,
             "confidence": confidence,
             "expected_next_before": expected_next,
             "expected_next_after": expected_next,
-            "strong_structure": strong_structure,
-            "action": "no_number_detected" if detected_number is None else "ignored_non_bag_signal",
+            "action": "no_number_detected" if detected_number is None else "unhandled",
         }
-
-        if detected_number is not None and (detected_number < start_number or detected_number > end_number):
-            debug_entry["action"] = "ignored_out_of_scan_range"
-            page_debug_log.append(debug_entry)
-            continue
 
         if detected_number == expected_next and confidence >= min_confidence:
             accepted.append({
@@ -998,32 +1850,6 @@ def run_generic_sequence_scan(
             page_debug_log.append(debug_entry)
             continue
 
-        if (
-            not accepted
-            and detected_number is None
-            and strong_structure
-            and allow_structure_only_start
-            and expected_next == start_number
-            and confidence >= min_confidence
-        ):
-            structure_only_start_candidates.append({
-                "page": page,
-                "expected_number": start_number,
-                "confidence": confidence,
-                "reason": "strong_structure_no_number_start_candidate",
-            })
-            accepted.append({
-                "page": page,
-                "number": start_number,
-                "bag_number": start_number,
-                "confidence": confidence,
-                "reason": "accepted_from_structure_start_fallback",
-            })
-            expected_next = start_number + 1
-            debug_entry["action"] = "accepted_from_structure_start_fallback"
-            debug_entry["expected_next_after"] = expected_next
-            page_debug_log.append(debug_entry)
-            continue
 
         if detected_number is not None and detected_number > expected_next:
             deferred.append({
@@ -1043,14 +1869,32 @@ def run_generic_sequence_scan(
             page_debug_log.append(debug_entry)
             continue
 
-        if detected_number is None:
+        if (
+            detected_number is None
+            and strong_structure
+            and allow_structure_only_start
+            and expected_next == start_number
+        ):
+            structure_only_start_candidates.append({
+                "page": page,
+                "expected_number": start_number,
+                "confidence": confidence,
+                "reason": "strong_structure_no_number_start_candidate",
+            })
+            debug_entry["strong_structure"] = True
+            debug_entry["structure_only_start_candidate"] = True
             page_debug_log.append(debug_entry)
+            continue
+
+        debug_entry["strong_structure"] = strong_structure
+        page_debug_log.append(debug_entry)
 
     accepted_numbers = sorted({r["bag_number"] for r in accepted})
     missing = [n for n in range(start_number, end_number + 1) if n not in accepted_numbers]
     expected_next_debug = None
     if expected_next <= end_number:
         expected_next_debug = build_missing_bag_debug(ordered_rows, accepted, deferred, expected_next)
+
 
     return {
         "accepted_sequence": accepted,
@@ -1665,6 +2509,146 @@ def debug_sequential(
             {''.join(start_rows)}
           </tbody>
         </table>
+      </div>
+    </body>
+    </html>
+    """
+
+
+def _make_annotated_thumbnail_data_url(page: int, max_width: int = 200):
+    img = cv2.imread(page_path(page))
+    if img is None or img.size == 0:
+        return None
+
+    h, w = img.shape[:2]
+    if w > max_width:
+        scale = max_width / float(w)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+    if not ok:
+        return None
+
+    encoded = base64.b64encode(buf.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+@app.get("/debug/bag-thumbs", response_class=HTMLResponse)
+def debug_bag_thumbs(
+    start_number: int = Query(1, ge=1),
+    end_number: int = Query(24, ge=1),
+    min_confidence: float = Query(0.70, ge=0.0, le=1.0),
+    allow_structure_only_start: bool = Query(True),
+):
+    if end_number < start_number:
+        raise HTTPException(status_code=400, detail="end_number must be >= start_number")
+
+    data = run_sequential_scan(
+        start_number=start_number,
+        end_number=end_number,
+        min_confidence=min_confidence,
+        allow_structure_only_start=allow_structure_only_start,
+    )
+    query_string = (
+        f"start_number={start_number}&"
+        f"end_number={end_number}&"
+        f"min_confidence={min_confidence:.2f}&"
+        f"allow_structure_only_start={str(allow_structure_only_start).lower()}"
+    )
+
+    tiles = []
+    for item in data["accepted_sequence"]:
+        page = item["page"]
+        number = item["number"]
+        thumb_url = _make_annotated_thumbnail_data_url(page, max_width=200)
+        if thumb_url is None:
+            continue
+
+        tiles.append(f"""
+        <a class="thumb-card" href="/api/annotated?page={page}" target="_blank">
+          <img src="{thumb_url}" alt="Bag {number} page {page}" loading="lazy" />
+          <div class="thumb-meta">Bag {number}</div>
+          <div class="thumb-sub">Page {page}</div>
+        </a>
+        """)
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Bag Thumbnails</title>
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          margin: 16px;
+          background: #f2f2f2;
+        }}
+        .card {{
+          background: #fff;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          padding: 12px;
+          margin-bottom: 16px;
+        }}
+        .btn {{
+          display: inline-block;
+          padding: 8px 12px;
+          background: #222;
+          color: #fff;
+          text-decoration: none;
+          border-radius: 6px;
+          margin-right: 8px;
+          margin-bottom: 8px;
+        }}
+        .thumb-grid {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 16px;
+        }}
+        .thumb-card {{
+          width: 200px;
+          background: #fff;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          padding: 10px;
+          text-decoration: none;
+          color: #111;
+          box-sizing: border-box;
+        }}
+        .thumb-card img {{
+          display: block;
+          width: 100%;
+          max-width: 200px;
+          height: auto;
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          margin-bottom: 8px;
+          background: #fafafa;
+        }}
+        .thumb-meta {{
+          font-weight: bold;
+          margin-bottom: 4px;
+        }}
+        .thumb-sub {{
+          color: #444;
+          font-size: 14px;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <a class="btn" href="/debug/sequential?{query_string}">Back to sequential scan</a>
+        <a class="btn" href="/api/sequence-scan?{query_string}" target="_blank">Raw JSON sequence scan</a>
+        <h2>Accepted Bag Start Thumbnails</h2>
+        <p><strong>Accepted sequence:</strong> {[item['number'] for item in data['accepted_sequence']]}</p>
+        <p><strong>Accepted pages:</strong> {len(data['accepted_sequence'])}</p>
+      </div>
+
+      <div class="thumb-grid">
+        {''.join(tiles) if tiles else '<div class="card">No accepted bag starts found.</div>'}
       </div>
     </body>
     </html>
