@@ -32,6 +32,9 @@ SEQUENCE_SCAN_ROWS_CACHE = {}
 SEQUENCE_SCAN_ROWS_CACHE_LOCK = threading.Lock()
 SEQUENCE_SCAN_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
 FULL_PAGE_FALLBACK_MIN_SHELL_SCORE = 0.76
+PANEL_BAG_FALLBACK_MIN_SHELL_HINT = 0.88
+PANEL_BAG_FALLBACK_MIN_BAG_SCORE = 8.0
+PANEL_BAG_FALLBACK_MIN_OCR_SCORE = 120.0
 
 
 def _clone_cached_value(value):
@@ -1871,11 +1874,12 @@ def _run_square_bag_number_pipeline(
     include_image=False,
     vis=None,
     allow_structure_ocr_fallback=False,
+    draw_square_box=True,
 ):
     if square_abs is None:
         return None, None, None, None, "", False
 
-    if include_image and vis is not None:
+    if include_image and vis is not None and draw_square_box:
         draw_box(vis, square_abs, (255, 0, 0), 3)
 
     square_img = crop(img, square_abs)
@@ -1949,6 +1953,110 @@ def _run_square_bag_number_pipeline(
     return bag_abs, bag_score, number_abs, chosen_candidate["number"], chosen_candidate["raw"], structure_ocr_accepted
 
 
+def _iter_panel_bag_fallback_regions(panel_abs):
+    if panel_abs is None:
+        return []
+
+    px, py, pw, ph = panel_abs
+    rel_boxes = [
+        (0.00, 0.00, 0.35, 0.85),
+        (0.00, 0.00, 0.45, 1.00),
+        (0.05, 0.05, 0.50, 0.90),
+    ]
+
+    regions = []
+    for rx, ry, rw, rh in rel_boxes:
+        x = px + int(round(pw * rx))
+        y = py + int(round(ph * ry))
+        w = int(round(pw * rw))
+        h = int(round(ph * rh))
+        if w < 20 or h < 20:
+            continue
+        regions.append((x, y, w, h))
+
+    return regions
+
+
+def _run_panel_bag_number_fallback(
+    img,
+    panel_abs,
+    *,
+    shell_hint_score=None,
+    include_image=False,
+    vis=None,
+):
+    if (
+        panel_abs is None or
+        shell_hint_score is None or
+        shell_hint_score < PANEL_BAG_FALLBACK_MIN_SHELL_HINT
+    ):
+        return None, None, None, None, "", False
+
+    panel_x, panel_y, panel_w, panel_h = panel_abs
+    panel_area = float(max(1, panel_w * panel_h))
+    best_candidate = None
+
+    for roi_abs in _iter_panel_bag_fallback_regions(panel_abs):
+        bag_abs, bag_score, number_abs, bag_number, ocr_raw, _ = _run_square_bag_number_pipeline(
+            img,
+            roi_abs,
+            include_image=False,
+            vis=None,
+            allow_structure_ocr_fallback=False,
+            draw_square_box=False,
+        )
+        if bag_abs is None or number_abs is None or bag_number is None:
+            continue
+        if bag_score is None or bag_score < PANEL_BAG_FALLBACK_MIN_BAG_SCORE:
+            continue
+
+        number_img = crop(img, number_abs)
+        _, _, ocr_score = read_bag_number_with_score(number_img)
+        if ocr_score < PANEL_BAG_FALLBACK_MIN_OCR_SCORE:
+            continue
+
+        roi_x, roi_y, roi_w, roi_h = roi_abs
+        roi_area_ratio = (roi_w * roi_h) / panel_area
+        left_bias = 1.0 - ((roi_x - panel_x) / max(1.0, float(panel_w)))
+        top_bias = 1.0 - ((roi_y - panel_y) / max(1.0, float(panel_h)))
+        area_bias = max(0.0, 1.0 - abs(roi_area_ratio - 0.30) / 0.28)
+
+        candidate_score = (
+            ocr_score
+            + (bag_score * 1.8)
+            + (left_bias * 18.0)
+            + (top_bias * 12.0)
+            + (area_bias * 10.0)
+        )
+
+        candidate = {
+            "score": float(candidate_score),
+            "bag_abs": bag_abs,
+            "bag_score": bag_score,
+            "number_abs": number_abs,
+            "bag_number": bag_number,
+            "ocr_raw": ocr_raw,
+        }
+        if best_candidate is None or candidate["score"] > best_candidate["score"]:
+            best_candidate = candidate
+
+    if best_candidate is None:
+        return None, None, None, None, "", False
+
+    if include_image and vis is not None:
+        draw_box(vis, best_candidate["bag_abs"], (0, 200, 255), 2)
+        draw_box(vis, best_candidate["number_abs"], (0, 0, 255), 2)
+
+    return (
+        best_candidate["bag_abs"],
+        best_candidate["bag_score"],
+        best_candidate["number_abs"],
+        best_candidate["bag_number"],
+        best_candidate["ocr_raw"],
+        True,
+    )
+
+
 # --------------------------------------------------
 # PAGE ANALYSIS
 # --------------------------------------------------
@@ -2017,6 +2125,7 @@ def analyze_page(page: int, include_image: bool = True):
     bag_number = None
     ocr_raw = ""
     structure_ocr_accepted = False
+    panel_bag_fallback_accepted = False
 
     panel_found = panel is not None
 
@@ -2037,6 +2146,16 @@ def analyze_page(page: int, include_image: bool = True):
                 include_image=include_image,
                 vis=vis,
             )
+        else:
+            bag_abs, bag_score, number_abs, bag_number, ocr_raw, panel_bag_fallback_accepted = _run_panel_bag_number_fallback(
+                img,
+                panel,
+                shell_hint_score=shell_score,
+                include_image=include_image,
+                vis=vis,
+            )
+            if panel_bag_fallback_accepted:
+                shell_method = f"{shell_method}_panel_bag_fallback"
     else:
         if fallback_square_rel is None and fallback_shell_score is None:
             fallback_intro_frame_abs, fallback_square_rel, fallback_shell_score, fallback_shell_method = _find_full_page_fallback_candidate_with_debug(img)
@@ -2123,7 +2242,10 @@ def analyze_page(page: int, include_image: bool = True):
                 2,
             )
         elif panel_found:
-            txt = f"NO SHELL ({shell_score:.2f})" if shell_score is not None else "NO SHELL"
+            if panel_bag_fallback_accepted:
+                txt = "NO SHELL (PANEL BAG OCR ACCEPTED)"
+            else:
+                txt = f"NO SHELL ({shell_score:.2f})" if shell_score is not None else "NO SHELL"
             cv2.putText(
                 vis,
                 txt,
