@@ -31,10 +31,6 @@ ANALYZE_PAGE_CACHE_LOCK = threading.Lock()
 SEQUENCE_SCAN_ROWS_CACHE = {}
 SEQUENCE_SCAN_ROWS_CACHE_LOCK = threading.Lock()
 SEQUENCE_SCAN_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
-FULL_PAGE_FALLBACK_MIN_SHELL_SCORE = 0.76
-PANEL_BAG_FALLBACK_MIN_SHELL_HINT = 0.88
-PANEL_BAG_FALLBACK_MIN_BAG_SCORE = 8.0
-PANEL_BAG_FALLBACK_MIN_OCR_SCORE = 120.0
 
 
 def _clone_cached_value(value):
@@ -64,32 +60,6 @@ def _switch_detector_pages_dir(pages_dir: Path):
     BASE = pages_dir.as_posix()
     _clear_detector_caches()
     SHELL_TEMPLATE = make_shell_template()
-
-
-
-def _get_current_dataset_info():
-    base_path = Path(BASE)
-    parts = list(base_path.parts)
-
-    try:
-        debug_idx = parts.index('debug')
-    except ValueError:
-        debug_idx = -1
-
-    set_num = None
-    pdf_name = None
-    if debug_idx >= 0 and len(parts) > debug_idx + 2:
-        set_num = parts[debug_idx + 1]
-        pdf_name = parts[debug_idx + 2]
-    else:
-        if base_path.parent.name == 'pages':
-            pdf_name = base_path.parent.parent.name or None
-            set_num = base_path.parent.parent.parent.name or None
-
-    return {
-        'set_num': set_num or 'unknown',
-        'pdf_name': pdf_name or 'unknown',
-    }
 
 
 
@@ -725,85 +695,6 @@ def _find_square_box_inside_candidate(candidate_img):
     return best, (float(best_score) if best_score is not None else None)
 
 
-
-def _find_full_page_intro_box_inside_candidate(candidate_img):
-    square_box, square_score = _find_square_box_inside_candidate(candidate_img)
-    if square_box is not None and square_score is not None:
-        return square_box, square_score
-
-    if candidate_img is None or candidate_img.size == 0:
-        return None, None
-
-    ch, cw = candidate_img.shape[:2]
-    gray = cv2.cvtColor(candidate_img, cv2.COLOR_BGR2GRAY)
-
-    search_x1, search_y1 = 0, 0
-    search_x2, search_y2 = int(cw * 0.90), ch
-    search = gray[search_y1:search_y2, search_x1:search_x2]
-    if search.size == 0:
-        return None, None
-
-    mask = cv2.threshold(search, 205, 255, cv2.THRESH_BINARY_INV)[1]
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidate_area = float(ch * cw)
-    best = None
-    best_score = None
-
-    for contour in cnts:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        area_ratio = (bw * bh) / max(1.0, candidate_area)
-        wh_ratio = bw / float(max(bh, 1))
-
-        if area_ratio < 0.22 or area_ratio > 0.90:
-            continue
-        if wh_ratio < 0.90 or wh_ratio > 1.60:
-            continue
-        if bh < ch * 0.50:
-            continue
-        if x > int(cw * 0.16):
-            continue
-
-        roi = search[y:y + bh, x:x + bw]
-        if roi.size == 0:
-            continue
-
-        stats = _border_center_stats(roi)
-        if stats is None:
-            continue
-
-        border_mean = stats["border_mean"]
-        center_mean = stats["center_mean"]
-        roi_std = stats["std"]
-        if border_mean < 170:
-            continue
-        if center_mean > border_mean - 10:
-            continue
-        if roi_std < 18:
-            continue
-
-        edge_density = float(np.mean(cv2.Canny(roi, 30, 120) > 0))
-        if edge_density < 0.02:
-            continue
-
-        score = 0.0
-        score += max(0.0, border_mean - center_mean) / 55.0
-        score += roi_std / 55.0
-        score += edge_density * 4.5
-        score += max(0.0, 1.4 - abs(wh_ratio - 1.25))
-        score += max(0.0, (bw / max(1.0, cw)) - 0.55) * 1.5
-        score -= abs(area_ratio - 0.62) * 2.0
-        score = max(0.0, min(1.0, score / 3.4))
-
-        if best_score is None or score > best_score:
-            best_score = score
-            best = (x + search_x1, y + search_y1, bw, bh)
-
-    return best, (float(best_score) if best_score is not None else None)
-
-
 def _score_side_tail(candidate_img, square_box, side):
     if candidate_img is None or candidate_img.size == 0 or square_box is None:
         return 0.0
@@ -872,254 +763,6 @@ def _find_side_tail(candidate_img, square_box):
     if left_score > right_score and left_score >= 0.22:
         return "left", left_score
     return None, max(right_score, left_score)
-
-
-def _score_full_page_fallback_layout(page_img, candidate_box, intro_box, tail_side):
-    if page_img is None or candidate_box is None or intro_box is None:
-        return 0.0
-
-    page_h, page_w = page_img.shape[:2]
-    x, y, w, h = candidate_box
-    ix, iy, iw, ih = intro_box
-
-    page_area = float(max(1, page_h * page_w))
-    y_ratio = y / max(1.0, float(page_h))
-    area_ratio = (w * h) / page_area
-    intro_fill_ratio = (iw * ih) / max(1.0, float(w * h))
-    left_anchor_ratio = ix / max(1.0, float(w))
-    preview_width_ratio = max(0.0, (w - (ix + iw)) / max(1.0, float(w)))
-
-    preview_score = 0.0
-    preview_x1 = min(w, ix + iw)
-    preview_y1 = max(0, iy + int(ih * 0.08))
-    preview_y2 = min(h, iy + int(ih * 0.92))
-    if preview_x1 < w and preview_y2 > preview_y1:
-        preview_roi = crop(page_img[y:y + h, x:x + w], (preview_x1, preview_y1, w - preview_x1, preview_y2 - preview_y1))
-        if preview_roi is not None and preview_roi.size != 0:
-            preview_gray = cv2.cvtColor(preview_roi, cv2.COLOR_BGR2GRAY)
-            preview_edges = float(np.mean(cv2.Canny(preview_gray, 30, 120) > 0))
-            preview_dark = float(np.mean(cv2.threshold(preview_gray, 210, 255, cv2.THRESH_BINARY_INV)[1] > 0))
-            preview_score = max(0.0, min(1.0, (preview_width_ratio * 1.8) + (preview_edges * 4.0) + (preview_dark * 0.6)))
-
-    top_bias = max(0.0, min(1.0, 1.0 - (y_ratio / 0.60)))
-    lower_page_penalty = max(0.0, min(1.0, (y_ratio - 0.28) / 0.35))
-    size_bias = max(0.0, min(1.0, area_ratio / 0.11))
-    left_anchor_score = max(0.0, min(1.0, 1.0 - abs(left_anchor_ratio - 0.08) * 5.0))
-    fill_score = max(0.0, min(1.0, 1.0 - abs(intro_fill_ratio - 0.68) * 2.0))
-
-    if tail_side == "right":
-        preview_score = min(1.0, preview_score + 0.08)
-
-    layout_score = (
-        (top_bias * 0.58)
-        + (size_bias * 0.14)
-        + (preview_score * 0.12)
-        + (left_anchor_score * 0.08)
-        + (fill_score * 0.08)
-        - (lower_page_penalty * 0.35)
-    )
-    return max(0.0, min(1.0, layout_score))
-
-
-
-def _find_full_intro_frame_candidates(page_img):
-    if page_img is None or page_img.size == 0:
-        return []
-
-    page_h, page_w = page_img.shape[:2]
-    gray = cv2.cvtColor(page_img, cv2.COLOR_BGR2GRAY)
-
-    sx1, sy1 = 0, 0
-    sx2, sy2 = int(page_w * 0.78), int(page_h * 0.68)
-    search = gray[sy1:sy2, sx1:sx2]
-    if search.size == 0:
-        return []
-
-    mask = cv2.threshold(search, 215, 255, cv2.THRESH_BINARY)[1]
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    page_area = float(max(1, page_h * page_w))
-    candidates = []
-
-    for contour in cnts:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        area_ratio = (bw * bh) / page_area
-        width_ratio = bw / max(1.0, float(page_w))
-        height_ratio = bh / max(1.0, float(page_h))
-        wh_ratio = bw / float(max(bh, 1))
-
-        if area_ratio < 0.10 or area_ratio > 0.40:
-            continue
-        if width_ratio < 0.30 or width_ratio > 0.78:
-            continue
-        if height_ratio < 0.18 or height_ratio > 0.62:
-            continue
-        if wh_ratio < 0.90 or wh_ratio > 2.40:
-            continue
-        if x > int(page_w * 0.10):
-            continue
-        if y > int(page_h * 0.10):
-            continue
-
-        roi = search[y:y + bh, x:x + bw]
-        if roi.size == 0:
-            continue
-
-        roi_mean = float(np.mean(roi))
-        white_density = float(np.mean(roi > 220))
-        edge_density = float(np.mean(cv2.Canny(roi, 30, 120) > 0))
-        if roi_mean < 180.0:
-            continue
-        if white_density < 0.48:
-            continue
-
-        top_bias = max(0.0, min(1.0, 1.0 - ((y / max(1.0, float(page_h))) / 0.16)))
-        size_bias = max(0.0, min(1.0, area_ratio / 0.24))
-        shape_bias = max(0.0, min(1.0, 1.0 - abs(wh_ratio - 1.45) / 0.95))
-
-        score = (
-            (top_bias * 0.34)
-            + (size_bias * 0.24)
-            + (white_density * 0.24)
-            + (min(edge_density * 4.0, 1.0) * 0.10)
-            + (shape_bias * 0.08)
-        )
-
-        candidates.append({
-            "box": (x + sx1, y + sy1, bw, bh),
-            "score": float(max(0.0, min(0.99, score))),
-        })
-
-    deduped = []
-    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
-        if any(_box_iou(candidate["box"], existing["box"]) > 0.60 for existing in deduped):
-            continue
-        deduped.append(candidate)
-
-    return deduped[:6]
-
-
-
-def _find_inner_down_tail_region_inside_frame(frame_img):
-    if frame_img is None or frame_img.size == 0:
-        return None, None
-
-    fh, fw = frame_img.shape[:2]
-    gray = cv2.cvtColor(frame_img, cv2.COLOR_BGR2GRAY)
-
-    sx1, sy1 = 0, 0
-    sx2, sy2 = fw, int(fh * 0.72)
-    search = gray[sy1:sy2, sx1:sx2]
-    if search.size == 0:
-        return None, None
-
-    mask = cv2.threshold(search, 215, 255, cv2.THRESH_BINARY_INV)[1]
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    frame_area = float(max(1, fh * fw))
-    best = None
-    best_score = None
-
-    for contour in cnts:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        area_ratio = (bw * bh) / frame_area
-        width_ratio = bw / max(1.0, float(fw))
-        height_ratio = bh / max(1.0, float(fh))
-        wh_ratio = bw / float(max(bh, 1))
-        bottom_room = max(0.0, (fh - (y + bh)) / max(1.0, float(fh)))
-
-        if area_ratio < 0.10 or area_ratio > 0.62:
-            continue
-        if width_ratio < 0.45 or width_ratio > 0.99:
-            continue
-        if height_ratio < 0.20 or height_ratio > 0.72:
-            continue
-        if wh_ratio < 1.20 or wh_ratio > 3.20:
-            continue
-        if y > int(fh * 0.18):
-            continue
-        if bottom_room < 0.12:
-            continue
-
-        roi = search[y:y + bh, x:x + bw]
-        if roi.size == 0:
-            continue
-
-        stats = _border_center_stats(roi)
-        if stats is None:
-            continue
-
-        roi_std = stats["std"]
-        edge_density = float(np.mean(cv2.Canny(roi, 30, 120) > 0))
-        center_x_ratio = (x + (bw / 2.0)) / max(1.0, float(fw))
-
-        if roi_std < 20.0:
-            continue
-        if edge_density < 0.02:
-            continue
-
-        top_bias = max(0.0, min(1.0, 1.0 - ((y / max(1.0, float(fh))) / 0.18)))
-        width_bias = max(0.0, min(1.0, 1.0 - abs(width_ratio - 0.66) / 0.36))
-        height_bias = max(0.0, min(1.0, 1.0 - abs(height_ratio - 0.52) / 0.24))
-        room_bias = max(0.0, min(1.0, bottom_room / 0.28))
-        center_bias = max(0.0, min(1.0, 1.0 - abs(center_x_ratio - 0.46) / 0.42))
-
-        score = (
-            (top_bias * 0.28)
-            + (width_bias * 0.18)
-            + (height_bias * 0.16)
-            + (room_bias * 0.18)
-            + (center_bias * 0.10)
-            + (min(edge_density * 4.0, 1.0) * 0.10)
-        )
-
-        if best_score is None or score > best_score:
-            best_score = score
-            best = (x + sx1, y + sy1, bw, bh)
-
-    return best, (float(best_score) if best_score is not None else None)
-
-
-
-def _find_full_page_fallback_candidate_with_debug(page_img):
-    frame_candidates = _find_full_intro_frame_candidates(page_img)
-    if not frame_candidates:
-        return None, None, None, "intro_frame"
-
-    best_partial_score = frame_candidates[0]["score"]
-    best_candidate = None
-
-    for frame_candidate in frame_candidates:
-        frame_box = frame_candidate["box"]
-        frame_img = crop(page_img, frame_box)
-        if frame_img is None or frame_img.size == 0:
-            continue
-
-        inner_box_rel, inner_score = _find_inner_down_tail_region_inside_frame(frame_img)
-        if inner_box_rel is None or inner_score is None:
-            continue
-
-        fx, fy, _, _ = frame_box
-        inner_box_abs = (fx + inner_box_rel[0], fy + inner_box_rel[1], inner_box_rel[2], inner_box_rel[3])
-
-        combined_score = max(0.0, min(0.99, (frame_candidate["score"] * 0.48) + (inner_score * 0.52) + 0.08))
-        candidate = {
-            "frame_box": frame_box,
-            "inner_box": inner_box_abs,
-            "score": float(combined_score),
-            "method": "intro_frame_then_inner_down",
-        }
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
-            best_candidate = candidate
-
-    if best_candidate is None:
-        return None, None, float(best_partial_score), "intro_frame"
-
-    return best_candidate["frame_box"], best_candidate["inner_box"], best_candidate["score"], best_candidate["method"]
 
 
 def _find_structured_shell_candidate_with_debug(panel_img):
@@ -1844,219 +1487,6 @@ def compute_confidence(panel_found, shell_found, grey_bag_found,
     return round(min(score, 1.0), 3)
 
 
-def _build_fast_reject_result(page: int):
-    return {
-        "page": page,
-        "panel_found": False,
-        "panel_box": None,
-        "panel_source": "fast_reject",
-        "panel_score": None,
-        "shell_found": False,
-        "shell_box": None,
-        "shell_score": None,
-        "shell_method": "none",
-        "grey_bag_found": False,
-        "grey_bag_box": None,
-        "grey_bag_score": None,
-        "number_box_found": False,
-        "number_box": None,
-        "bag_number": None,
-        "ocr_raw": "",
-        "confidence": compute_confidence(False, False, False, False, None, None, None),
-    }
-
-
-
-def _run_square_bag_number_pipeline(
-    img,
-    square_abs,
-    *,
-    include_image=False,
-    vis=None,
-    allow_structure_ocr_fallback=False,
-    draw_square_box=True,
-):
-    if square_abs is None:
-        return None, None, None, None, "", False
-
-    if include_image and vis is not None and draw_square_box:
-        draw_box(vis, square_abs, (255, 0, 0), 3)
-
-    square_img = crop(img, square_abs)
-    bag_rel, bag_score = find_grey_bag_blob(square_img)
-
-    bag_abs = None
-    ocr_search_abs = None
-    structure_ocr_mode = False
-
-    if bag_rel is not None:
-        bx, by, _, _ = square_abs
-        gx, gy, gw, gh = bag_rel
-        bag_abs = (bx + gx, by + gy, gw, gh)
-        ocr_search_abs = bag_abs
-
-        if include_image and vis is not None:
-            draw_box(vis, bag_abs, (0, 200, 255), 2)
-    elif allow_structure_ocr_fallback:
-        ocr_search_abs = square_abs
-        structure_ocr_mode = True
-    else:
-        return None, bag_score, None, None, "", False
-
-    ocr_img = crop(img, ocr_search_abs)
-
-    best_candidate = None
-    best_multi_digit_candidate = None
-
-    for number_rel in find_number_crop(ocr_img):
-        ox, oy, _, _ = ocr_search_abs
-        nx, ny, nw, nh = number_rel
-
-        number_abs_try = (ox + nx, oy + ny, nw, nh)
-        number_img = crop(img, number_abs_try)
-
-        val, raw, ocr_score = read_bag_number_with_score(number_img)
-        if val is None:
-            continue
-
-        candidate = {
-            "score": ocr_score,
-            "number": val,
-            "raw": raw,
-            "box": number_abs_try,
-        }
-
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
-            best_candidate = candidate
-
-        if len(str(val)) >= 2:
-            if best_multi_digit_candidate is None or candidate["score"] > best_multi_digit_candidate["score"]:
-                best_multi_digit_candidate = candidate
-
-    chosen_candidate = best_candidate
-    if (
-        best_candidate is not None and
-        best_multi_digit_candidate is not None and
-        best_multi_digit_candidate["score"] >= 90.0 and
-        best_multi_digit_candidate["score"] + 40.0 >= best_candidate["score"]
-    ):
-        chosen_candidate = best_multi_digit_candidate
-
-    if chosen_candidate is None:
-        return bag_abs, bag_score, None, None, "", False
-
-    number_abs = chosen_candidate["box"]
-    if include_image and vis is not None:
-        draw_box(vis, number_abs, (0, 0, 255), 2)
-
-    structure_ocr_accepted = structure_ocr_mode and bag_rel is None
-    return bag_abs, bag_score, number_abs, chosen_candidate["number"], chosen_candidate["raw"], structure_ocr_accepted
-
-
-def _iter_panel_bag_fallback_regions(panel_abs):
-    if panel_abs is None:
-        return []
-
-    px, py, pw, ph = panel_abs
-    rel_boxes = [
-        (0.00, 0.00, 0.35, 0.85),
-        (0.00, 0.00, 0.45, 1.00),
-        (0.05, 0.05, 0.50, 0.90),
-    ]
-
-    regions = []
-    for rx, ry, rw, rh in rel_boxes:
-        x = px + int(round(pw * rx))
-        y = py + int(round(ph * ry))
-        w = int(round(pw * rw))
-        h = int(round(ph * rh))
-        if w < 20 or h < 20:
-            continue
-        regions.append((x, y, w, h))
-
-    return regions
-
-
-def _run_panel_bag_number_fallback(
-    img,
-    panel_abs,
-    *,
-    shell_hint_score=None,
-    include_image=False,
-    vis=None,
-):
-    if (
-        panel_abs is None or
-        shell_hint_score is None or
-        shell_hint_score < PANEL_BAG_FALLBACK_MIN_SHELL_HINT
-    ):
-        return None, None, None, None, "", False
-
-    panel_x, panel_y, panel_w, panel_h = panel_abs
-    panel_area = float(max(1, panel_w * panel_h))
-    best_candidate = None
-
-    for roi_abs in _iter_panel_bag_fallback_regions(panel_abs):
-        bag_abs, bag_score, number_abs, bag_number, ocr_raw, _ = _run_square_bag_number_pipeline(
-            img,
-            roi_abs,
-            include_image=False,
-            vis=None,
-            allow_structure_ocr_fallback=False,
-            draw_square_box=False,
-        )
-        if bag_abs is None or number_abs is None or bag_number is None:
-            continue
-        if bag_score is None or bag_score < PANEL_BAG_FALLBACK_MIN_BAG_SCORE:
-            continue
-
-        number_img = crop(img, number_abs)
-        _, _, ocr_score = read_bag_number_with_score(number_img)
-        if ocr_score < PANEL_BAG_FALLBACK_MIN_OCR_SCORE:
-            continue
-
-        roi_x, roi_y, roi_w, roi_h = roi_abs
-        roi_area_ratio = (roi_w * roi_h) / panel_area
-        left_bias = 1.0 - ((roi_x - panel_x) / max(1.0, float(panel_w)))
-        top_bias = 1.0 - ((roi_y - panel_y) / max(1.0, float(panel_h)))
-        area_bias = max(0.0, 1.0 - abs(roi_area_ratio - 0.30) / 0.28)
-
-        candidate_score = (
-            ocr_score
-            + (bag_score * 1.8)
-            + (left_bias * 18.0)
-            + (top_bias * 12.0)
-            + (area_bias * 10.0)
-        )
-
-        candidate = {
-            "score": float(candidate_score),
-            "bag_abs": bag_abs,
-            "bag_score": bag_score,
-            "number_abs": number_abs,
-            "bag_number": bag_number,
-            "ocr_raw": ocr_raw,
-        }
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
-            best_candidate = candidate
-
-    if best_candidate is None:
-        return None, None, None, None, "", False
-
-    if include_image and vis is not None:
-        draw_box(vis, best_candidate["bag_abs"], (0, 200, 255), 2)
-        draw_box(vis, best_candidate["number_abs"], (0, 0, 255), 2)
-
-    return (
-        best_candidate["bag_abs"],
-        best_candidate["bag_score"],
-        best_candidate["number_abs"],
-        best_candidate["bag_number"],
-        best_candidate["ocr_raw"],
-        True,
-    )
-
-
 # --------------------------------------------------
 # PAGE ANALYSIS
 # --------------------------------------------------
@@ -2066,15 +1496,6 @@ def analyze_page(page: int, include_image: bool = True):
         raise HTTPException(status_code=404, detail="Page not found")
 
     cache_key = None
-    img = None
-    preloaded_panel = None
-    preloaded_panel_source = None
-    preloaded_panel_score = None
-    fallback_intro_frame_abs = None
-    fallback_square_rel = None
-    fallback_shell_score = None
-    fallback_shell_method = "none"
-
     if not include_image:
         cache_key = _path_cache_key(path)
         with ANALYZE_PAGE_CACHE_LOCK:
@@ -2083,40 +1504,38 @@ def analyze_page(page: int, include_image: bool = True):
             return _clone_cached_value(cached)
 
         if not _passes_fast_panel_precheck_path(path):
-            img = cv2.imread(path)
-            if img is None:
-                raise HTTPException(status_code=500, detail="Could not read image")
+            fast_reject_result = {
+                "page": page,
+                "panel_found": False,
+                "panel_box": None,
+                "panel_source": "fast_reject",
+                "panel_score": None,
+                "shell_found": False,
+                "shell_box": None,
+                "shell_score": None,
+                "shell_method": "none",
+                "grey_bag_found": False,
+                "grey_bag_box": None,
+                "grey_bag_score": None,
+                "number_box_found": False,
+                "number_box": None,
+                "bag_number": None,
+                "ocr_raw": "",
+                "confidence": compute_confidence(False, False, False, False, None, None, None),
+            }
+            with ANALYZE_PAGE_CACHE_LOCK:
+                ANALYZE_PAGE_CACHE[cache_key] = _clone_cached_value(fast_reject_result)
+            return fast_reject_result
 
-            preloaded_panel, preloaded_panel_source, preloaded_panel_score = find_bag_intro_panel_with_debug(img)
-            if preloaded_panel is None:
-                fallback_intro_frame_abs, fallback_square_rel, fallback_shell_score, fallback_shell_method = _find_full_page_fallback_candidate_with_debug(img)
-                if (
-                    fallback_intro_frame_abs is None or
-                    fallback_square_rel is None or
-                    fallback_shell_score is None or
-                    fallback_shell_score < FULL_PAGE_FALLBACK_MIN_SHELL_SCORE
-                ):
-                    fast_reject_result = _build_fast_reject_result(page)
-                    with ANALYZE_PAGE_CACHE_LOCK:
-                        ANALYZE_PAGE_CACHE[cache_key] = _clone_cached_value(fast_reject_result)
-                    return fast_reject_result
-
-    if img is None:
-        img = cv2.imread(path)
+    img = cv2.imread(path)
     if img is None:
         raise HTTPException(status_code=500, detail="Could not read image")
 
     vis = img.copy() if include_image else None
 
-    if preloaded_panel_source is None:
-        panel, panel_source, panel_score = find_bag_intro_panel_with_debug(img)
-    else:
-        panel = preloaded_panel
-        panel_source = preloaded_panel_source
-        panel_score = preloaded_panel_score
+    panel, panel_source, panel_score = find_bag_intro_panel_with_debug(img)
 
     square_abs = None
-    full_intro_frame_abs = None
     shell_score = None
     shell_method = "none"
     bag_abs = None
@@ -2124,63 +1543,90 @@ def analyze_page(page: int, include_image: bool = True):
     number_abs = None
     bag_number = None
     ocr_raw = ""
-    structure_ocr_accepted = False
-    panel_bag_fallback_accepted = False
 
-    panel_found = panel is not None
-
-    if panel_found and include_image:
+    if panel is not None and include_image:
         draw_box(vis, panel, (0, 255, 0), 4)
 
-    if panel_found:
+    # --------------------------------------------------
+    # PANEL → SHELL → BAG → NUMBER
+    # --------------------------------------------------
+    if panel is not None:
         panel_img = crop(img, panel)
+
         square_rel, shell_score, shell_method = find_square_bag_box_with_debug(panel_img)
 
         if square_rel is not None:
             px, py, _, _ = panel
             sx, sy, sw, sh = square_rel
+
             square_abs = (px + sx, py + sy, sw, sh)
-            bag_abs, bag_score, number_abs, bag_number, ocr_raw, structure_ocr_accepted = _run_square_bag_number_pipeline(
-                img,
-                square_abs,
-                include_image=include_image,
-                vis=vis,
-            )
-        else:
-            bag_abs, bag_score, number_abs, bag_number, ocr_raw, panel_bag_fallback_accepted = _run_panel_bag_number_fallback(
-                img,
-                panel,
-                shell_hint_score=shell_score,
-                include_image=include_image,
-                vis=vis,
-            )
-            if panel_bag_fallback_accepted:
-                shell_method = f"{shell_method}_panel_bag_fallback"
-    else:
-        if fallback_square_rel is None and fallback_shell_score is None:
-            fallback_intro_frame_abs, fallback_square_rel, fallback_shell_score, fallback_shell_method = _find_full_page_fallback_candidate_with_debug(img)
 
-        full_intro_frame_abs = fallback_intro_frame_abs
-        shell_method = f"full_page_fallback_{fallback_shell_method}"
-        shell_score = fallback_shell_score
+            if include_image:
+                draw_box(vis, square_abs, (255, 0, 0), 3)
 
-        if (
-            fallback_intro_frame_abs is not None and
-            fallback_square_rel is not None and
-            fallback_shell_score is not None and
-            fallback_shell_score >= FULL_PAGE_FALLBACK_MIN_SHELL_SCORE
-        ):
-            square_abs = fallback_square_rel
-            bag_abs, bag_score, number_abs, bag_number, ocr_raw, structure_ocr_accepted = _run_square_bag_number_pipeline(
-                img,
-                square_abs,
-                include_image=include_image,
-                vis=vis,
-                allow_structure_ocr_fallback=True,
-            )
-            if structure_ocr_accepted:
-                shell_method = f"{shell_method}_structure_ocr"
+            square_img = crop(img, square_abs)
 
+            bag_rel, bag_score = find_grey_bag_blob(square_img)
+
+            if bag_rel is not None:
+                bx, by, _, _ = square_abs
+                gx, gy, gw, gh = bag_rel
+                bag_abs = (bx + gx, by + gy, gw, gh)
+
+                if include_image:
+                    draw_box(vis, bag_abs, (0, 200, 255), 2)
+
+                bag_img = crop(img, bag_abs)
+
+                best_candidate = None
+                best_multi_digit_candidate = None
+
+                for number_rel in find_number_crop(bag_img):
+                    gx2, gy2, _, _ = bag_abs
+                    nx, ny, nw, nh = number_rel
+
+                    number_abs_try = (gx2 + nx, gy2 + ny, nw, nh)
+                    number_img = crop(img, number_abs_try)
+
+                    val, raw, ocr_score = read_bag_number_with_score(number_img)
+                    if val is None:
+                        continue
+
+                    candidate = {
+                        "score": ocr_score,
+                        "number": val,
+                        "raw": raw,
+                        "box": number_abs_try,
+                    }
+
+                    if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                        best_candidate = candidate
+
+                    if len(str(val)) >= 2:
+                        if best_multi_digit_candidate is None or candidate["score"] > best_multi_digit_candidate["score"]:
+                            best_multi_digit_candidate = candidate
+
+                chosen_candidate = best_candidate
+                if (
+                    best_candidate is not None and
+                    best_multi_digit_candidate is not None and
+                    best_multi_digit_candidate["score"] >= 90.0 and
+                    best_multi_digit_candidate["score"] + 40.0 >= best_candidate["score"]
+                ):
+                    chosen_candidate = best_multi_digit_candidate
+
+                if chosen_candidate is not None:
+                    bag_number = chosen_candidate["number"]
+                    ocr_raw = chosen_candidate["raw"]
+                    number_abs = chosen_candidate["box"]
+
+                    if include_image and number_abs is not None:
+                        draw_box(vis, number_abs, (0, 0, 255), 2)
+
+    # --------------------------------------------------
+    # FLAGS
+    # --------------------------------------------------
+    panel_found = panel is not None
     shell_found = square_abs is not None
     grey_bag_found = bag_abs is not None
     number_box_found = number_abs is not None
@@ -2195,6 +1641,9 @@ def analyze_page(page: int, include_image: bool = True):
         bag_score,
     )
 
+    # --------------------------------------------------
+    # DRAW LABELS
+    # --------------------------------------------------
     if include_image:
         if panel_found:
             panel_label = "BAG PANEL" if panel_source == "strict_top_left" else f"BAG PANEL {panel_source}"
@@ -2208,27 +1657,15 @@ def analyze_page(page: int, include_image: bool = True):
                 2,
             )
         else:
-            panel_label = "NO PANEL (FULL PAGE FALLBACK)" if shell_method.startswith("full_page_fallback") else "NO PANEL"
             cv2.putText(
                 vis,
-                panel_label,
+                "NO PANEL",
                 (30, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.0,
                 (0, 0, 255),
                 2,
             )
-            if full_intro_frame_abs is not None:
-                draw_box(vis, full_intro_frame_abs, (0, 255, 0), 4)
-                cv2.putText(
-                    vis,
-                    "FULL INTRO FRAME",
-                    (full_intro_frame_abs[0], max(30, full_intro_frame_abs[1] - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                )
 
         if shell_found:
             shell_label = f"SHELL {shell_method} {shell_score:.2f}" if shell_score is not None else f"SHELL {shell_method}"
@@ -2242,21 +1679,7 @@ def analyze_page(page: int, include_image: bool = True):
                 2,
             )
         elif panel_found:
-            if panel_bag_fallback_accepted:
-                txt = "NO SHELL (PANEL BAG OCR ACCEPTED)"
-            else:
-                txt = f"NO SHELL ({shell_score:.2f})" if shell_score is not None else "NO SHELL"
-            cv2.putText(
-                vis,
-                txt,
-                (30, 75),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 0, 0),
-                2,
-            )
-        elif shell_method.startswith("full_page_fallback"):
-            txt = f"NO FULL PAGE SHELL ({shell_score:.2f})" if shell_score is not None else "NO FULL PAGE SHELL"
+            txt = f"NO SHELL ({shell_score:.2f})" if shell_score is not None else "NO SHELL"
             cv2.putText(
                 vis,
                 txt,
@@ -2278,10 +1701,9 @@ def analyze_page(page: int, include_image: bool = True):
                 2,
             )
         elif shell_found:
-            grey_label = "NO GREY BAG (STRUCTURE+OCR ACCEPTED)" if structure_ocr_accepted else "NO GREY BAG"
             cv2.putText(
                 vis,
-                grey_label,
+                "NO GREY BAG",
                 (30, 105),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
@@ -2290,7 +1712,7 @@ def analyze_page(page: int, include_image: bool = True):
             )
 
         label = f"BAG {bag_number}" if bag_number is not None else "BAG ?"
-        if panel_found or shell_method.startswith("full_page_fallback"):
+        if panel_found:
             cv2.putText(
                 vis,
                 f"{label}  CONF {confidence:.2f}",
@@ -2307,7 +1729,6 @@ def analyze_page(page: int, include_image: bool = True):
         "panel_box": list(panel) if panel_found else None,
         "panel_source": panel_source,
         "panel_score": panel_score,
-        "full_intro_frame_box": list(full_intro_frame_abs) if full_intro_frame_abs is not None else None,
         "shell_found": shell_found,
         "shell_box": list(square_abs) if shell_found else None,
         "shell_score": shell_score,
@@ -2868,7 +2289,6 @@ def api_missing_bag_debug(
         min_confidence=min_confidence,
         allow_structure_only_start=allow_structure_only_start,
     )
-    dataset_info = _get_current_dataset_info()
     if gap is None:
         raise HTTPException(status_code=404, detail="Could not build missing-bag debug output")
 
@@ -3080,7 +2500,6 @@ def debug_sequential(
         min_confidence=min_confidence,
         allow_structure_only_start=allow_structure_only_start,
     )
-    dataset_info = _get_current_dataset_info()
     query_string = (
         f"start_number={start_number}&"
         f"end_number={end_number}&"
@@ -3187,12 +2606,10 @@ def debug_sequential(
     </head>
     <body>
       <div class="card">
-        <a class="btn" href="/debug/load-set">Start New Check</a>
         <a class="btn" href="/debug/top-bags">Back to top bags</a>
         <a class="btn" href="/api/sequence-scan?{query_string}" target="_blank">Raw JSON sequence scan</a>
         {expected_next_link}
         <h2>Sequential scan</h2>
-        <p><strong>Loaded dataset:</strong> set {dataset_info['set_num']} / {dataset_info['pdf_name']}</p>
         <p><strong>Accepted sequence:</strong> {[r['number'] for r in data['accepted_sequence']]}</p>
         <p><strong>Scan range:</strong> {start_number}..{end_number}</p>
         <p><strong>Minimum confidence:</strong> {min_confidence:.2f}</p>
@@ -3298,7 +2715,6 @@ def debug_bag_thumbs(
         min_confidence=min_confidence,
         allow_structure_only_start=allow_structure_only_start,
     )
-    dataset_info = _get_current_dataset_info()
     query_string = (
         f"start_number={start_number}&"
         f"end_number={end_number}&"
@@ -3313,6 +2729,14 @@ def debug_bag_thumbs(
         thumb_url = _make_annotated_thumbnail_data_url(page, max_width=200)
         if thumb_url is None:
             continue
+
+        tiles.append(f"""
+        <a class="thumb-card" href="/api/annotated?page={page}" target="_blank">
+          <img src="{thumb_url}" alt="Bag {number} page {page}" loading="lazy" />
+          <div class="thumb-meta">Bag {number}</div>
+          <div class="thumb-sub">Page {page}</div>
+        </a>
+        """)
 
         tiles.append(f"""
         <a class="thumb-card" href="/api/annotated?page={page}" target="_blank">
@@ -3388,11 +2812,9 @@ def debug_bag_thumbs(
     </head>
     <body>
       <div class="card">
-        <a class="btn" href="/debug/load-set">Start New Check</a>
         <a class="btn" href="/debug/sequential?{query_string}">Back to sequential scan</a>
         <a class="btn" href="/api/sequence-scan?{query_string}" target="_blank">Raw JSON sequence scan</a>
         <h2>Accepted Bag Start Thumbnails</h2>
-        <p><strong>Loaded dataset:</strong> set {dataset_info['set_num']} / {dataset_info['pdf_name']}</p>
         <p><strong>Accepted sequence:</strong> {[item['number'] for item in data['accepted_sequence']]}</p>
         <p><strong>Accepted pages:</strong> {len(data['accepted_sequence'])}</p>
       </div>
@@ -3421,7 +2843,6 @@ def debug_bags(
         min_confidence=min_confidence,
         allow_structure_only_start=allow_structure_only_start,
     )
-    dataset_info = _get_current_dataset_info()
     query_string = (
         f"start_number={start_number}&"
         f"end_number={end_number}&"
@@ -3499,11 +2920,9 @@ def debug_bags(
     </head>
     <body>
       <div class="card">
-        <a class="btn" href="/debug/load-set">Start New Check</a>
         <a class="btn" href="/debug/sequential?{query_string}">Back to sequential scan</a>
         <a class="btn" href="/api/bag-ranges?{query_string}" target="_blank">Raw JSON bag ranges</a>
         <h2>Bag ranges</h2>
-        <p><strong>Loaded dataset:</strong> set {dataset_info['set_num']} / {dataset_info['pdf_name']}</p>
         <p><strong>Accepted sequence:</strong> {[item['number'] for item in payload['accepted_sequence']]}</p>
         <p><strong>Missing numbers:</strong> {payload['missing_numbers']}</p>
         <p><strong>Last page:</strong> {payload['last_page']}</p>
@@ -3568,7 +2987,6 @@ def debug_missing_bag(
         min_confidence=min_confidence,
         allow_structure_only_start=allow_structure_only_start,
     )
-    dataset_info = _get_current_dataset_info()
     if gap is None:
         raise HTTPException(status_code=404, detail="Could not build missing-bag debug output")
 
@@ -3655,11 +3073,9 @@ def debug_missing_bag(
     </head>
     <body>
       <div class="card">
-        <a class="btn" href="/debug/load-set">Start New Check</a>
         <a class="btn" href="/debug/sequential?start_number={start_number}&end_number={end_number}&min_confidence={min_confidence:.2f}&allow_structure_only_start={str(allow_structure_only_start).lower()}">Back to sequential scan</a>
         <a class="btn" href="/api/missing-bag-debug?{query_string}" target="_blank">Raw JSON gap debug</a>
         <h2>Bag {bag_number} debug</h2>
-        <p><strong>Loaded dataset:</strong> set {dataset_info['set_num']} / {dataset_info['pdf_name']}</p>
         <p><strong>Status:</strong> {gap['status']}</p>
         <p><strong>Accepted sequence:</strong> {accepted_sequence}</p>
         <p><strong>Previous accepted:</strong> {prev_text}</p>
