@@ -27,6 +27,50 @@ BAG_BADGE_REGION_HEIGHT_RATIO = 0.32
 BAG_BADGE_SAMPLE_STEP = 4
 BAG_BADGE_BRIGHT_THRESHOLD = 245
 BAG_BADGE_DARK_THRESHOLD = 180
+INTRO_PANEL_SEARCH_WIDTH_RATIO = 0.72
+INTRO_PANEL_SEARCH_HEIGHT_RATIO = 0.45
+INTRO_PANEL_MIN_AREA_RATIO = 0.08
+INTRO_PANEL_MAX_AREA_RATIO = 0.34
+INTRO_PANEL_MIN_ASPECT = 1.4
+INTRO_PANEL_MAX_ASPECT = 5.0
+INTRO_PANEL_BRIGHT_THRESHOLD = 236
+INTRO_PANEL_MIN_PAGE_MEAN = 165
+INTRO_PANEL_MIN_ROI_MEAN = 215
+INTRO_PANEL_LEFT_MAX_MEAN = 235
+INTRO_PANEL_LEFT_MIN_STD = 12
+INTRO_PANEL_RIGHT_MIN_STD = 10
+INTRO_PANEL_CANNY_LOW = 40
+INTRO_PANEL_CANNY_HIGH = 140
+INTRO_PANEL_MIN_EDGE_DENSITY = 0.015
+INTRO_PANEL_MIN_CONTRAST_GAP = 8
+INTRO_PANEL_LEFT_STD_SCALE = 30.0
+INTRO_PANEL_LEFT_STD_MAX_SCORE = 0.20
+INTRO_PANEL_RIGHT_STD_SCALE = 25.0
+INTRO_PANEL_RIGHT_STD_MAX_SCORE = 0.15
+INTRO_PANEL_EDGE_DENSITY_SCALE = 0.05
+INTRO_PANEL_EDGE_DENSITY_MAX_SCORE = 0.20
+INTRO_PANEL_CONTRAST_SCALE = 30.0
+INTRO_PANEL_CONTRAST_MAX_SCORE = 0.20
+INTRO_PANEL_AREA_IDEAL_RATIO = 0.18
+INTRO_PANEL_AREA_WEIGHT = 0.15
+INTRO_PANEL_MAX_SCORE = 0.90
+INTRO_PANEL_BOOST_THRESHOLD = 0.40
+INTRO_PANEL_START_LIKE_MIN = 0.40
+INTRO_PANEL_BOOST_MULTIPLIER = 0.20
+INTRO_PANEL_MAX_BOOST = 0.10
+MULTI_STEP_MIN_PANELS = 4
+MULTI_STEP_PANEL_MIN_AREA_RATIO = 0.04
+MULTI_STEP_PANEL_MAX_AREA_RATIO = 0.38
+MULTI_STEP_SIZE_TOLERANCE = 0.55
+MULTI_STEP_X_SPREAD_THRESHOLD = 0.40
+MULTI_STEP_Y_SPREAD_THRESHOLD = 0.20
+MULTI_STEP_CANNY_LOW = 30
+MULTI_STEP_CANNY_HIGH = 100
+MULTI_STEP_POLY_EPSILON = 0.03
+MULTI_STEP_MIN_VERTICES = 4
+MULTI_STEP_MAX_VERTICES = 8
+MULTI_STEP_MIN_ASPECT = 0.4
+MULTI_STEP_MAX_ASPECT = 4.0
 FEATURE_SCALES = {
     "word_count": 50.0,
     "drawing_count": 150.0,
@@ -220,6 +264,210 @@ def _detect_bag_icon_shape(page: PageData) -> tuple[float, list[str]]:
             return 0.0, ["small sticker-like box rejected"]
         return 0.0, ["no bag icon shape found in restricted region"]
     return best_score, best_reasons
+
+
+def _detect_intro_panel(page: PageData) -> tuple[float, list[str]]:
+    """Detect the bag-start intro panel in the top-left of the page.
+
+    A true bag-start page contains a wide bright panel anchored in the
+    top-left corner.  The panel has three internal zones:
+      - left  zone: the bag card / leaflet image (darker, textured)
+      - middle zone: red arrow connecting card to model (edge-dense)
+      - right zone:  partial model preview (brighter, textured)
+
+    Returns (score, reasons).  score is in the range [0.0, INTRO_PANEL_MAX_SCORE].
+    A score of 0.0 means no intro panel was found; higher values indicate
+    increasing confidence that the detected bright region is a bag-start panel.
+    """
+    if page.image_path is None or not page.image_path.exists():
+        return 0.0, ["no rendered page image available for intro panel detection"]
+
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return 0.0, ["opencv unavailable"]
+
+    image = cv2.imread(page.image_path.as_posix(), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return 0.0, ["image load failed"]
+
+    h, w = image.shape[:2]
+    page_mean = float(np.mean(image))
+    if page_mean < INTRO_PANEL_MIN_PAGE_MEAN:
+        return 0.0, ["page too dark for bag-start intro panel"]
+
+    sx2 = int(w * INTRO_PANEL_SEARCH_WIDTH_RATIO)
+    sy2 = int(h * INTRO_PANEL_SEARCH_HEIGHT_RATIO)
+    search = image[:sy2, :sx2]
+
+    _, th = cv2.threshold(search, INTRO_PANEL_BRIGHT_THRESHOLD, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    page_area = float(w * h)
+    best_score = 0.0
+    best_reasons: list[str] = ["no intro panel found in top-left region"]
+
+    for c in contours:
+        x, y, bw, bh = cv2.boundingRect(c)
+        area = bw * bh
+        area_ratio = area / page_area
+        wh_ratio = bw / float(max(bh, 1))
+
+        if not (INTRO_PANEL_MIN_AREA_RATIO <= area_ratio <= INTRO_PANEL_MAX_AREA_RATIO):
+            continue
+        if not (INTRO_PANEL_MIN_ASPECT <= wh_ratio <= INTRO_PANEL_MAX_ASPECT):
+            continue
+        if x > int(w * 0.08) or y > int(h * 0.10):
+            continue
+
+        roi = image[y: y + bh, x: x + bw]
+        if roi.size == 0:
+            continue
+
+        roi_mean = float(np.mean(roi))
+        if roi_mean < INTRO_PANEL_MIN_ROI_MEAN:
+            continue
+
+        left = roi[:, : int(bw * 0.28)]
+        mid = roi[:, int(bw * 0.28): int(bw * 0.45)]
+        right = roi[:, int(bw * 0.45):]
+
+        if left.size == 0 or mid.size == 0 or right.size == 0:
+            continue
+
+        left_mean = float(np.mean(left))
+        right_mean = float(np.mean(right))
+        left_std = float(np.std(left))
+        right_std = float(np.std(right))
+
+        # Left (bag card) must be darker/textured, not blank white
+        if left_mean > INTRO_PANEL_LEFT_MAX_MEAN or left_std < INTRO_PANEL_LEFT_MIN_STD:
+            continue
+        # Right (model preview) must have some texture
+        if right_std < INTRO_PANEL_RIGHT_MIN_STD:
+            continue
+
+        # Middle (arrow zone) must have edge structure
+        mid_edges = cv2.Canny(mid, INTRO_PANEL_CANNY_LOW, INTRO_PANEL_CANNY_HIGH)
+        mid_edge_density = float(np.mean(mid_edges > 0))
+        if mid_edge_density < INTRO_PANEL_MIN_EDGE_DENSITY:
+            continue
+
+        # Card (left) darker than model background (right)
+        contrast_gap = right_mean - left_mean
+        if contrast_gap < INTRO_PANEL_MIN_CONTRAST_GAP:
+            continue
+
+        score = 0.0
+        reasons: list[str] = [f"intro panel at ({x},{y}) size {bw}x{bh}"]
+        score += min(left_std / INTRO_PANEL_LEFT_STD_SCALE, INTRO_PANEL_LEFT_STD_MAX_SCORE)
+        reasons.append(f"bag-card zone texture std={left_std:.1f}")
+        score += min(right_std / INTRO_PANEL_RIGHT_STD_SCALE, INTRO_PANEL_RIGHT_STD_MAX_SCORE)
+        reasons.append(f"model-preview zone texture std={right_std:.1f}")
+        score += min(mid_edge_density / INTRO_PANEL_EDGE_DENSITY_SCALE, INTRO_PANEL_EDGE_DENSITY_MAX_SCORE)
+        reasons.append(f"arrow zone edge density={mid_edge_density:.3f}")
+        score += min(contrast_gap / INTRO_PANEL_CONTRAST_SCALE, INTRO_PANEL_CONTRAST_MAX_SCORE)
+        reasons.append(f"left-right contrast gap={contrast_gap:.1f}")
+        area_closeness = max(0.0, 1.0 - abs(area_ratio - INTRO_PANEL_AREA_IDEAL_RATIO) / INTRO_PANEL_AREA_IDEAL_RATIO)
+        score += area_closeness * INTRO_PANEL_AREA_WEIGHT
+        reasons.append(f"panel area ratio={area_ratio:.3f}")
+        score = min(score, INTRO_PANEL_MAX_SCORE)
+
+        if score > best_score:
+            best_score = score
+            best_reasons = reasons
+
+    return best_score, best_reasons
+
+
+def _detect_multi_step_grid(page: PageData) -> tuple[bool, list[str]]:
+    """Detect whether a page is a multi-step build-instruction grid.
+
+    Multi-step grid pages (e.g., a 2×2 or 2×3 layout of build steps) are
+    NOT bag-start pages.  They are identified by:
+      - four or more rectangular panels of similar size
+      - panels spread across both the horizontal and vertical extents of the
+        page (not confined to the top-left corner)
+
+    Returns (True, reasons) when the page should be rejected as a grid page.
+    Returns (False, reasons) when the page does not match the multi-step grid
+    pattern and should proceed to further bag-start evaluation.
+    """
+    if page.image_path is None or not page.image_path.exists():
+        return False, ["no rendered page image available for grid detection"]
+
+    try:
+        import cv2
+    except ImportError:
+        return False, ["opencv unavailable"]
+
+    image = cv2.imread(page.image_path.as_posix(), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return False, ["image load failed"]
+
+    h, w = image.shape[:2]
+    page_area = float(h * w)
+    min_panel_area = page_area * MULTI_STEP_PANEL_MIN_AREA_RATIO
+    max_panel_area = page_area * MULTI_STEP_PANEL_MAX_AREA_RATIO
+
+    edges = cv2.Canny(image, MULTI_STEP_CANNY_LOW, MULTI_STEP_CANNY_HIGH)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rect_panels: list[tuple[int, int, int, int]] = []
+    for c in contours:
+        perimeter = cv2.arcLength(c, True)
+        if perimeter <= 0:
+            continue
+        approx = cv2.approxPolyDP(c, MULTI_STEP_POLY_EPSILON * perimeter, True)
+        if len(approx) < MULTI_STEP_MIN_VERTICES or len(approx) > MULTI_STEP_MAX_VERTICES:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        area = bw * bh
+        if not (min_panel_area <= area <= max_panel_area):
+            continue
+        aspect = bw / float(max(bh, 1))
+        if not (MULTI_STEP_MIN_ASPECT <= aspect <= MULTI_STEP_MAX_ASPECT):
+            continue
+        rect_panels.append((x, y, bw, bh))
+
+    if len(rect_panels) < MULTI_STEP_MIN_PANELS:
+        return False, [
+            f"only {len(rect_panels)} panel-sized rectangles found "
+            f"(need {MULTI_STEP_MIN_PANELS})"
+        ]
+
+    areas = sorted(bw * bh for _, _, bw, bh in rect_panels)
+    median_area = areas[len(areas) // 2]
+    similar_panels = [
+        (x, y, bw, bh)
+        for x, y, bw, bh in rect_panels
+        if MULTI_STEP_SIZE_TOLERANCE * median_area
+        <= bw * bh
+        <= (1.0 / MULTI_STEP_SIZE_TOLERANCE) * median_area
+    ]
+
+    if len(similar_panels) < MULTI_STEP_MIN_PANELS:
+        return False, [
+            f"panels not uniform enough for multi-step grid "
+            f"({len(similar_panels)} similar of {len(rect_panels)} total)"
+        ]
+
+    x_centers = [x + bw // 2 for x, y, bw, bh in similar_panels]
+    y_centers = [y + bh // 2 for x, y, bw, bh in similar_panels]
+    x_spread = (max(x_centers) - min(x_centers)) / float(max(w, 1))
+    y_spread = (max(y_centers) - min(y_centers)) / float(max(h, 1))
+
+    if x_spread >= MULTI_STEP_X_SPREAD_THRESHOLD and y_spread >= MULTI_STEP_Y_SPREAD_THRESHOLD:
+        return True, [
+            f"multi-step grid: {len(similar_panels)} similar panels, "
+            f"x-spread={x_spread:.2f}, y-spread={y_spread:.2f}"
+        ]
+
+    return False, [
+        f"panels not in full-page grid "
+        f"(x-spread={x_spread:.2f}, y-spread={y_spread:.2f})"
+    ]
 
 
 def _detect_bag_badge(page: PageData) -> tuple[float, list[str]]:
@@ -812,6 +1060,8 @@ def _save_candidate_debug(
 
     bag_badge_score, bag_badge_reasons = _detect_bag_badge(page)
     bag_icon_score, bag_icon_reasons = _detect_bag_icon_shape(page)
+    intro_panel_score, intro_panel_reasons = _detect_intro_panel(page)
+    multi_step_grid, multi_step_reasons = _detect_multi_step_grid(page)
 
     payload = {
         "page_number": page.page_number,
@@ -825,6 +1075,10 @@ def _save_candidate_debug(
         "bag_badge_reasons": bag_badge_reasons,
         "bag_icon_score": round(bag_icon_score, 3),
         "bag_icon_reasons": bag_icon_reasons,
+        "intro_panel_score": round(intro_panel_score, 3),
+        "intro_panel_reasons": intro_panel_reasons,
+        "multi_step_grid": multi_step_grid,
+        "multi_step_grid_reasons": multi_step_reasons,
         "text_excerpt": page.text[:500],
         "word_count": page.word_count,
         "drawing_count": page.drawing_count,
@@ -862,6 +1116,40 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
         start_like_confidence, start_like_reasons = _bag_start_like_score(page, dark_ratio)
         bag_badge_score, bag_badge_reasons = _detect_bag_badge(page)
         bag_icon_score, _ = _detect_bag_icon_shape(page)
+        intro_panel_score, intro_panel_reasons = _detect_intro_panel(page)
+        multi_step_grid, multi_step_reasons = _detect_multi_step_grid(page)
+
+        LOG.debug(
+            "Page %s signals: start_like=%.3f badge=%.3f icon=%.3f intro_panel=%.3f multi_step_grid=%s",
+            page.page_number,
+            start_like_confidence,
+            bag_badge_score,
+            bag_icon_score,
+            intro_panel_score,
+            multi_step_grid,
+        )
+
+        # Hard rejection: multi-step grid pages are not bag-start pages.
+        # A reviewed bag label overrides this guard to allow manual corrections.
+        if multi_step_grid and reviewed_bag is None:
+            LOG.info(
+                "Rejected page %s as multi-step grid in %s: %s",
+                page.page_number,
+                pdf_path.name,
+                "; ".join(multi_step_reasons),
+            )
+            if debug:
+                _save_candidate_debug(
+                    debug_dir / "candidates",
+                    page,
+                    numbers,
+                    "rejected-grid",
+                    False,
+                    0.0,
+                    multi_step_reasons,
+                    dark_ratio,
+                )
+            continue
 
         if (
             bag_badge_score >= 0.90
@@ -871,6 +1159,19 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
             start_like_confidence = min(0.99, start_like_confidence + 0.03)
             start_like_reasons = start_like_reasons + [
                 f"strong bag header signals observed (badge {bag_badge_score:.3f}, icon {bag_icon_score:.3f})"
+            ]
+
+        # Positive boost: a detected intro panel (bag card + arrow + model zones)
+        # provides strong direct evidence that this is a bag-start page.
+        # The start_like_confidence guard prevents the intro panel from rescuing
+        # pages that fail all text/layout checks (e.g., dark promo pages that
+        # happen to have a bright rectangle in the top-left corner).
+        if intro_panel_score >= INTRO_PANEL_BOOST_THRESHOLD and start_like_confidence >= INTRO_PANEL_START_LIKE_MIN:
+            boost = min(intro_panel_score * INTRO_PANEL_BOOST_MULTIPLIER, INTRO_PANEL_MAX_BOOST)
+            start_like_confidence = min(0.99, start_like_confidence + boost)
+            start_like_reasons = start_like_reasons + [
+                f"intro panel detected (score {intro_panel_score:.3f}): "
+                + "; ".join(intro_panel_reasons[:2])
             ]
 
         page_numbers[page.page_number] = numbers
