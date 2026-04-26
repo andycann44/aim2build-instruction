@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+.venv/
+debug/
+instructions/
+output/
+downloads/
+*.pyc
+
+datasets/
+debug_shell/
+*.pdf
+*.png
+.DS_Store
+datasets/
