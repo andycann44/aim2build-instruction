@@ -1811,6 +1811,64 @@ def _is_build_step_page(page_img):
         )
     )
 
+def _detect_red_arrow(img):
+    """Detect a red/orange directional arrow, typical on LEGO bag-start pages.
+
+    Returns (box, score) where box is (x, y, w, h) or None when not found.
+    Score is a rough quality measure in [0, 1].
+    """
+    if img is None or img.size == 0:
+        return None, 0.0
+
+    page_h, page_w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # Red/orange hues wrap around 0 in HSV.
+    # Lower red: hue 0-20, upper red: hue 160-180.
+    mask1 = cv2.inRange(hsv, np.array([0, 120, 80]), np.array([20, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([160, 120, 80]), np.array([180, 255, 255]))
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_score = 0.0
+    page_area = float(page_w * page_h)
+
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = float(w * h)
+        area_ratio = area / max(1.0, page_area)
+
+        if area_ratio < 0.0005 or area_ratio > 0.06:
+            continue
+
+        # Arrows are elongated in at least one direction.
+        wh_ratio = float(max(w, h)) / float(max(min(w, h), 1))
+        if wh_ratio < 1.5:
+            continue
+
+        # Prefer upper portion of the page (below 70% height).
+        cy = y + h / 2.0
+        if cy > page_h * 0.70:
+            continue
+
+        cx = x + w / 2.0
+        upper_bonus = max(0.0, 1.0 - (cy / max(1.0, page_h * 0.60)))
+        left_bonus = max(0.0, 1.0 - (cx / max(1.0, page_w * 0.65)))
+        score = wh_ratio * 0.4 + upper_bonus * 0.3 + left_bonus * 0.3
+
+        if score > best_score:
+            best_score = score
+            best = (int(x), int(y), int(w), int(h))
+
+    return best, round(float(best_score), 4)
+
+
 def analyze_page(page: int, include_image: bool = True):
     path = page_path(page)
     if not os.path.exists(path):
@@ -1832,64 +1890,8 @@ def analyze_page(page: int, include_image: bool = True):
     text_heavy_page = _is_text_heavy_page(img)
     build_step_page = _is_build_step_page(img)
     overview_page = _is_multi_bag_overview_page(img)
-    if False:
-        if build_step_page:
-            rejection_source = "build_step_page"
-        elif text_heavy_page:
-            rejection_source = "text_heavy_page"
-        elif overview_page:
-            rejection_source = "overview_page"
-        else:
-            rejection_source = "rejected_early"
-        if include_image:
-            cv2.putText(
-                vis,
-                (
-                    "BUILD-STEP / NON-START"
-                    if rejection_source == "build_step_page"
-                    else "TEXT-HEAVY / NON-START"
-                    if rejection_source == "text_heavy_page"
-                    else "REJECTED EARLY"
-                ),
-                (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 0, 255),
-                2,
-            )
-
-        result = {
-            "page": page,
-            "panel_found": False,
-            "panel_box": None,
-            "panel_source": rejection_source,
-            "panel_score": None,
-            "shell_found": False,
-            "shell_box": None,
-            "shell_score": None,
-            "shell_method": "none",
-            "grey_bag_found": False,
-            "grey_bag_box": None,
-            "grey_bag_score": None,
-            "number_box_found": False,
-            "number_box": None,
-            "bag_number": None,
-            "ocr_raw": "",
-            "intro_region_candidates": [],
-            "intro_region_top_box": None,
-            "confidence": 0.0,
-        }
-
-        if include_image:
-            ok, buf = cv2.imencode(".png", vis)
-            if not ok:
-                raise HTTPException(status_code=500, detail="Encode failed")
-            result["image_bytes"] = buf.tobytes()
-        elif cache_key is not None:
-            with ANALYZE_PAGE_CACHE_LOCK:
-                ANALYZE_PAGE_CACHE[cache_key] = _clone_cached_value(result)
-
-        return result
+    red_arrow_box, red_arrow_score = _detect_red_arrow(img)
+    red_arrow_found = red_arrow_box is not None
 
     if overview_page:
         intro_region_candidates = []
@@ -1919,6 +1921,91 @@ def analyze_page(page: int, include_image: bool = True):
     number_abs = None
     bag_number = None
     ocr_raw = ""
+
+    # --------------------------------------------------
+    # EARLY REJECTION — multi-step grid guard
+    # Only reject when the page looks like a build-step grid AND no strict
+    # top-left panel was found AND no red arrow is present. Pages that have a
+    # genuine bag-start panel (page 22, 39, 81 …) pass through unaffected.
+    # --------------------------------------------------
+    if build_step_page and not legacy_panel_found and not red_arrow_found:
+        rejection_reason = "build_step_page"
+        if include_image:
+            cv2.putText(
+                vis,
+                "BUILD-STEP / NON-START",
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+            )
+            cv2.putText(
+                vis,
+                "build_step_page=True  panel=False  red_arrow=False",
+                (30, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 200),
+                1,
+            )
+
+        result = {
+            "page": page,
+            "panel_found": False,
+            "panel_box": None,
+            "panel_source": "build_step_page",
+            "panel_score": None,
+            "shell_found": False,
+            "shell_box": None,
+            "shell_score": None,
+            "shell_method": "none",
+            "grey_bag_found": False,
+            "grey_bag_box": None,
+            "grey_bag_score": None,
+            "shell_area_ratio": 0.0,
+            "grey_bag_area_ratio": 0.0,
+            "tiny_bag_reference": False,
+            "weak_bag_reference": False,
+            "bag_region_quality": 1.0,
+            "number_box_found": False,
+            "number_found": False,
+            "number_box": None,
+            "number_box_x": None,
+            "number_box_y": None,
+            "number_box_width": None,
+            "number_box_height": None,
+            "number_box_area": None,
+            "bag_number": None,
+            "ocr_raw": "",
+            "intro_region_candidates": [],
+            "intro_region_top_box": None,
+            "intro_region_top_score": None,
+            "intro_region_top_type": None,
+            "text_heavy_page": text_heavy_page,
+            "build_step_page": build_step_page,
+            "overview_page": overview_page,
+            "red_arrow_found": red_arrow_found,
+            "red_arrow_box": list(red_arrow_box) if red_arrow_box is not None else None,
+            "red_arrow_score": red_arrow_score,
+            "model_preview_found": False,
+            "model_preview_score": None,
+            "rejection_reason": rejection_reason,
+            "confidence": 0.0,
+        }
+
+        if include_image:
+            ok, buf = cv2.imencode(".png", vis)
+            if not ok:
+                raise HTTPException(status_code=500, detail="Encode failed")
+            result["image_bytes"] = buf.tobytes()
+        elif cache_key is not None:
+            with ANALYZE_PAGE_CACHE_LOCK:
+                ANALYZE_PAGE_CACHE[cache_key] = _clone_cached_value(result)
+
+        return result
+
+    rejection_reason = None
 
     # --------------------------------------------------
     # PANEL → SHELL → BAG → NUMBER
@@ -2225,6 +2312,38 @@ def analyze_page(page: int, include_image: bool = True):
                 2,
             )
 
+        # Red arrow overlay
+        if red_arrow_found:
+            draw_box(vis, red_arrow_box, (0, 60, 255), 2)
+            cv2.putText(
+                vis,
+                f"RED ARROW {red_arrow_score:.2f}",
+                (red_arrow_box[0], max(18, red_arrow_box[1] - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 60, 255),
+                1,
+            )
+
+        # Diagnostic signal strip at bottom-right
+        diag_x = img.shape[1] - 340
+        diag_y = img.shape[0] - 90
+        for idx, (label_txt, val) in enumerate([
+            ("build_step", build_step_page),
+            ("red_arrow", red_arrow_found),
+            ("model_prev", shell_found),
+        ]):
+            color = (0, 200, 0) if val else (0, 0, 200)
+            cv2.putText(
+                vis,
+                f"{label_txt}: {'Y' if val else 'N'}",
+                (diag_x, diag_y + idx * 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                1,
+            )
+
     result = {
         "page": page,
         "panel_found": panel_found,
@@ -2259,9 +2378,21 @@ def analyze_page(page: int, include_image: bool = True):
         "intro_region_top_box": (
             list(intro_region_candidates[0]["box"]) if intro_region_candidates else None
         ),
+        "intro_region_top_score": (
+            float(intro_region_candidates[0]["score"]) if intro_region_candidates else None
+        ),
+        "intro_region_top_type": (
+            intro_region_candidates[0].get("type") if intro_region_candidates else None
+        ),
         "text_heavy_page": text_heavy_page,
         "build_step_page": build_step_page,
         "overview_page": overview_page,
+        "red_arrow_found": red_arrow_found,
+        "red_arrow_box": list(red_arrow_box) if red_arrow_box is not None else None,
+        "red_arrow_score": red_arrow_score,
+        "model_preview_found": shell_found,
+        "model_preview_score": shell_score,
+        "rejection_reason": rejection_reason,
         "confidence": confidence,
     }
 
