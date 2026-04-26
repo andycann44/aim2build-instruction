@@ -32,6 +32,11 @@ def _get_green_step_box_count(set_num: str, page: int) -> int:
 
 
 def _compare_candidates(a: dict, b: dict) -> int:
+    excluded_a = bool(a.get("selection_excluded"))
+    excluded_b = bool(b.get("selection_excluded"))
+    if excluded_a != excluded_b:
+        return 1 if excluded_a else -1
+
     score_a = float(a.get("score", 0.0) or 0.0)
     score_b = float(b.get("score", 0.0) or 0.0)
     if abs(score_a - score_b) < 5.0:
@@ -82,6 +87,9 @@ def _normalize_analysis_row(row: dict, page: int, precheck: dict) -> dict:
         )
     )
     normalized["cache_hit"] = bool(normalized.get("cache_hit"))
+    normalized["multi_step_green_boxes"] = bool(
+        normalized.get("multi_step_green_boxes")
+    )
     normalized["precheck"] = dict(precheck or {})
     normalized["page_kind"] = normalized["precheck"].get("page_kind", "other")
     return normalized
@@ -235,6 +243,11 @@ def _score_window_candidate(
 
 def _build_candidate(set_num: str, row: dict, bag_number: int, start_page: int, end_page: int) -> dict:
     score, reasons = _score_window_candidate(set_num, row, bag_number, start_page, end_page)
+    green_box_count = _get_green_step_box_count(set_num, int(row["page"]))
+    multi_step_green_boxes = bool(
+        row.get("multi_step_green_boxes") or green_box_count >= 4
+    )
+    selection_excluded = multi_step_green_boxes
 
     return {
         "page": int(row["page"]),
@@ -251,6 +264,11 @@ def _build_candidate(set_num: str, row: dict, bag_number: int, start_page: int, 
         "overview_page": bool(row.get("overview_page")),
         "strong_structure": bool(row.get("strong_structure")),
         "page_kind": row.get("page_kind", "other"),
+        "multi_step_green_boxes": multi_step_green_boxes,
+        "selection_excluded": selection_excluded,
+        "selection_excluded_reason": (
+            "multi_step_green_boxes" if selection_excluded else None
+        ),
         "ocr_raw": row.get("ocr_raw", "") or "",
         "analysis_source": "cached_analyzer_row" if row.get("cache_hit") else "window_page_analysis",
     }
@@ -311,12 +329,30 @@ def _scan_window(set_num: str, bag_number: int, window: dict, fast: bool = False
         for row in rows
     ]
     candidates.sort(key=cmp_to_key(_compare_candidates))
+    top_candidate = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("bag_number") == int(bag_number)
+            and not bool(candidate.get("selection_excluded"))
+        ),
+        next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("bag_number") is not None
+            and not bool(candidate.get("selection_excluded"))
+        ),
+        (candidates[0] if candidates else None),
+        ),
+    )
 
     return {
         "bag": int(bag_number),
         "status": "ok",
         "window": [int(start_page), int(end_page)],
         "candidates": candidates,
+        "top_candidate": top_candidate,
         "previous_anchor": {
             "bag": window.get("previous_confirmed_bag"),
             "page": window.get("previous_confirmed_page"),
@@ -477,7 +513,7 @@ def scan_gap_for_bag(set_num: str, bag_number: int, fast: bool = False):
         "pages_skipped_confirmed": [],
         "analysis_rows": item.get("candidates", []),
         "analysis_count": len(item.get("candidates", [])),
-        "top_candidate": item.get("candidates", [None])[0],
+        "top_candidate": item.get("top_candidate"),
         "rows_reused": int(item.get("rows_reused", 0) or 0),
         "rows_analyzed": int(item.get("rows_analyzed", 0) or 0),
     }

@@ -8,7 +8,6 @@ from typing import Any
 
 from .utils import ensure_dir
 
-
 CROP_FIELDS = (
     "top_left_crop_path",
     "top_right_crop_path",
@@ -28,7 +27,9 @@ def export_crop_dataset(args: argparse.Namespace) -> int:
         raise SystemExit(f"Training data root not found: {training_root}")
 
     exported = 0
-    sidecar_paths = sorted(path for path in training_root.glob("*/*.json") if path.is_file())
+    sidecar_paths = sorted(
+        path for path in training_root.glob("*/*.json") if path.is_file()
+    )
     for sidecar_path in sidecar_paths:
         payload = _load_json(sidecar_path)
         label = str(payload.get("label", "")).strip()
@@ -55,9 +56,19 @@ def export_crop_dataset(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Copy labeled crop images into a classifier-ready dataset tree.")
-    parser.add_argument("--training-root", default="training_data", help="Root directory containing training sidecars.")
-    parser.add_argument("--output-root", default="training_data_crops", help="Output directory for crop dataset.")
+    parser = argparse.ArgumentParser(
+        description="Copy labeled crop images into a classifier-ready dataset tree."
+    )
+    parser.add_argument(
+        "--training-root",
+        default="training_data",
+        help="Root directory containing training sidecars.",
+    )
+    parser.add_argument(
+        "--output-root",
+        default="training_data_crops",
+        help="Output directory for crop dataset.",
+    )
     parser.set_defaults(func=export_crop_dataset)
     return parser
 

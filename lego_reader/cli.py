@@ -8,7 +8,8 @@ from .bag_detector import analyze_pdf_for_bags
 from .downloader import DownloadError, SetNotFoundError, download_set_pdfs
 from .models import PdfBagAnalysis
 from .pdf_reader import read_pdf_pages
-from .utils import LOG, configure_logging, ensure_dir, normalize_set_num, write_json
+from .utils import (LOG, configure_logging, ensure_dir, normalize_set_num,
+                    write_json)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,7 +18,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("set_num", help="LEGO set number, for example 21330")
     parser.add_argument("--debug", action="store_true", help="Save debug artifacts.")
-    parser.add_argument("--out", default="output", help="Output directory for result JSON.")
+    parser.add_argument(
+        "--out", default="output", help="Output directory for result JSON."
+    )
     parser.add_argument(
         "--instructions-dir",
         default="instructions",
@@ -72,7 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     total_bags = 0
 
     for downloaded_pdf in download_result.pdfs:
-        LOG.info("Reading %s from %s", downloaded_pdf.local_path.name, downloaded_pdf.source_url)
+        LOG.info(
+            "Reading %s from %s",
+            downloaded_pdf.local_path.name,
+            downloaded_pdf.source_url,
+        )
         per_pdf_debug_dir = debug_dir / set_num / downloaded_pdf.local_path.stem
         page_data = read_pdf_pages(
             pdf_path=downloaded_pdf.local_path,
@@ -92,7 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         "set_num": set_num,
         "source_url": download_result.source_url,
         "page_title": download_result.page_title,
-        "downloaded_pdf_paths": [pdf.local_path.as_posix() for pdf in download_result.pdfs],
+        "downloaded_pdf_paths": [
+            pdf.local_path.as_posix() for pdf in download_result.pdfs
+        ],
         "pdfs": [
             {
                 "title": pdf.title,

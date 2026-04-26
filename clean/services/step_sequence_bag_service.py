@@ -124,9 +124,16 @@ def scan_step_bag_sequence(
             continue
 
         detected = step_detector_service.detect_steps(set_num, page)
-        step_values = sorted(
-            set(int(item.get("value", 0) or 0) for item in detected.get("step_candidates", []))
-        )
+        main_steps = detected.get("main_steps", []) or []
+        sub_steps = detected.get("sub_steps", []) or []
+        if main_steps:
+            step_values = sorted(
+                set(int(item.get("value", 0) or 0) for item in main_steps)
+            )
+        else:
+            step_values = sorted(
+                set(int(item.get("value", 0) or 0) for item in detected.get("step_candidates", []))
+            )
 
         page_row: Dict[str, Any] = {
             "page": int(page),
@@ -136,6 +143,10 @@ def scan_step_bag_sequence(
         }
 
         if step_values:
+            if any(int(v) > 200 for v in sub_steps):
+                page_row["reason"] = "rejected implausible sub step value > 200"
+                page_steps.append(page_row)
+                continue
             if any(int(v) > 200 for v in step_values):
                 page_row["reason"] = "rejected implausible step value > 200"
                 page_steps.append(page_row)
@@ -143,6 +154,14 @@ def scan_step_bag_sequence(
 
             current_min_step = min(step_values)
             current_max_step = max(step_values)
+            has_main_step_one = 1 in step_values
+            has_sub_step_one = 1 in [int(v) for v in sub_steps]
+            effective_reset_step: Optional[int] = None
+            if has_main_step_one:
+                effective_reset_step = 1
+            elif current_min_step >= 10 and has_sub_step_one:
+                effective_reset_step = 1
+
             reset_confidence = 0.0
             drop = None
             if previous_max_step is not None:
@@ -151,25 +170,33 @@ def scan_step_bag_sequence(
                     previous_max_step = current_max_step
                     page_steps.append(page_row)
                     continue
-                drop = int(previous_max_step) - int(current_min_step)
+                compare_step = (
+                    int(effective_reset_step)
+                    if effective_reset_step is not None
+                    else int(current_min_step)
+                )
+                drop = int(previous_max_step) - int(compare_step)
                 reset_confidence = _score_step_reset(
                     previous_max_step=previous_max_step,
-                    current_min_step=current_min_step,
+                    current_min_step=compare_step,
                     current_max_step=current_max_step,
                     step_values=step_values,
                 )
 
             if (
                 previous_max_step is not None
-                and current_min_step == 1
-                and previous_max_step >= 15
+                and effective_reset_step == 1
+                and previous_max_step >= 10
                 and drop is not None
                 and drop >= 10
             ):
                 page_row["bag_start"] = True
-                page_row["reason"] = "strong bag reset %d -> 1" % (
-                    previous_max_step,
-                )
+                if has_main_step_one:
+                    page_row["reason"] = "strong bag reset %d -> 1" % (previous_max_step,)
+                else:
+                    page_row["reason"] = "strong bag reset %d -> 1 (from sub_steps)" % (
+                        previous_max_step,
+                    )
                 candidate_bag_starts.append(
                     {
                         "page": int(page),

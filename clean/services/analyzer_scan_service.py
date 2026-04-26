@@ -110,6 +110,16 @@ def get_or_build_sequence_scan_row(set_num: str, page: int):
     return _get_cached_or_scan(set_num, int(page))
 
 
+def get_cached_sequence_scan_row(set_num: str, page: int):
+    cached = _ANALYZER_SCAN_CACHE.get((str(set_num), int(page)))
+    if cached is None:
+        return None
+
+    row = dict(cached)
+    row["cache_hit"] = True
+    return row
+
+
 def _get_cached_or_scan(set_num: str, page: int):
     cache_key = (str(set_num), int(page))
 

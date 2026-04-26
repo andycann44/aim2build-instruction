@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+
 import cv2
 import numpy as np
 
@@ -11,12 +12,12 @@ os.makedirs(OUT, exist_ok=True)
 
 def crop(img, box):
     x, y, w, h = box
-    return img[y:y+h, x:x+w]
+    return img[y : y + h, x : x + w]
 
 
 def draw_box(img, box, color, t=3):
     x, y, w, h = box
-    cv2.rectangle(img, (x, y), (x+w, y+h), color, t)
+    cv2.rectangle(img, (x, y), (x + w, y + h), color, t)
 
 
 def find_bag_intro_panel(img):
@@ -61,7 +62,7 @@ def find_bag_intro_panel(img):
         if y > int(h * 0.10):
             continue
 
-        roi = gray[y:y+bh, x:x+bw]
+        roi = gray[y : y + bh, x : x + bw]
         if roi.size == 0:
             continue
 
@@ -73,9 +74,9 @@ def find_bag_intro_panel(img):
             continue
 
         # split into left / middle / right zones
-        left = roi[:, :int(bw * 0.28)]
-        mid = roi[:, int(bw * 0.28):int(bw * 0.45)]
-        right = roi[:, int(bw * 0.45):]
+        left = roi[:, : int(bw * 0.28)]
+        mid = roi[:, int(bw * 0.28) : int(bw * 0.45)]
+        right = roi[:, int(bw * 0.45) :]
 
         if left.size == 0 or mid.size == 0 or right.size == 0:
             continue
@@ -143,17 +144,11 @@ for file in sorted(os.listdir(BASE)):
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
             (0, 255, 0),
-            2
+            2,
         )
     else:
         cv2.putText(
-            vis,
-            "NO PANEL",
-            (30, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2
+            vis, "NO PANEL", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2
         )
 
     cv2.imwrite(os.path.join(OUT, file), vis)

@@ -8,7 +8,6 @@ import fitz
 from .models import PageData
 from .utils import ensure_dir
 
-
 LOG = logging.getLogger("lego_reader.pdf_reader")
 
 
@@ -30,7 +29,9 @@ def read_pdf_pages(pdf_path: Path, debug: bool, debug_dir: Path) -> list[PageDat
         text = page.get_text("text").strip()
         image_path = None
         if debug:
-            image_path = _render_page(page, render_dir / f"page_{page_index + 1:03d}.png")
+            image_path = _render_page(
+                page, render_dir / f"page_{page_index + 1:03d}.png"
+            )
         pages.append(
             PageData(
                 page_index=page_index,

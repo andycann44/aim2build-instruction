@@ -10,7 +10,6 @@ from typing import Any
 
 from .utils import ensure_dir, write_json
 
-
 PAGE_RE = re.compile(r"^page_(\d+)\.png$")
 KEY_TO_LABEL = {
     "b": "true_bag_start",
@@ -31,7 +30,9 @@ UNSURE_BLOCK_RE = re.compile(r'"unsure_pages"\s*:\s*\[(.*?)\]', re.DOTALL)
 PAGE_TOKEN_RE = re.compile(r'"(\d+)"')
 
 
-def _recover_label_state_from_text(raw_text: str, set_num: str, pdf_name: str) -> dict[str, Any]:
+def _recover_label_state_from_text(
+    raw_text: str, set_num: str, pdf_name: str
+) -> dict[str, Any]:
     labels = {
         page: label
         for page, label in LABEL_ENTRY_RE.findall(raw_text)
@@ -41,7 +42,9 @@ def _recover_label_state_from_text(raw_text: str, set_num: str, pdf_name: str) -
     unsure_pages: list[str] = []
     unsure_match = UNSURE_BLOCK_RE.search(raw_text)
     if unsure_match:
-        unsure_pages = sorted(set(PAGE_TOKEN_RE.findall(unsure_match.group(1))), key=int)
+        unsure_pages = sorted(
+            set(PAGE_TOKEN_RE.findall(unsure_match.group(1))), key=int
+        )
 
     recovered_set_num = SET_NUM_RE.search(raw_text)
     recovered_pdf_name = PDF_NAME_RE.search(raw_text)
@@ -99,14 +102,18 @@ def _load_label_state(labels_path: Path, set_num: str, pdf_name: str) -> dict[st
     return payload
 
 
-def _save_label_state(labels_path: Path, payload: dict[str, Any], dry_run: bool) -> None:
+def _save_label_state(
+    labels_path: Path, payload: dict[str, Any], dry_run: bool
+) -> None:
     if dry_run:
         return
     ensure_dir(labels_path.parent)
     write_json(labels_path, payload)
 
 
-def _page_paths(debug_pdf_dir: Path, start_page: int | None, end_page: int | None) -> list[Path]:
+def _page_paths(
+    debug_pdf_dir: Path, start_page: int | None, end_page: int | None
+) -> list[Path]:
     pages_dir = debug_pdf_dir / "pages"
     if not pages_dir.is_dir():
         raise SystemExit(f"Page images directory not found: {pages_dir}")
@@ -128,11 +135,17 @@ def _pending_pages(page_paths: list[Path], payload: dict[str, Any]) -> list[Path
     return [
         path
         for path in page_paths
-        if str(_page_number(path)) not in labels and str(_page_number(path)) not in unsure_pages
+        if str(_page_number(path)) not in labels
+        and str(_page_number(path)) not in unsure_pages
     ]
 
 
-def _dry_run_summary(labels_path: Path, payload: dict[str, Any], pending_pages: list[Path], page_paths: list[Path]) -> int:
+def _dry_run_summary(
+    labels_path: Path,
+    payload: dict[str, Any],
+    pending_pages: list[Path],
+    page_paths: list[Path],
+) -> int:
     summary = {
         "labels_path": labels_path.as_posix(),
         "total_pages_in_range": len(page_paths),
@@ -206,7 +219,9 @@ def manual_label_pages_terminal(args: argparse.Namespace) -> int:
     if not page_paths:
         raise SystemExit("No page images found for the requested range.")
     if not pending_pages:
-        print(f"All pages in range are already labeled or marked unsure. Labels file: {labels_path}")
+        print(
+            f"All pages in range are already labeled or marked unsure. Labels file: {labels_path}"
+        )
         return 0
 
     for index, image_path in enumerate(pending_pages, start=1):
@@ -232,21 +247,53 @@ def manual_label_pages_terminal(args: argparse.Namespace) -> int:
             _save_choice(payload, page_num, KEY_TO_LABEL[choice])
 
         _save_label_state(labels_path, payload, args.dry_run)
-        print(f"Saved page {page_num} -> {payload['labels'].get(str(page_num), 'unsure')}")
+        print(
+            f"Saved page {page_num} -> {payload['labels'].get(str(page_num), 'unsure')}"
+        )
 
     print(f"Done. Labels saved to {labels_path}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Open rendered debug pages in Preview and save labels from terminal prompts.")
-    parser.add_argument("--set-num", required=True, help="LEGO set number, for example 21330")
-    parser.add_argument("--pdf-name", required=True, help="PDF folder name under debug/<set>, for example 21330_01")
-    parser.add_argument("--debug-root", default=DEFAULT_DEBUG_ROOT, help="Root directory containing rendered debug page images.")
-    parser.add_argument("--labels-root", default=DEFAULT_LABELS_ROOT, help="Directory where manual label JSON files are saved.")
-    parser.add_argument("--start-page", type=int, default=None, help="Optional first page number to include.")
-    parser.add_argument("--end-page", type=int, default=None, help="Optional last page number to include.")
-    parser.add_argument("--dry-run", action="store_true", help="Print summary and labels path without opening Preview.")
+    parser = argparse.ArgumentParser(
+        description="Open rendered debug pages in Preview and save labels from terminal prompts."
+    )
+    parser.add_argument(
+        "--set-num", required=True, help="LEGO set number, for example 21330"
+    )
+    parser.add_argument(
+        "--pdf-name",
+        required=True,
+        help="PDF folder name under debug/<set>, for example 21330_01",
+    )
+    parser.add_argument(
+        "--debug-root",
+        default=DEFAULT_DEBUG_ROOT,
+        help="Root directory containing rendered debug page images.",
+    )
+    parser.add_argument(
+        "--labels-root",
+        default=DEFAULT_LABELS_ROOT,
+        help="Directory where manual label JSON files are saved.",
+    )
+    parser.add_argument(
+        "--start-page",
+        type=int,
+        default=None,
+        help="Optional first page number to include.",
+    )
+    parser.add_argument(
+        "--end-page",
+        type=int,
+        default=None,
+        help="Optional last page number to include.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print summary and labels path without opening Preview.",
+    )
     parser.set_defaults(func=manual_label_pages_terminal)
     return parser
 

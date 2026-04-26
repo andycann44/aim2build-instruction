@@ -382,6 +382,100 @@ def _dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return kept
 
 
+def _rank_step_candidate(candidate: Dict[str, Any]) -> Tuple[float, float, int, int]:
+    return (
+        -float(candidate.get("area", 0) or 0),
+        -float(candidate.get("score", 0.0) or 0.0),
+        int(candidate.get("y", 0) or 0),
+        int(candidate.get("x", 0) or 0),
+    )
+
+
+def _summarize_step_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "value": int(candidate.get("value", 0) or 0),
+        "text": str(candidate.get("text", "")),
+        "x": int(candidate.get("x", 0) or 0),
+        "y": int(candidate.get("y", 0) or 0),
+        "w": int(candidate.get("w", 0) or 0),
+        "h": int(candidate.get("h", 0) or 0),
+        "score": float(candidate.get("score", 0.0) or 0.0),
+    }
+
+
+def _classify_main_and_sub_steps(
+    step_candidates: List[Dict[str, Any]],
+    page_width: int,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[int]]:
+    if not step_candidates:
+        return {}, [], []
+
+    sorted_candidates = sorted(
+        step_candidates,
+        key=lambda item: (int(item.get("y", 0) or 0), int(item.get("x", 0) or 0)),
+    )
+    leftmost_x = min(int(item.get("x", 0) or 0) for item in sorted_candidates)
+    left_band_margin = max(60, int(page_width * 0.04))
+    left_band = [
+        item for item in sorted_candidates
+        if int(item.get("x", 0) or 0) <= leftmost_x + left_band_margin
+    ]
+    if not left_band:
+        left_band = list(sorted_candidates)
+
+    band_max_area = max(float(item.get("area", 0) or 0) for item in left_band)
+    band_max_score = max(float(item.get("score", 0.0) or 0.0) for item in left_band)
+
+    main_steps_raw: List[Dict[str, Any]] = []
+    for item in left_band:
+        area = float(item.get("area", 0) or 0)
+        score = float(item.get("score", 0.0) or 0.0)
+        if area >= band_max_area * 0.55 or score >= band_max_score - 0.75:
+            main_steps_raw.append(item)
+
+    if not main_steps_raw:
+        main_steps_raw = [sorted(left_band, key=_rank_step_candidate)[0]]
+
+    main_steps_raw = sorted(
+        main_steps_raw,
+        key=lambda item: (int(item.get("y", 0) or 0), int(item.get("x", 0) or 0)),
+    )
+    main_step = _summarize_step_candidate(
+        sorted(main_steps_raw, key=_rank_step_candidate)[0]
+    )
+    main_steps = [_summarize_step_candidate(item) for item in main_steps_raw]
+
+    main_ids = {
+        (
+            int(item.get("x", 0) or 0),
+            int(item.get("y", 0) or 0),
+            int(item.get("w", 0) or 0),
+            int(item.get("h", 0) or 0),
+            str(item.get("text", "")),
+        )
+        for item in main_steps_raw
+    }
+
+    sub_step_values: List[int] = []
+    for item in sorted_candidates:
+        item_id = (
+            int(item.get("x", 0) or 0),
+            int(item.get("y", 0) or 0),
+            int(item.get("w", 0) or 0),
+            int(item.get("h", 0) or 0),
+            str(item.get("text", "")),
+        )
+        if item_id in main_ids:
+            continue
+        if int(item.get("x", 0) or 0) > int(page_width * 0.35):
+            continue
+        value = int(item.get("value", 0) or 0)
+        if value not in sub_step_values:
+            sub_step_values.append(value)
+
+    return main_step, main_steps, sub_step_values
+
+
 def detect_steps(set_num: str, page: int) -> Dict[str, Any]:
     image_path = debug_service.resolve_page_image_path(set_num, page)
     if image_path is None:
@@ -425,6 +519,10 @@ def detect_steps(set_num: str, page: int) -> Dict[str, Any]:
         candidates.append(scored)
 
     step_candidates = _dedupe_candidates(candidates)
+    main_step, main_steps, sub_steps = _classify_main_and_sub_steps(
+        step_candidates,
+        page_width,
+    )
 
     return {
         "set_num": str(set_num),
@@ -433,6 +531,9 @@ def detect_steps(set_num: str, page: int) -> Dict[str, Any]:
         "page_height": int(page_height),
         "page_number_tokens": page_number_tokens,
         "step_candidates": step_candidates,
+        "main_step": main_step,
+        "main_steps": main_steps,
+        "sub_steps": sub_steps,
         "numeric_tokens": numeric_tokens,
         "joined_numbers": joined_numbers,
         "visual_candidates": visual_candidates,

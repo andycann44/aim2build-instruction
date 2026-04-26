@@ -53,11 +53,10 @@ It ignores spare parts (is_spare = 1) if that column exists.
 import argparse
 import json
 import logging
-import os
 import re
 import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -121,7 +120,9 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def load_set_meta(conn: sqlite3.Connection, set_num: str) -> Tuple[Optional[str], Optional[int]]:
+def load_set_meta(
+    conn: sqlite3.Connection, set_num: str
+) -> Tuple[Optional[str], Optional[int]]:
     """
     Load basic set metadata (name, year) from the sets table.
     """
@@ -200,8 +201,6 @@ def load_set_parts(conn: sqlite3.Connection, set_num: str) -> List[PartEntry]:
     if not parts:
         LOG.warning("No parts found for set_num=%s", set_num)
     return parts
-
-
 
 
 def ensure_dir(path: Path) -> None:
@@ -328,9 +327,7 @@ def build_instruction_catalog(
             key = (p.part_num, p.color_id)
             entry = parts_index[key]
             entry["total_qty"] = int(entry["total_qty"]) + int(p.quantity)
-            entry["sets"].append(
-                {"set_num": set_num, "quantity": int(p.quantity)}
-            )
+            entry["sets"].append({"set_num": set_num, "quantity": int(p.quantity)})
 
             if create_placeholders:
                 img_path = assets_parts_dir / f"{p.part_num}-{p.color_id}.png"

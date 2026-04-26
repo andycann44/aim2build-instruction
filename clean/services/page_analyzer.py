@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytesseract
+from pytesseract import TesseractError
 from fastapi import HTTPException
 
 # Extracted from app.py.
@@ -14,6 +15,7 @@ from fastapi import HTTPException
 BASE = ""
 ANALYZE_PAGE_CACHE = {}
 ANALYZE_PAGE_CACHE_LOCK = threading.Lock()
+_OCR_STATE = threading.local()
 
 
 def configure_pages_dir(pages_dir):
@@ -25,6 +27,47 @@ def configure_pages_dir(pages_dir):
 
 def _clone_cached_value(value):
     return copy.deepcopy(value)
+
+
+def _reset_ocr_error_flag():
+    _OCR_STATE.ocr_error = False
+
+
+def _mark_ocr_error():
+    _OCR_STATE.ocr_error = True
+
+
+def _get_ocr_error():
+    return bool(getattr(_OCR_STATE, "ocr_error", False))
+
+
+def _safe_tesseract_image_to_string(*args, **kwargs):
+    try:
+        return pytesseract.image_to_string(*args, **kwargs)
+    except TesseractError:
+        _mark_ocr_error()
+        return ""
+
+
+def _empty_ocr_data_dict():
+    return {
+        "text": [],
+        "conf": [],
+        "left": [],
+        "top": [],
+        "width": [],
+        "height": [],
+        "block_num": [],
+        "par_num": [],
+    }
+
+
+def _safe_tesseract_image_to_data(*args, **kwargs):
+    try:
+        return pytesseract.image_to_data(*args, **kwargs)
+    except TesseractError:
+        _mark_ocr_error()
+        return _empty_ocr_data_dict()
 
 def _path_cache_key(path: str):
     try:
@@ -43,6 +86,102 @@ def draw_box(img, box, color, t=3):
 def crop(img, box):
     x, y, w, h = box
     return img[y : y + h, x : x + w]
+
+
+def detect_step_grid(img):
+    if img is None or img.size == 0:
+        return 0, 0, False
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 160)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    page_h, page_w = gray.shape[:2]
+    page_area = float(max(1, page_h * page_w))
+    step_grid_number_count = 0
+
+    for contour in cnts:
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
+        if len(approx) != 4:
+            continue
+
+        x, y, w, h = cv2.boundingRect(approx)
+        if w <= 0 or h <= 0:
+            continue
+
+        area_ratio = float(w * h) / page_area
+        aspect_ratio = float(w) / float(max(h, 1))
+
+        if area_ratio < 0.01 or area_ratio > 0.10:
+            continue
+        if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+            continue
+
+        step_grid_number_count += 1
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(
+        hsv,
+        np.array((99, 25, 245), dtype=np.uint8),
+        np.array((105, 60, 255), dtype=np.uint8),
+    )
+    green_mask = cv2.morphologyEx(
+        green_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+    )
+    green_mask = cv2.dilate(green_mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    green_ratio = float(np.mean(green_mask > 0))
+    green_box_count = 0
+
+    if green_ratio >= 0.82:
+        line_segments = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180.0,
+            threshold=120,
+            minLineLength=max(120, int(gray.shape[0] * 0.60)),
+            maxLineGap=10,
+        )
+
+        internal_vertical_xs = []
+        page_h, page_w = gray.shape[:2]
+        min_x = int(page_w * 0.12)
+        max_x = int(page_w * 0.88)
+        min_vertical_length = int(page_h * 0.75)
+
+        if line_segments is not None:
+            for segment in line_segments[:, 0, :]:
+                x1, y1, x2, y2 = [int(v) for v in segment]
+                dx = abs(x2 - x1)
+                dy = abs(y2 - y1)
+                if dx > 10 or dy < min_vertical_length:
+                    continue
+
+                x_mid = int(round((x1 + x2) * 0.5))
+                if x_mid < min_x or x_mid > max_x:
+                    continue
+
+                internal_vertical_xs.append(x_mid)
+
+        if internal_vertical_xs:
+            internal_vertical_xs.sort()
+            vertical_bands = 1
+            last_x = internal_vertical_xs[0]
+            for x_mid in internal_vertical_xs[1:]:
+                if abs(x_mid - last_x) > 20:
+                    vertical_bands += 1
+                    last_x = x_mid
+            if vertical_bands >= 2:
+                green_box_count = vertical_bands + 2
+
+    multi_step_green_boxes = bool(
+        green_box_count >= 4 or step_grid_number_count >= 4
+    )
+    return int(step_grid_number_count), int(green_box_count), multi_step_green_boxes
 
 def _find_bag_intro_panel_once(
     img,
@@ -802,7 +941,7 @@ def _ocr_hits_from_images(images, configs):
     hits = []
     for img_try in images:
         for cfg in configs:
-            raw = pytesseract.image_to_string(img_try, config=cfg).strip()
+            raw = _safe_tesseract_image_to_string(img_try, config=cfg).strip()
             digits = "".join(ch for ch in raw if ch.isdigit())
             if len(digits) == 0 or len(digits) > 2:
                 continue
@@ -894,7 +1033,7 @@ def read_bag_number(number_img):
 
     if not hits:
         # fallback: try OCR on raw upscaled image directly
-        raw = pytesseract.image_to_string(
+        raw = _safe_tesseract_image_to_string(
             up, config="--psm 8 -c tessedit_char_whitelist=0123456789"
         ).strip()
 
@@ -1015,7 +1154,7 @@ def read_bag_number_with_score(number_img):
     for variant in variants:
         up = cv2.resize(variant, None, fx=8, fy=8, interpolation=cv2.INTER_CUBIC)
         for cfg in configs:
-            data = pytesseract.image_to_data(
+            data = _safe_tesseract_image_to_data(
                 up,
                 config=cfg,
                 output_type=pytesseract.Output.DICT,
@@ -1169,7 +1308,7 @@ def _safe_ocr_text(img, psm=6):
         return ""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
     up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    txt = pytesseract.image_to_string(up, config=f"--psm {psm}")
+    txt = _safe_tesseract_image_to_string(up, config=f"--psm {psm}")
     return txt or ""
 
 def _region_contains_xn_marker(region_img):
@@ -1562,7 +1701,7 @@ def _collect_page_bag_number_candidates(page_img, max_candidates=32):
             interpolation=cv2.INTER_AREA,
         )
 
-    ocr_data = pytesseract.image_to_data(
+    ocr_data = _safe_tesseract_image_to_data(
         gray_for_ocr,
         config="--psm 11 -c tessedit_char_whitelist=0123456789",
         output_type=pytesseract.Output.DICT,
@@ -1667,7 +1806,7 @@ def _is_text_heavy_page(page_img):
             interpolation=cv2.INTER_AREA,
         )
 
-    ocr_data = pytesseract.image_to_data(
+    ocr_data = _safe_tesseract_image_to_data(
         gray,
         config="--psm 11",
         output_type=pytesseract.Output.DICT,
@@ -1812,6 +1951,7 @@ def _is_build_step_page(page_img):
     )
 
 def analyze_page(page: int, include_image: bool = True):
+    _reset_ocr_error_flag()
     path = page_path(page)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Page not found")
@@ -1829,6 +1969,7 @@ def analyze_page(page: int, include_image: bool = True):
         raise HTTPException(status_code=500, detail="Could not read image")
 
     vis = img.copy() if include_image else None
+    step_grid_number_count, green_box_count, multi_step_green_boxes = detect_step_grid(img)
     text_heavy_page = _is_text_heavy_page(img)
     build_step_page = _is_build_step_page(img)
     overview_page = _is_multi_bag_overview_page(img)
@@ -1860,6 +2001,7 @@ def analyze_page(page: int, include_image: bool = True):
 
         result = {
             "page": page,
+            "page_kind": "other",
             "panel_found": False,
             "panel_box": None,
             "panel_source": rejection_source,
@@ -1877,6 +2019,7 @@ def analyze_page(page: int, include_image: bool = True):
             "ocr_raw": "",
             "intro_region_candidates": [],
             "intro_region_top_box": None,
+            "ocr_error": _get_ocr_error(),
             "confidence": 0.0,
         }
 
@@ -2225,8 +2368,22 @@ def analyze_page(page: int, include_image: bool = True):
                 2,
             )
 
+    structural_rejection_reasons = []
+    page_kind = "other"
+    no_bag_structure_number_only = bool(
+        number_box_found and not shell_found and not grey_bag_found
+    )
+    if multi_step_green_boxes:
+        structural_rejection_reasons.append("multi_step_green_boxes")
+        page_kind = (
+            "no_bag_structure_number_only"
+            if no_bag_structure_number_only
+            else "multi_step_green_boxes"
+        )
+
     result = {
         "page": page,
+        "page_kind": page_kind,
         "panel_found": panel_found,
         "panel_box": list(panel) if panel_found else None,
         "panel_source": panel_source,
@@ -2262,6 +2419,14 @@ def analyze_page(page: int, include_image: bool = True):
         "text_heavy_page": text_heavy_page,
         "build_step_page": build_step_page,
         "overview_page": overview_page,
+        "step_grid_number_count": step_grid_number_count,
+        "green_box_count": green_box_count,
+        "multi_step_green_boxes": multi_step_green_boxes,
+        "ocr_error": _get_ocr_error(),
+        "rejection_reason": (
+            structural_rejection_reasons[0] if structural_rejection_reasons else None
+        ),
+        "rejection_reasons": structural_rejection_reasons,
         "confidence": confidence,
     }
 

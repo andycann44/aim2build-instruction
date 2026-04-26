@@ -9,7 +9,6 @@ from typing import Any
 
 from .utils import ensure_dir, write_json
 
-
 PAGE_RE = re.compile(r"^page_(\d+)\.png$")
 KEY_TO_LABEL = {
     "b": "true_bag_start",
@@ -64,14 +63,18 @@ def _load_label_state(labels_path: Path, set_num: str, pdf_name: str) -> dict[st
     return payload
 
 
-def _save_label_state(labels_path: Path, payload: dict[str, Any], dry_run: bool) -> None:
+def _save_label_state(
+    labels_path: Path, payload: dict[str, Any], dry_run: bool
+) -> None:
     if dry_run:
         return
     ensure_dir(labels_path.parent)
     write_json(labels_path, payload)
 
 
-def _page_paths(debug_pdf_dir: Path, start_page: int | None, end_page: int | None) -> list[Path]:
+def _page_paths(
+    debug_pdf_dir: Path, start_page: int | None, end_page: int | None
+) -> list[Path]:
     pages_dir = debug_pdf_dir / "pages"
     if not pages_dir.is_dir():
         raise SystemExit(f"Page images directory not found: {pages_dir}")
@@ -93,11 +96,17 @@ def _pending_pages(page_paths: list[Path], payload: dict[str, Any]) -> list[Path
     return [
         path
         for path in page_paths
-        if str(_page_number(path)) not in labels and str(_page_number(path)) not in unsure_pages
+        if str(_page_number(path)) not in labels
+        and str(_page_number(path)) not in unsure_pages
     ]
 
 
-def _dry_run_summary(labels_path: Path, payload: dict[str, Any], pending_pages: list[Path], page_paths: list[Path]) -> int:
+def _dry_run_summary(
+    labels_path: Path,
+    payload: dict[str, Any],
+    pending_pages: list[Path],
+    page_paths: list[Path],
+) -> int:
     summary = {
         "labels_path": labels_path.as_posix(),
         "total_pages_in_range": len(page_paths),
@@ -110,7 +119,9 @@ def _dry_run_summary(labels_path: Path, payload: dict[str, Any], pending_pages: 
     return 0
 
 
-def _scaled_photo(tk_module: Any, image_path: Path, max_width: int, max_height: int) -> tuple[Any, Any]:
+def _scaled_photo(
+    tk_module: Any, image_path: Path, max_width: int, max_height: int
+) -> tuple[Any, Any]:
     original = tk_module.PhotoImage(file=image_path.as_posix())
     width = max(1, original.width())
     height = max(1, original.height())
@@ -140,13 +151,17 @@ def manual_label_pages(args: argparse.Namespace) -> int:
     if not page_paths:
         raise SystemExit("No page images found for the requested range.")
     if not pending_pages:
-        print(f"All pages in range are already labeled or marked unsure. Labels file: {labels_path}")
+        print(
+            f"All pages in range are already labeled or marked unsure. Labels file: {labels_path}"
+        )
         return 0
 
     try:
         import tkinter as tk
     except ImportError as exc:
-        raise SystemExit("tkinter is unavailable on this Python install; cannot open the manual labeling viewer.") from exc
+        raise SystemExit(
+            "tkinter is unavailable on this Python install; cannot open the manual labeling viewer."
+        ) from exc
 
     try:
         root = tk.Tk()
@@ -159,8 +174,12 @@ def manual_label_pages(args: argparse.Namespace) -> int:
         value="Keys: b=true_bag_start | s=sticker_or_callout | n=normal_step | u=skip/unsure | q=quit"
     )
     image_label = tk.Label(root, bg="white")
-    info_label = tk.Label(root, textvariable=info_var, bg="white", font=("Helvetica", 14, "bold"))
-    hint_label = tk.Label(root, textvariable=hint_var, bg="white", font=("Helvetica", 12))
+    info_label = tk.Label(
+        root, textvariable=info_var, bg="white", font=("Helvetica", 14, "bold")
+    )
+    hint_label = tk.Label(
+        root, textvariable=hint_var, bg="white", font=("Helvetica", 12)
+    )
     info_label.pack(padx=12, pady=(12, 6))
     image_label.pack(padx=12, pady=6, expand=True)
     hint_label.pack(padx=12, pady=(6, 12))
@@ -238,14 +257,44 @@ def manual_label_pages(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Label rendered debug pages one at a time with keyboard shortcuts.")
-    parser.add_argument("--set-num", required=True, help="LEGO set number, for example 21330")
-    parser.add_argument("--pdf-name", required=True, help="PDF folder name under debug/<set>, for example 21330_01")
-    parser.add_argument("--debug-root", default=DEFAULT_DEBUG_ROOT, help="Root directory containing rendered debug page images.")
-    parser.add_argument("--labels-root", default=DEFAULT_LABELS_ROOT, help="Directory where manual label JSON files are saved.")
-    parser.add_argument("--start-page", type=int, default=None, help="Optional first page number to include.")
-    parser.add_argument("--end-page", type=int, default=None, help="Optional last page number to include.")
-    parser.add_argument("--dry-run", action="store_true", help="Print summary and labels path without opening the viewer.")
+    parser = argparse.ArgumentParser(
+        description="Label rendered debug pages one at a time with keyboard shortcuts."
+    )
+    parser.add_argument(
+        "--set-num", required=True, help="LEGO set number, for example 21330"
+    )
+    parser.add_argument(
+        "--pdf-name",
+        required=True,
+        help="PDF folder name under debug/<set>, for example 21330_01",
+    )
+    parser.add_argument(
+        "--debug-root",
+        default=DEFAULT_DEBUG_ROOT,
+        help="Root directory containing rendered debug page images.",
+    )
+    parser.add_argument(
+        "--labels-root",
+        default=DEFAULT_LABELS_ROOT,
+        help="Directory where manual label JSON files are saved.",
+    )
+    parser.add_argument(
+        "--start-page",
+        type=int,
+        default=None,
+        help="Optional first page number to include.",
+    )
+    parser.add_argument(
+        "--end-page",
+        type=int,
+        default=None,
+        help="Optional last page number to include.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print summary and labels path without opening the viewer.",
+    )
     parser.set_defaults(func=manual_label_pages)
     return parser
 

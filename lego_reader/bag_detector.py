@@ -14,7 +14,6 @@ import fitz
 from .models import BagCandidate, PageData, PdfBagAnalysis
 from .utils import ensure_dir
 
-
 LOG = logging.getLogger("lego_reader.bag_detector")
 NUMBER_RE = re.compile(r"\b(\d{1,3})\b")
 BAG_WORD_RE = re.compile(r"\bbag\b", re.IGNORECASE)
@@ -72,7 +71,9 @@ def _longest_run(numbers: list[int]) -> int:
 
 def _dark_pixel_ratio(document: fitz.Document, page_index: int) -> float:
     page = document.load_page(page_index)
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csGRAY, alpha=False)
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csGRAY, alpha=False
+    )
     samples = pix.samples
     if not samples:
         return 1.0
@@ -80,7 +81,9 @@ def _dark_pixel_ratio(document: fitz.Document, page_index: int) -> float:
     return dark_pixels / len(samples)
 
 
-def _region_ratio(grid: list[list[int]], x0: int, y0: int, x1: int, y1: int, predicate: Any) -> float:
+def _region_ratio(
+    grid: list[list[int]], x0: int, y0: int, x1: int, y1: int, predicate: Any
+) -> float:
     if not grid or not grid[0]:
         return 0.0
 
@@ -177,7 +180,9 @@ def _detect_bag_icon_shape(page: PageData) -> tuple[float, list[str]]:
 
         inner_nonwhite_ratio = float((inner < 245).mean())
         inner_dark_ratio = float((inner < 190).mean())
-        if not (0.22 <= inner_nonwhite_ratio <= 0.82 and 0.05 <= inner_dark_ratio <= 0.28):
+        if not (
+            0.22 <= inner_nonwhite_ratio <= 0.82 and 0.05 <= inner_dark_ratio <= 0.28
+        ):
             saw_small_box = True
             continue
 
@@ -195,7 +200,12 @@ def _detect_bag_icon_shape(page: PageData) -> tuple[float, list[str]]:
                 continue
             if aw * ah < min_arrow_area:
                 continue
-            if ax < search_x0 or ay < search_y0 or ax + aw > search_x1 or ay + ah > search_y1:
+            if (
+                ax < search_x0
+                or ay < search_y0
+                or ax + aw > search_x1
+                or ay + ah > search_y1
+            ):
                 continue
 
             other_perimeter = cv2.arcLength(other_contour, True)
@@ -248,7 +258,11 @@ def _detect_bag_badge(page: PageData) -> tuple[float, list[str]]:
         for x in range(0, roi_width, step):
             sample_index = row_base + x * channels
             if channels >= 3:
-                gray = (samples[sample_index] + samples[sample_index + 1] + samples[sample_index + 2]) // 3
+                gray = (
+                    samples[sample_index]
+                    + samples[sample_index + 1]
+                    + samples[sample_index + 2]
+                ) // 3
             else:
                 gray = samples[sample_index]
             row.append(gray)
@@ -356,14 +370,20 @@ def _detect_bag_badge(page: PageData) -> tuple[float, list[str]]:
         connector_y1,
         lambda value: value >= 235,
     )
-    if inner_bag_like_found and 0.02 <= connector_dark_density <= 0.18 and connector_bright_ratio >= 0.70:
+    if (
+        inner_bag_like_found
+        and 0.02 <= connector_dark_density <= 0.18
+        and connector_bright_ratio >= 0.70
+    ):
         score += 0.15
         reasons.append("possible connector shape near badge")
 
     return min(score, 0.95), reasons
 
 
-def _overview_score(page: PageData, numbers: list[int], dark_ratio: float) -> tuple[float, list[str]]:
+def _overview_score(
+    page: PageData, numbers: list[int], dark_ratio: float
+) -> tuple[float, list[str]]:
     reasons: list[str] = []
     score = 0.0
     run_length = _longest_run(numbers)
@@ -426,11 +446,15 @@ def _bag_start_like_score(page: PageData, dark_ratio: float) -> tuple[float, lis
     return max(0.0, min(score, 0.99)), reasons
 
 
-def _resolve_bag_number(page: PageData, numbers: list[int]) -> tuple[int | None, list[str]]:
+def _resolve_bag_number(
+    page: PageData, numbers: list[int]
+) -> tuple[int | None, list[str]]:
     reasons: list[str] = []
     remaining = sorted({number for number in numbers if number != page.page_number})
     if len(remaining) == 1:
-        reasons.append(f"resolved bag number {remaining[0]} after dropping page number {page.page_number}")
+        reasons.append(
+            f"resolved bag number {remaining[0]} after dropping page number {page.page_number}"
+        )
         return remaining[0], reasons
     if len(numbers) == 1:
         reasons.append(f"single extracted bag number {numbers[0]}")
@@ -504,7 +528,9 @@ def _load_reviewed_bag(candidate_json_path: Path) -> int | None:
     return None
 
 
-def _feature_vector(page: PageData, dark_ratio: float, start_like_score: float) -> dict[str, float]:
+def _feature_vector(
+    page: PageData, dark_ratio: float, start_like_score: float
+) -> dict[str, float]:
     return {
         "word_count": float(page.word_count),
         "drawing_count": float(page.drawing_count),
@@ -522,8 +548,12 @@ def _page_similarity(
     reference_dark_ratio: float,
     reference_start_like_score: float,
 ) -> float:
-    candidate_vector = _feature_vector(candidate_page, candidate_dark_ratio, candidate_start_like_score)
-    reference_vector = _feature_vector(reference_page, reference_dark_ratio, reference_start_like_score)
+    candidate_vector = _feature_vector(
+        candidate_page, candidate_dark_ratio, candidate_start_like_score
+    )
+    reference_vector = _feature_vector(
+        reference_page, reference_dark_ratio, reference_start_like_score
+    )
     total = 0.0
     for key, weight in FEATURE_WEIGHTS.items():
         scale = FEATURE_SCALES[key]
@@ -550,7 +580,9 @@ def _pages_per_bag_step(confirmed_bags: list[BagCandidate]) -> float:
     return float(median(steps))
 
 
-def _neighboring_confirmed_bags(target_bag: int, confirmed_bags: list[BagCandidate]) -> tuple[BagCandidate | None, BagCandidate | None]:
+def _neighboring_confirmed_bags(
+    target_bag: int, confirmed_bags: list[BagCandidate]
+) -> tuple[BagCandidate | None, BagCandidate | None]:
     lower: BagCandidate | None = None
     upper: BagCandidate | None = None
     for bag in sorted(confirmed_bags, key=lambda item: item.bag):
@@ -563,7 +595,9 @@ def _neighboring_confirmed_bags(target_bag: int, confirmed_bags: list[BagCandida
     return lower, upper
 
 
-def _estimated_transition_page(target_bag: int, confirmed_bags: list[BagCandidate], default_step: float) -> float | None:
+def _estimated_transition_page(
+    target_bag: int, confirmed_bags: list[BagCandidate], default_step: float
+) -> float | None:
     if not confirmed_bags:
         return None
 
@@ -578,7 +612,9 @@ def _estimated_transition_page(target_bag: int, confirmed_bags: list[BagCandidat
     return None
 
 
-def _transition_score(page_number: int, estimated_page: float | None, page_step: float) -> float:
+def _transition_score(
+    page_number: int, estimated_page: float | None, page_step: float
+) -> float:
     if estimated_page is None:
         return 0.0
     window = max(18.0, page_step * 1.75)
@@ -611,7 +647,9 @@ def _build_bag_intervals(confirmed_bags: list[BagCandidate]) -> list[dict[str, i
     return intervals
 
 
-def _candidate_within_interval(candidate: dict[str, Any], missing_bag: int, intervals: list[dict[str, int]]) -> bool:
+def _candidate_within_interval(
+    candidate: dict[str, Any], missing_bag: int, intervals: list[dict[str, int]]
+) -> bool:
     page_number = candidate.get("page_number")
     if not isinstance(page_number, int):
         return True
@@ -639,7 +677,10 @@ def _missing_bag_candidate_entry(
     confirmed_start_pages: set[int],
     page_step: float,
 ) -> dict[str, Any] | None:
-    if page.page_number in overview_page_numbers or page.page_number in confirmed_start_pages:
+    if (
+        page.page_number in overview_page_numbers
+        or page.page_number in confirmed_start_pages
+    ):
         return None
     if QUANTITY_RE.search(page.text or ""):
         return None
@@ -705,7 +746,9 @@ def _missing_bag_candidate_entry(
     return {
         "bag": missing_bag,
         "page_number": page.page_number,
-        "estimated_page": round(estimated_page, 1) if estimated_page is not None else None,
+        "estimated_page": (
+            round(estimated_page, 1) if estimated_page is not None else None
+        ),
         "score": round(score, 3),
         "similarity_to_confirmed_start": round(similarity, 3),
         "transition_score": round(transition, 3),
@@ -748,7 +791,9 @@ def _build_missing_bag_review_groups(
     groups: list[dict[str, Any]] = []
 
     for missing_bag in missing_bags:
-        estimated_page = _estimated_transition_page(missing_bag, confirmed_bags, page_step)
+        estimated_page = _estimated_transition_page(
+            missing_bag, confirmed_bags, page_step
+        )
         candidates: list[dict[str, Any]] = []
         for page in pages:
             candidate = _missing_bag_candidate_entry(
@@ -767,7 +812,9 @@ def _build_missing_bag_review_groups(
                 candidates.append(candidate)
 
         filtered_candidates = [
-            candidate for candidate in candidates if _candidate_within_interval(candidate, missing_bag, intervals)
+            candidate
+            for candidate in candidates
+            if _candidate_within_interval(candidate, missing_bag, intervals)
         ]
         if filtered_candidates:
             candidates = filtered_candidates
@@ -775,14 +822,20 @@ def _build_missing_bag_review_groups(
         candidates.sort(
             key=lambda item: (
                 -_final_missing_candidate_score(item),
-                abs(item["page_number"] - item["estimated_page"]) if item["estimated_page"] is not None else item["page_number"],
+                (
+                    abs(item["page_number"] - item["estimated_page"])
+                    if item["estimated_page"] is not None
+                    else item["page_number"]
+                ),
                 item["page_number"],
             )
         )
         groups.append(
             {
                 "bag": missing_bag,
-                "estimated_page": round(estimated_page, 1) if estimated_page is not None else None,
+                "estimated_page": (
+                    round(estimated_page, 1) if estimated_page is not None else None
+                ),
                 "candidates": candidates[:MISSING_BAG_TOP_K],
             }
         )
@@ -839,7 +892,9 @@ def _save_candidate_debug(
     candidate_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, debug_dir: Path) -> PdfBagAnalysis:
+def analyze_pdf_for_bags(
+    pdf_path: Path, pages: list[PageData], debug: bool, debug_dir: Path
+) -> PdfBagAnalysis:
     document = fitz.open(pdf_path)
     overview_pages: list[int] = []
     overview_numbers: set[int] = set()
@@ -855,11 +910,15 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
     page_start_like_scores: dict[int, float] = {}
 
     for page in pages:
-        candidate_json_path = _candidate_json_path(debug_dir / "candidates", page.page_number)
+        candidate_json_path = _candidate_json_path(
+            debug_dir / "candidates", page.page_number
+        )
         reviewed_bag = _load_reviewed_bag(candidate_json_path)
         numbers = _extract_candidate_numbers(page)
         dark_ratio = _dark_pixel_ratio(document, page.page_index)
-        start_like_confidence, start_like_reasons = _bag_start_like_score(page, dark_ratio)
+        start_like_confidence, start_like_reasons = _bag_start_like_score(
+            page, dark_ratio
+        )
         bag_badge_score, bag_badge_reasons = _detect_bag_badge(page)
         bag_icon_score, _ = _detect_bag_icon_shape(page)
 
@@ -926,7 +985,9 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
                         "confidence": 1.0,
                         "detected_numbers": numbers,
                         "reasons": reviewed_reasons,
-                        "image_path": page.image_path.as_posix() if page.image_path else None,
+                        "image_path": (
+                            page.image_path.as_posix() if page.image_path else None
+                        ),
                     }
                 )
                 LOG.info(
@@ -950,8 +1011,14 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
 
         if numbers:
             reviewed_expected_bags = _load_reviewed_expected_bags(candidate_json_path)
-            overview_confidence, overview_reasons = _overview_score(page, numbers, dark_ratio)
-            if overview_confidence >= 0.75 and len(numbers) >= 8 and page.image_count >= 40:
+            overview_confidence, overview_reasons = _overview_score(
+                page, numbers, dark_ratio
+            )
+            if (
+                overview_confidence >= 0.75
+                and len(numbers) >= 8
+                and page.image_count >= 40
+            ):
                 overview_pages.append(page.page_number)
                 overview_numbers.update(numbers)
                 if reviewed_expected_bags:
@@ -969,9 +1036,14 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
                         "confidence": round(overview_confidence, 3),
                         "detected_numbers": numbers,
                         "reviewed_expected_bags": reviewed_expected_bags,
-                        "resolved_expected_bags": sorted(set(numbers) | set(reviewed_expected_bags)),
-                        "reasons": overview_reasons + ["accepted with tightened overview gate"],
-                        "image_path": page.image_path.as_posix() if page.image_path else None,
+                        "resolved_expected_bags": sorted(
+                            set(numbers) | set(reviewed_expected_bags)
+                        ),
+                        "reasons": overview_reasons
+                        + ["accepted with tightened overview gate"],
+                        "image_path": (
+                            page.image_path.as_posix() if page.image_path else None
+                        ),
                     }
                 )
                 LOG.info(
@@ -1011,7 +1083,11 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
             if numbers:
                 bag_num, number_reasons = _resolve_bag_number(page, numbers)
                 combined_reasons = start_like_reasons + number_reasons
-                if bag_num is not None and start_like_confidence >= 0.8 and bag_num not in seen_single_bags:
+                if (
+                    bag_num is not None
+                    and start_like_confidence >= 0.8
+                    and bag_num not in seen_single_bags
+                ):
                     seen_single_bags.add(bag_num)
                     bags.append(
                         BagCandidate(
@@ -1029,7 +1105,9 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
                             "confidence": round(start_like_confidence, 3),
                             "detected_numbers": numbers,
                             "reasons": combined_reasons,
-                            "image_path": page.image_path.as_posix() if page.image_path else None,
+                            "image_path": (
+                                page.image_path.as_posix() if page.image_path else None
+                            ),
                         }
                     )
                     LOG.info(
@@ -1088,7 +1166,11 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
     deduped_uncertain = sorted(set(uncertain_pages))
     detected_bags = sorted(set(bag.bag for bag in ordered_bags if bag.bag is not None))
     missing_bags = sorted(set(expected_bags) - set(detected_bags))
-    bag_count_estimate = len(expected_bags) if expected_bags else max((bag.bag for bag in ordered_bags), default=0)
+    bag_count_estimate = (
+        len(expected_bags)
+        if expected_bags
+        else max((bag.bag for bag in ordered_bags), default=0)
+    )
     missing_bag_review_groups = _build_missing_bag_review_groups(
         missing_bags=missing_bags,
         pages=pages,
@@ -1099,7 +1181,10 @@ def analyze_pdf_for_bags(pdf_path: Path, pages: list[PageData], debug: bool, deb
         overview_pages=overview_pages,
     )
     review_groups = {
-        "confirmed_bag_start": sorted(confirmed_bag_start_review, key=lambda item: (item["bag"], item["page_number"])),
+        "confirmed_bag_start": sorted(
+            confirmed_bag_start_review,
+            key=lambda item: (item["bag"], item["page_number"]),
+        ),
         "overview": sorted(accepted_overviews, key=lambda item: item["page_number"]),
         "missing_bag_candidates": missing_bag_review_groups,
     }

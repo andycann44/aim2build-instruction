@@ -198,7 +198,7 @@ def scan_step_bag_sequence_openai_verify(
     local_candidates = local_scan.get("candidate_bag_starts", [])
     page_steps = local_scan.get("page_steps", [])
     page_step_map = {
-        int(row.get("page", 0) or 0): list(row.get("steps", []) or [])
+        int(row.get("page", 0) or 0): row
         for row in page_steps
     }
     verified_bag_starts: List[Dict[str, Any]] = []
@@ -206,9 +206,26 @@ def scan_step_bag_sequence_openai_verify(
 
     for candidate in local_candidates:
         page = int(candidate.get("page", 0) or 0)
-        current_steps = sorted(set(int(v) for v in (candidate.get("steps", []) or [])))
         previous_page = max(1, int(page) - 1)
-        previous_steps = sorted(set(int(v) for v in page_step_map.get(previous_page, []) or []))
+        previous_row = page_step_map.get(previous_page, {}) or {}
+        previous_main_steps = [
+            int(item.get("value", 0) or 0)
+            for item in (previous_row.get("main_steps", []) or [])
+        ]
+        page_data = page_step_map.get(page, {}) or {}
+        main_steps = [
+            int(item.get("value", 0) or 0)
+            for item in (page_data.get("main_steps", []) or [])
+        ]
+        sub_steps = [int(v) for v in (page_data.get("sub_steps", []) or [])]
+        main_min = min(main_steps) if main_steps else None
+        has_substep_one = 1 in sub_steps
+        allow_candidate = (
+            (main_min == 1)
+            or (main_min is not None and main_min >= 10 and has_substep_one)
+        )
+
+        print(f"[verify] page={page} main_steps={main_steps} sub_steps={sub_steps}")
 
         if page <= 3:
             skipped_candidates.append(
@@ -216,14 +233,14 @@ def scan_step_bag_sequence_openai_verify(
             )
             continue
 
-        if not previous_steps:
+        if not previous_main_steps:
             skipped_candidates.append(
                 {"page": int(page), "reason": "skipped previous page has no valid main steps"}
             )
             continue
 
-        previous_max_step = max(previous_steps)
-        current_min_step = min(current_steps) if current_steps else None
+        previous_max_step = max(previous_main_steps)
+        current_min_step = main_min
         step_drop = (
             int(previous_max_step) - int(current_min_step)
             if current_min_step is not None
@@ -236,9 +253,12 @@ def scan_step_bag_sequence_openai_verify(
             )
             continue
 
-        if current_min_step != 1:
+        if not allow_candidate:
             skipped_candidates.append(
-                {"page": int(page), "reason": "skipped current page does not start at main step 1"}
+                {
+                    "page": int(page),
+                    "reason": "skipped no valid step-1 start (neither main nor substep)",
+                }
             )
             continue
 

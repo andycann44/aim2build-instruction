@@ -5,7 +5,6 @@ import logging
 import re
 from pathlib import Path
 
-
 LOG = logging.getLogger("lego_reader")
 SET_NUM_RE = re.compile(r"^\d{3,7}(?:-\d+)?$")
 

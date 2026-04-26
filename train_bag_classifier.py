@@ -1,16 +1,18 @@
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
+from torchvision import datasets, models, transforms
 
 DATA_DIR = "training_data_crops"
 BATCH_SIZE = 8
 EPOCHS = 5
 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+transform = transforms.Compose(
+    [
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ]
+)
 
 dataset = datasets.ImageFolder(DATA_DIR, transform=transform)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)

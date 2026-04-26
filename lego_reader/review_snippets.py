@@ -9,7 +9,6 @@ from typing import Any
 
 from .utils import ensure_dir
 
-
 LABELS = ("bag_start", "overview", "normal_step", "rejected")
 FEATURE_SCALES = {
     "word_count": 50.0,
@@ -105,7 +104,9 @@ def promote_snippet(args: argparse.Namespace) -> int:
     snippet_id = _snippet_id(candidate_json)
 
     destination_json = destination_dir / f"{snippet_id}.json"
-    destination_image = destination_dir / f"{snippet_id}{image_path.suffix if image_path else '.png'}"
+    destination_image = (
+        destination_dir / f"{snippet_id}{image_path.suffix if image_path else '.png'}"
+    )
 
     review_meta = {
         "label": args.label,
@@ -127,7 +128,11 @@ def promote_snippet(args: argparse.Namespace) -> int:
 
     if args.action == "move":
         candidate_json.unlink(missing_ok=True)
-        if image_path and image_path.exists() and image_path.parent == candidate_json.parent:
+        if (
+            image_path
+            and image_path.exists()
+            and image_path.parent == candidate_json.parent
+        ):
             image_path.unlink(missing_ok=True)
 
     print(destination_json.as_posix())
@@ -173,7 +178,9 @@ def compare_snippet(args: argparse.Namespace) -> int:
 
     label_scores: dict[str, float] = {}
     for label in sorted({match["label"] for match in scored_matches}):
-        label_specific = [match["score"] for match in scored_matches if match["label"] == label][: args.top_k]
+        label_specific = [
+            match["score"] for match in scored_matches if match["label"] == label
+        ][: args.top_k]
         if label_specific:
             label_scores[label] = round(sum(label_specific) / len(label_specific), 4)
 
@@ -188,20 +195,38 @@ def compare_snippet(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Review and compare exported candidate snippets.")
+    parser = argparse.ArgumentParser(
+        description="Review and compare exported candidate snippets."
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    promote_parser = subparsers.add_parser("promote", help="Copy or move a reviewed snippet into training.")
-    promote_parser.add_argument("candidate_json", help="Path to an exported candidate JSON sidecar.")
-    promote_parser.add_argument("label", choices=LABELS, help="Review label for the snippet.")
+    promote_parser = subparsers.add_parser(
+        "promote", help="Copy or move a reviewed snippet into training."
+    )
+    promote_parser.add_argument(
+        "candidate_json", help="Path to an exported candidate JSON sidecar."
+    )
+    promote_parser.add_argument(
+        "label", choices=LABELS, help="Review label for the snippet."
+    )
     promote_parser.add_argument("--action", choices=("copy", "move"), default="copy")
-    promote_parser.add_argument("--training-root", default="training", help="Training data root directory.")
+    promote_parser.add_argument(
+        "--training-root", default="training", help="Training data root directory."
+    )
     promote_parser.set_defaults(func=promote_snippet)
 
-    compare_parser = subparsers.add_parser("compare", help="Score a candidate against accepted snippets.")
-    compare_parser.add_argument("candidate_json", help="Path to an exported candidate JSON sidecar.")
-    compare_parser.add_argument("--training-root", default="training", help="Training data root directory.")
-    compare_parser.add_argument("--top-k", type=int, default=5, help="Number of top matches to show.")
+    compare_parser = subparsers.add_parser(
+        "compare", help="Score a candidate against accepted snippets."
+    )
+    compare_parser.add_argument(
+        "candidate_json", help="Path to an exported candidate JSON sidecar."
+    )
+    compare_parser.add_argument(
+        "--training-root", default="training", help="Training data root directory."
+    )
+    compare_parser.add_argument(
+        "--top-k", type=int, default=5, help="Number of top matches to show."
+    )
     compare_parser.set_defaults(func=compare_snippet)
 
     return parser

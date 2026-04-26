@@ -23,10 +23,12 @@ model.load_state_dict(state_dict)
 model.eval()
 
 # same transform as training
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+transform = transforms.Compose(
+    [
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ]
+)
 
 
 def predict(image_path: Path):
@@ -46,11 +48,17 @@ def predict(image_path: Path):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Predict labels for crop images using the trained bag classifier.")
+    parser = argparse.ArgumentParser(
+        description="Predict labels for crop images using the trained bag classifier."
+    )
     parser.add_argument("image_paths", nargs="*", help="Crop image paths to classify.")
     args = parser.parse_args()
 
-    image_paths = [Path(path) for path in args.image_paths] if args.image_paths else DEFAULT_IMAGES
+    image_paths = (
+        [Path(path) for path in args.image_paths]
+        if args.image_paths
+        else DEFAULT_IMAGES
+    )
     for image_path in image_paths:
         if not image_path.is_file():
             print(f"Skipping missing image: {image_path}")

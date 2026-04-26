@@ -13,7 +13,6 @@ import cv2
 
 from .utils import ensure_dir, write_json
 
-
 DEFAULT_DEBUG_ROOT = "debug"
 DEFAULT_LABELS_ROOT = "manual_labels"
 
@@ -55,11 +54,7 @@ def _load_manual_labels(labels_path: Path) -> dict[str, Any]:
             for page, label in raw_labels.items()
             if str(page).isdigit() and isinstance(label, str) and label.strip()
         },
-        "unsure_pages": {
-            int(str(page))
-            for page in raw_unsure
-            if str(page).isdigit()
-        },
+        "unsure_pages": {int(str(page)) for page in raw_unsure if str(page).isdigit()},
     }
 
 
@@ -85,7 +80,11 @@ def _lookup_by_page(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     return output
 
 
-def _sequence_lookups(sequence_data: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+def _sequence_lookups(
+    sequence_data: dict[str, Any],
+) -> tuple[
+    dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]]
+]:
     accepted_by_page: dict[int, dict[str, Any]] = {}
     for item in sequence_data.get("accepted_sequence", []):
         page = item.get("page")
@@ -146,12 +145,19 @@ def _disagreement_types(
     return sorted(set(disagreement_types))
 
 
-def _write_annotated_image(app_module, page_number: int, destination_path: Path) -> None:
+def _write_annotated_image(
+    app_module, page_number: int, destination_path: Path
+) -> None:
     annotated_result = app_module.analyze_page(page_number, include_image=True)
     destination_path.write_bytes(annotated_result["image_bytes"])
 
 
-def _write_number_crop(app_module, page_image_path: Path, number_box: list[int] | None, destination_path: Path) -> bool:
+def _write_number_crop(
+    app_module,
+    page_image_path: Path,
+    number_box: list[int] | None,
+    destination_path: Path,
+) -> bool:
     if not number_box:
         return False
 
@@ -195,7 +201,9 @@ def export_app_candidates(args: argparse.Namespace) -> int:
     )
 
     rows_by_page = _lookup_by_page(sequence_data.get("rows", []))
-    accepted_by_page, deferred_by_page, page_debug_by_page = _sequence_lookups(sequence_data)
+    accepted_by_page, deferred_by_page, page_debug_by_page = _sequence_lookups(
+        sequence_data
+    )
 
     app_candidates_dir = ensure_dir(debug_pdf_dir / "app_candidates")
 
@@ -261,7 +269,9 @@ def export_app_candidates(args: argparse.Namespace) -> int:
             "saved_paths": {
                 "full_page_image": full_page_path.as_posix(),
                 "annotated_image": annotated_path.as_posix(),
-                "number_crop_image": number_crop_path.as_posix() if number_crop_saved else None,
+                "number_crop_image": (
+                    number_crop_path.as_posix() if number_crop_saved else None
+                ),
             },
             "manual_truth": {
                 "label": manual_label,
@@ -270,11 +280,19 @@ def export_app_candidates(args: argparse.Namespace) -> int:
             "detector": row,
             "sequence": {
                 "accepted": accepted_item is not None,
-                "accepted_number": accepted_item.get("number") if accepted_item else None,
-                "accepted_reason": accepted_item.get("reason") if accepted_item else None,
+                "accepted_number": (
+                    accepted_item.get("number") if accepted_item else None
+                ),
+                "accepted_reason": (
+                    accepted_item.get("reason") if accepted_item else None
+                ),
                 "deferred": deferred_item is not None,
-                "deferred_number": deferred_item.get("number") if deferred_item else None,
-                "deferred_reason": deferred_item.get("reason") if deferred_item else None,
+                "deferred_number": (
+                    deferred_item.get("number") if deferred_item else None
+                ),
+                "deferred_reason": (
+                    deferred_item.get("reason") if deferred_item else None
+                ),
                 "page_debug_action": page_debug.get("action"),
                 "expected_next_before": page_debug.get("expected_next_before"),
                 "expected_next_after": page_debug.get("expected_next_after"),
@@ -315,20 +333,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export app.py detector disagreements against manual_labels into debug/<set>/<pdf>/app_candidates/."
     )
-    parser.add_argument("--set-num", required=True, help="LEGO set number, for example 21330")
-    parser.add_argument("--pdf-name", required=True, help="PDF folder name under debug/<set>, for example 21330_01")
-    parser.add_argument("--debug-root", default=DEFAULT_DEBUG_ROOT, help="Root directory containing rendered debug pages.")
-    parser.add_argument("--labels-root", default=DEFAULT_LABELS_ROOT, help="Directory containing manual label JSON files.")
-    parser.add_argument("--start-number", type=int, default=1, help="First bag number for sequence scan.")
-    parser.add_argument("--end-number", type=int, default=24, help="Last bag number for sequence scan.")
-    parser.add_argument("--min-confidence", type=float, default=0.70, help="Minimum confidence used for disagreement checks.")
+    parser.add_argument(
+        "--set-num", required=True, help="LEGO set number, for example 21330"
+    )
+    parser.add_argument(
+        "--pdf-name",
+        required=True,
+        help="PDF folder name under debug/<set>, for example 21330_01",
+    )
+    parser.add_argument(
+        "--debug-root",
+        default=DEFAULT_DEBUG_ROOT,
+        help="Root directory containing rendered debug pages.",
+    )
+    parser.add_argument(
+        "--labels-root",
+        default=DEFAULT_LABELS_ROOT,
+        help="Directory containing manual label JSON files.",
+    )
+    parser.add_argument(
+        "--start-number",
+        type=int,
+        default=1,
+        help="First bag number for sequence scan.",
+    )
+    parser.add_argument(
+        "--end-number", type=int, default=24, help="Last bag number for sequence scan."
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.70,
+        help="Minimum confidence used for disagreement checks.",
+    )
     parser.add_argument(
         "--allow-structure-only-start",
         type=_parse_bool,
         default=True,
         help="Whether to allow structure-only bag 1 candidates in sequence scan (true/false).",
     )
-    parser.add_argument("--reference-page", type=int, default=28, help="Reference page used to rebuild the shell template.")
+    parser.add_argument(
+        "--reference-page",
+        type=int,
+        default=28,
+        help="Reference page used to rebuild the shell template.",
+    )
     parser.set_defaults(func=export_app_candidates)
     return parser
 

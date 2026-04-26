@@ -9,9 +9,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from .models import DownloadResult, DownloadedPdf
+from .models import DownloadedPdf, DownloadResult
 from .utils import ensure_dir
-
 
 LOG = logging.getLogger("lego_reader.downloader")
 REQUEST_TIMEOUT = 20
@@ -71,15 +70,23 @@ def _find_best_source_page(session: requests.Session, set_num: str) -> tuple[str
             last_url = url
             continue
         last_url = response.url
-        LOG.info("Fetched %s -> %s (status=%s)", url, response.url, response.status_code)
+        LOG.info(
+            "Fetched %s -> %s (status=%s)", url, response.url, response.status_code
+        )
         if _looks_like_instruction_page(response, set_num):
             return response.text, response.url
     raise SetNotFoundError(set_num=set_num, source_url=last_url)
 
 
-def _extract_pdf_links_from_anchors(html: str, base_url: str) -> tuple[str, list[tuple[str, str]]]:
+def _extract_pdf_links_from_anchors(
+    html: str, base_url: str
+) -> tuple[str, list[tuple[str, str]]]:
     soup = BeautifulSoup(html, "html.parser")
-    title = soup.title.get_text(" ", strip=True) if soup.title else "LEGO Building Instructions"
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else "LEGO Building Instructions"
+    )
     pdf_entries: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -133,7 +140,9 @@ def _extract_pdf_links(html: str, base_url: str) -> tuple[str, list[tuple[str, s
     return title, fallback_entries
 
 
-def _download_file(session: requests.Session, source_url: str, destination: Path) -> None:
+def _download_file(
+    session: requests.Session, source_url: str, destination: Path
+) -> None:
     try:
         with session.get(source_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
             response.raise_for_status()

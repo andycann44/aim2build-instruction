@@ -27,9 +27,7 @@ from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/api/images", tags=["images"])
 
-DEFAULT_ROOT = (
-    Path(__file__).resolve().parent.parent / "data" / "instruction_catalog"
-)
+DEFAULT_ROOT = Path(__file__).resolve().parent.parent / "data" / "instruction_catalog"
 ASSETS_ROOT = Path(os.getenv("A2B_INSTRUCTION_ASSETS", DEFAULT_ROOT)).resolve()
 
 
