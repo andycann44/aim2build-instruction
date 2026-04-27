@@ -406,9 +406,15 @@ def _summarize_step_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
 def _classify_main_and_sub_steps(
     step_candidates: List[Dict[str, Any]],
     page_width: int,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[int]]:
+) -> Tuple[
+    Dict[str, Any],
+    List[Dict[str, Any]],
+    List[int],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     if not step_candidates:
-        return {}, [], []
+        return {}, [], [], [], []
 
     sorted_candidates = sorted(
         step_candidates,
@@ -457,6 +463,7 @@ def _classify_main_and_sub_steps(
     }
 
     sub_step_values: List[int] = []
+    sub_step_candidates_raw: List[Dict[str, Any]] = []
     for item in sorted_candidates:
         item_id = (
             int(item.get("x", 0) or 0),
@@ -472,8 +479,75 @@ def _classify_main_and_sub_steps(
         value = int(item.get("value", 0) or 0)
         if value not in sub_step_values:
             sub_step_values.append(value)
+        sub_step_candidates_raw.append(item)
 
-    return main_step, main_steps, sub_step_values
+    return main_step, main_steps, sub_step_values, main_steps_raw, sub_step_candidates_raw
+
+
+def _build_classified_step_boxes(
+    step_candidates: List[Dict[str, Any]],
+    main_steps_raw: List[Dict[str, Any]],
+    sub_step_candidates_raw: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    main_ids = {
+        (
+            int(item.get("x", 0) or 0),
+            int(item.get("y", 0) or 0),
+            int(item.get("w", 0) or 0),
+            int(item.get("h", 0) or 0),
+            str(item.get("text", "")),
+        )
+        for item in main_steps_raw
+    }
+    sub_ids = {
+        (
+            int(item.get("x", 0) or 0),
+            int(item.get("y", 0) or 0),
+            int(item.get("w", 0) or 0),
+            int(item.get("h", 0) or 0),
+            str(item.get("text", "")),
+        )
+        for item in sub_step_candidates_raw
+    }
+
+    classified: List[Dict[str, Any]] = []
+    for item in step_candidates:
+        item_id = (
+            int(item.get("x", 0) or 0),
+            int(item.get("y", 0) or 0),
+            int(item.get("w", 0) or 0),
+            int(item.get("h", 0) or 0),
+            str(item.get("text", "")),
+        )
+
+        step_group = "other_detected_step"
+        if item_id in main_ids:
+            step_group = "main_steps"
+        elif item_id in sub_ids:
+            step_group = "sub_steps"
+
+        classified.append(
+            {
+                "step_number": int(item.get("value", 0) or 0),
+                "text": str(item.get("text", "")),
+                "box": [
+                    int(item.get("x", 0) or 0),
+                    int(item.get("y", 0) or 0),
+                    int(item.get("w", 0) or 0),
+                    int(item.get("h", 0) or 0),
+                ],
+                "x": int(item.get("x", 0) or 0),
+                "y": int(item.get("y", 0) or 0),
+                "w": int(item.get("w", 0) or 0),
+                "h": int(item.get("h", 0) or 0),
+                "confidence": float(item.get("score", 0.0) or 0.0),
+                "source": str(item.get("source", "")),
+                "step_group": step_group,
+                "reasons": list(item.get("reasons", []) or []),
+            }
+        )
+
+    return classified
 
 
 def detect_steps(set_num: str, page: int) -> Dict[str, Any]:
@@ -519,9 +593,14 @@ def detect_steps(set_num: str, page: int) -> Dict[str, Any]:
         candidates.append(scored)
 
     step_candidates = _dedupe_candidates(candidates)
-    main_step, main_steps, sub_steps = _classify_main_and_sub_steps(
+    main_step, main_steps, sub_steps, main_steps_raw, sub_step_candidates_raw = _classify_main_and_sub_steps(
         step_candidates,
         page_width,
+    )
+    classified_step_boxes = _build_classified_step_boxes(
+        step_candidates,
+        main_steps_raw,
+        sub_step_candidates_raw,
     )
 
     return {
@@ -531,6 +610,7 @@ def detect_steps(set_num: str, page: int) -> Dict[str, Any]:
         "page_height": int(page_height),
         "page_number_tokens": page_number_tokens,
         "step_candidates": step_candidates,
+        "classified_step_boxes": classified_step_boxes,
         "main_step": main_step,
         "main_steps": main_steps,
         "sub_steps": sub_steps,

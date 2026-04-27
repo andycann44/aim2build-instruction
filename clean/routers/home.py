@@ -144,6 +144,36 @@ def home():
                         <button type="submit">Run Sequence Scan (needs saved bag truth)</button>
                     </form>
 
+                    <p class="section-title"><strong>Step 4: Full bag scan review</strong></p>
+                    <form action="/debug/full-bag-scan" method="get">
+                        <input
+                            name="set_num"
+                            placeholder="Set number for full bag scan"
+                            required
+                        >
+                        <input
+                            name="start"
+                            placeholder="Start page (optional)"
+                        >
+                        <input
+                            name="end"
+                            placeholder="End page (optional)"
+                        >
+                        <input
+                            name="chunk_size"
+                            placeholder="Chunk size (default 5)"
+                        >
+                        <input
+                            name="max_chunks"
+                            placeholder="Max chunks (default 3)"
+                        >
+                        <input
+                            name="expected_next_bag"
+                            placeholder="Expected next bag (optional)"
+                        >
+                        <button type="submit">Run Full Bag Scan Review</button>
+                    </form>
+
                     <hr>
 
                     <p><strong>Quick links</strong></p>

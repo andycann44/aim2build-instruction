@@ -17,6 +17,138 @@ def _list_available_pages(set_num: str) -> List[int]:
     return page_numbers
 
 
+def _build_step_sequence_row(
+    page: int,
+    main_step_values: List[int],
+    previous_max_step: Optional[int],
+    classified_step_boxes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "page": int(page),
+        "main_steps": [int(value) for value in sorted(set(main_step_values))],
+        "main_step_min": None,
+        "main_step_max": None,
+        "previous_max_step": (
+            int(previous_max_step) if previous_max_step is not None else None
+        ),
+        "step_drop": None,
+        "step_sequence_role": "no_step_data",
+        "step_role_reason": "no main_steps detected",
+        "bag_start_allowed": True,
+        "detected_step_boxes": list(classified_step_boxes or []),
+    }
+
+    if not main_step_values:
+        return row
+
+    main_step_min = int(min(main_step_values))
+    main_step_max = int(max(main_step_values))
+    step_drop = (
+        int(previous_max_step) - int(main_step_min)
+        if previous_max_step is not None
+        else None
+    )
+
+    row["main_step_min"] = main_step_min
+    row["main_step_max"] = main_step_max
+    row["step_drop"] = step_drop
+
+    if (
+        previous_max_step is not None
+        and int(previous_max_step) >= 8
+        and int(main_step_min) <= 3
+        and step_drop is not None
+        and int(step_drop) >= 8
+    ):
+        row["step_sequence_role"] = "step_sequence_reset"
+        row["step_role_reason"] = (
+            "main steps reset from %d to %d"
+            % (int(previous_max_step), int(main_step_min))
+        )
+        row["bag_start_allowed"] = True
+        return row
+
+    if (
+        previous_max_step is not None
+        and int(main_step_min) >= int(previous_max_step)
+        and int(main_step_max) >= int(previous_max_step)
+    ):
+        row["step_sequence_role"] = "build_step_sequence_page"
+        row["step_role_reason"] = (
+            "main steps continue upward from previous max %d"
+            % int(previous_max_step)
+        )
+        row["bag_start_allowed"] = False
+        return row
+
+    row["step_sequence_role"] = "ambiguous"
+    if previous_max_step is None:
+        row["step_role_reason"] = "no previous max step for comparison"
+    else:
+        row["step_role_reason"] = (
+            "main steps neither continue upward nor reset cleanly from previous max %d"
+            % int(previous_max_step)
+        )
+    row["bag_start_allowed"] = True
+    return row
+
+
+def build_step_sequence_prepass_for_pages(
+    set_num: str,
+    pages: List[int],
+) -> List[Dict[str, Any]]:
+    if not pages:
+        return []
+
+    available_pages = set(_list_available_pages(set_num))
+    ordered_pages = sorted({int(page) for page in pages if int(page) > 0})
+    previous_max_step: Optional[int] = None
+    rows: List[Dict[str, Any]] = []
+
+    for page in ordered_pages:
+        if page not in available_pages:
+            continue
+
+        detected = step_detector_service.detect_steps(set_num, int(page))
+        main_steps = detected.get("main_steps", []) or []
+        classified_step_boxes = detected.get("classified_step_boxes", []) or []
+        main_step_values = sorted(
+            {
+                int(item.get("value", 0) or 0)
+                for item in main_steps
+                if int(item.get("value", 0) or 0) > 0
+            }
+        )
+
+        row = _build_step_sequence_row(
+            page=int(page),
+            main_step_values=main_step_values,
+            previous_max_step=previous_max_step,
+            classified_step_boxes=classified_step_boxes,
+        )
+        rows.append(row)
+
+        if main_step_values:
+            previous_max_step = int(max(main_step_values))
+
+    return rows
+
+
+def build_step_sequence_prepass(
+    set_num: str,
+    start_page: int,
+    end_page: int,
+) -> List[Dict[str, Any]]:
+    start_page = int(start_page)
+    end_page = int(end_page)
+    if end_page < start_page:
+        raise RuntimeError("end_page must be >= start_page")
+    return build_step_sequence_prepass_for_pages(
+        set_num=set_num,
+        pages=list(range(start_page, end_page + 1)),
+    )
+
+
 def _score_step_reset(
     previous_max_step: int,
     current_min_step: int,

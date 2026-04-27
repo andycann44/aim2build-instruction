@@ -1303,6 +1303,116 @@ def _bag_region_quality_flags(img_shape, shell_box, grey_bag_box):
         "bag_region_quality": round(float(bag_region_quality), 3),
     }
 
+
+def detect_bag_start_card(img, panel_box, number_box):
+    result = {
+        "bag_start_card_found": False,
+        "bag_start_card_score": 0.0,
+        "bag_start_card_box": None,
+        "bag_start_card_reasons": [],
+    }
+
+    if img is None or img.size == 0:
+        result["bag_start_card_reasons"].append("no_image")
+        return result
+
+    if number_box is None:
+        result["bag_start_card_reasons"].append("no_number_box")
+        return result
+
+    page_h, page_w = img.shape[:2]
+    nx, ny, nw, nh = [int(v) for v in number_box]
+    if nw <= 0 or nh <= 0:
+        result["bag_start_card_reasons"].append("invalid_number_box")
+        return result
+
+    center_x = nx + (nw // 2)
+    center_y = ny + (nh // 2)
+    search = cv2.cvtColor(img[: int(page_h * 0.55), : int(page_w * 0.65)], cv2.COLOR_BGR2GRAY)
+
+    best = None
+    best_score = -1.0
+
+    for thresh in (242, 238, 232):
+        mask = cv2.threshold(search, thresh, 255, cv2.THRESH_BINARY)[1]
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in cnts:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w <= 0 or h <= 0:
+                continue
+
+            area = int(w * h)
+            if area < max(12000, int(nw * nh * 2.0)):
+                continue
+            if w < int(nw * 1.8) or h < int(nh * 1.3):
+                continue
+            if x > int(page_w * 0.25) or y > int(page_h * 0.22):
+                continue
+            if not (x <= center_x <= x + w and y <= center_y <= y + h):
+                continue
+
+            roi = search[y : y + h, x : x + w]
+            if roi.size == 0:
+                continue
+
+            edges = cv2.Canny(roi, 60, 140)
+            edge_density = float(np.mean(edges > 0))
+            white_ratio = float(np.mean(roi > thresh))
+
+            score = 0.0
+            score += 35.0
+            score += min(20.0, (float(area) / float(max(1, nw * nh))) * 2.0)
+            if edge_density >= 0.05:
+                score += 22.0
+            elif edge_density >= 0.03:
+                score += 12.0
+            if 0.35 <= white_ratio <= 0.85:
+                score += 12.0
+            elif 0.20 <= white_ratio <= 0.92:
+                score += 6.0
+            if panel_box is not None:
+                px, py, pw, ph = [int(v) for v in panel_box]
+                if x >= px and y >= py and (x + w) <= (px + pw) and (y + h) <= (py + ph):
+                    score += 8.0
+
+            if score > best_score:
+                best_score = score
+                best = {
+                    "box": [int(x), int(y), int(w), int(h)],
+                    "edge_density": edge_density,
+                    "white_ratio": white_ratio,
+                    "threshold": int(thresh),
+                    "area_ratio_vs_number": round(float(area) / float(max(1, nw * nh)), 3),
+                }
+
+    if best is None:
+        result["bag_start_card_reasons"].append("no_bright_card_containing_number_box")
+        return result
+
+    reasons = [
+        "bright_card_contains_number_box",
+        "card_larger_than_number_box",
+        f"threshold:{best['threshold']}",
+        f"edge_density:{best['edge_density']:.3f}",
+        f"white_ratio:{best['white_ratio']:.3f}",
+        f"area_ratio_vs_number:{best['area_ratio_vs_number']:.3f}",
+    ]
+    if best["edge_density"] >= 0.05:
+        reasons.append("textured_card_region")
+    if panel_box is not None:
+        reasons.append("card_inside_panel_box")
+
+    result["bag_start_card_found"] = bool(best_score >= 60.0)
+    result["bag_start_card_score"] = round(float(best_score), 3)
+    result["bag_start_card_box"] = best["box"]
+    result["bag_start_card_reasons"] = reasons
+    if not result["bag_start_card_found"]:
+        result["bag_start_card_reasons"].append("score_below_threshold")
+    return result
+
 def _safe_ocr_text(img, psm=6):
     if img is None or img.size == 0:
         return ""
@@ -2019,6 +2129,10 @@ def analyze_page(page: int, include_image: bool = True):
             "ocr_raw": "",
             "intro_region_candidates": [],
             "intro_region_top_box": None,
+            "bag_start_card_found": False,
+            "bag_start_card_score": 0.0,
+            "bag_start_card_box": None,
+            "bag_start_card_reasons": [],
             "ocr_error": _get_ocr_error(),
             "confidence": 0.0,
         }
@@ -2238,6 +2352,11 @@ def analyze_page(page: int, include_image: bool = True):
     grey_bag_found = bag_abs is not None
     number_box_found = number_abs is not None
     bag_region_flags = _bag_region_quality_flags(img.shape, square_abs, bag_abs)
+    bag_start_card = detect_bag_start_card(
+        img,
+        panel if panel_found else None,
+        number_abs if number_box_found else None,
+    )
 
     confidence = compute_confidence(
         panel_found,
@@ -2422,6 +2541,14 @@ def analyze_page(page: int, include_image: bool = True):
         "step_grid_number_count": step_grid_number_count,
         "green_box_count": green_box_count,
         "multi_step_green_boxes": multi_step_green_boxes,
+        "bag_start_card_found": bool(bag_start_card.get("bag_start_card_found")),
+        "bag_start_card_score": float(
+            bag_start_card.get("bag_start_card_score", 0.0) or 0.0
+        ),
+        "bag_start_card_box": bag_start_card.get("bag_start_card_box"),
+        "bag_start_card_reasons": list(
+            bag_start_card.get("bag_start_card_reasons", []) or []
+        ),
         "ocr_error": _get_ocr_error(),
         "rejection_reason": (
             structural_rejection_reasons[0] if structural_rejection_reasons else None
