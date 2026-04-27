@@ -1,4 +1,17 @@
-*
+# Debug / runtime
+debug/
+*.db
+*.sqlite
+
+# PDFs / datasets
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Mac
+.DS_Store*
 !clean/
 !clean/**
 !.gitignore

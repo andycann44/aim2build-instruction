@@ -1,8 +1,24 @@
 from pathlib import Path
 
-from lego_reader.downloader import DownloadError, SetNotFoundError, download_set_pdfs
-from lego_reader.pdf_reader import read_pdf_pages
-from lego_reader.utils import normalize_set_num
+try:
+    from lego_reader.downloader import DownloadError, SetNotFoundError, download_set_pdfs
+    from lego_reader.pdf_reader import read_pdf_pages
+    from lego_reader.utils import normalize_set_num
+except ModuleNotFoundError:
+    class DownloadError(Exception):
+        pass
+
+    class SetNotFoundError(Exception):
+        pass
+
+    def download_set_pdfs(*args, **kwargs):
+        raise DownloadError("lego_reader not available")
+
+    def read_pdf_pages(*args, **kwargs):
+        raise DownloadError("lego_reader not available")
+
+    def normalize_set_num(x):
+        return x
 
 try:
     import app as legacy_app
@@ -143,3 +159,4 @@ def load_set_from_number(raw_set_num: str):
         "page_count": page_count,
         "rendered_now": rendered_now,
     }
+    
