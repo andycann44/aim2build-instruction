@@ -1,4 +1,5 @@
 import re
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Resp
 
 from clean.services import (
     analyzer_scan_service,
+    bag_truth_store,
     gap_scan_service,
     truth_service,
     debug_service,
@@ -805,6 +807,217 @@ def debug_page_image(
     if path is None:
         raise HTTPException(status_code=404, detail="Page image not found")
     return FileResponse(str(path))
+
+
+@router.get("/debug/page-image")
+def debug_page_image_alias(
+    set_num: str = Query(...),
+    page: int = Query(..., ge=1),
+):
+    return debug_page_image(set_num=set_num, page=page)
+
+
+@router.get("/debug/bag-truth-visual", response_class=HTMLResponse)
+def debug_bag_truth_visual(
+    set_num: str = Query(...),
+):
+    saved_truth = bag_truth_store.get_bag_truth(set_num)
+    cards: List[str] = []
+
+    for row in saved_truth:
+        bag_number = int(row.get("bag_number", 0) or 0)
+        start_page = int(row.get("start_page", 0) or 0)
+        confidence = row.get("confidence")
+        source = str(row.get("source", "") or "")
+        image_url = (
+            f"/debug/page-image?set_num={escape(str(set_num))}&page={int(start_page)}"
+        )
+        analyze_url = (
+            f"/api/analyze-page-direct?set_num={escape(str(set_num))}&page={int(start_page)}"
+        )
+        if confidence is None:
+            confidence_label = "n/a"
+        else:
+            confidence_label = f"{float(confidence):.2f}"
+
+        source_badge_class = (
+            "badge badge-green"
+            if "card" in source.lower()
+            else "badge badge-slate"
+        )
+
+        cards.append(
+            f"""
+            <article class="tile">
+              <a class="thumb-wrap" href="{image_url}" target="_blank">
+                <img class="thumb" src="{image_url}" alt="Bag {bag_number} page {start_page}" loading="lazy" />
+              </a>
+              <div class="tile-body">
+                <h3>Bag {bag_number}</h3>
+                <p class="meta">Page {start_page}</p>
+                <div class="badges">
+                  <span class="badge badge-green">confidence {escape(confidence_label)}</span>
+                  <span class="{source_badge_class}">{escape(source or 'unknown source')}</span>
+                </div>
+                <p class="actions">
+                  <a href="{image_url}" target="_blank">Open image</a>
+                  <span class="sep">|</span>
+                  <a href="{analyze_url}" target="_blank">Analyze</a>
+                </p>
+              </div>
+            </article>
+            """
+        )
+
+    cards_block = (
+        "\n".join(cards)
+        if cards
+        else "<div class='empty'>No saved bag truth found for this set.</div>"
+    )
+
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Bag Truth Visual Gallery</title>
+          <style>
+            :root {{
+              --bg: #f3f5f2;
+              --panel: #ffffff;
+              --border: #d9dfd4;
+              --text: #17301f;
+              --muted: #5f7467;
+              --green: #2f8f55;
+              --green-soft: #e7f6ec;
+              --slate: #e9ecef;
+              --shadow: 0 12px 30px rgba(25, 47, 33, 0.08);
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{
+              margin: 0;
+              padding: 24px;
+              background: linear-gradient(180deg, #eef4ee 0%, var(--bg) 100%);
+              color: var(--text);
+              font-family: Arial, sans-serif;
+            }}
+            .shell {{
+              max-width: 1280px;
+              margin: 0 auto;
+            }}
+            .hero {{
+              background: var(--panel);
+              border: 1px solid var(--border);
+              border-radius: 16px;
+              padding: 18px 20px;
+              margin-bottom: 18px;
+              box-shadow: var(--shadow);
+            }}
+            .hero h1 {{
+              margin: 0 0 8px;
+              font-size: 28px;
+            }}
+            .hero p {{
+              margin: 4px 0;
+              color: var(--muted);
+            }}
+            .hero a {{
+              color: var(--green);
+              text-decoration: none;
+            }}
+            .grid {{
+              display: grid;
+              grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+              gap: 16px;
+            }}
+            .tile {{
+              background: var(--panel);
+              border: 1px solid var(--border);
+              border-radius: 16px;
+              overflow: hidden;
+              box-shadow: var(--shadow);
+            }}
+            .thumb-wrap {{
+              display: block;
+              background: #dbe7db;
+              aspect-ratio: 1 / 1.25;
+            }}
+            .thumb {{
+              width: 100%;
+              height: 100%;
+              object-fit: cover;
+              display: block;
+            }}
+            .tile-body {{
+              padding: 14px;
+            }}
+            .tile-body h3 {{
+              margin: 0 0 6px;
+              font-size: 20px;
+            }}
+            .meta {{
+              margin: 0 0 10px;
+              color: var(--muted);
+            }}
+            .badges {{
+              display: flex;
+              flex-wrap: wrap;
+              gap: 8px;
+              margin-bottom: 10px;
+            }}
+            .badge {{
+              display: inline-block;
+              border-radius: 999px;
+              padding: 5px 10px;
+              font-size: 12px;
+              font-weight: 700;
+            }}
+            .badge-green {{
+              background: var(--green-soft);
+              color: var(--green);
+            }}
+            .badge-slate {{
+              background: var(--slate);
+              color: #44515a;
+            }}
+            .actions {{
+              margin: 0;
+              font-size: 14px;
+            }}
+            .actions a {{
+              color: var(--green);
+              text-decoration: none;
+            }}
+            .sep {{
+              color: #90a091;
+              margin: 0 6px;
+            }}
+            .empty {{
+              background: var(--panel);
+              border: 1px dashed var(--border);
+              border-radius: 16px;
+              padding: 30px;
+              color: var(--muted);
+            }}
+          </style>
+        </head>
+        <body>
+          <div class="shell">
+            <section class="hero">
+              <h1>Bag Truth Visual Gallery</h1>
+              <p><strong>Set:</strong> {escape(str(set_num))}</p>
+              <p><strong>Saved bags:</strong> {len(saved_truth)}</p>
+              <p><a href="/api/bag-truth?set_num={escape(str(set_num))}" target="_blank">Open raw bag truth JSON</a></p>
+            </section>
+            <section class="grid">
+              {cards_block}
+            </section>
+          </div>
+        </body>
+        </html>
+        """
+    )
 
 
 @router.post("/api/debug/save-bag-truth")

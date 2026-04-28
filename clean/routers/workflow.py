@@ -11,6 +11,7 @@ from clean.services import (
     bag_truth_store,
     workflow_service,
     debug_service,
+    step_detector_service,
     step_sequence_bag_service,
 )
 from clean.services.page_analyzer import analyze_page, configure_pages_dir
@@ -80,6 +81,56 @@ def _boxes_overlap(box_a, box_b):
         or a_bottom <= by
         or b_bottom <= ay
     )
+
+
+def _load_page_main_steps(set_num: str, page: int):
+    analyze_page(int(page), include_image=False)
+    detected = step_detector_service.detect_steps(set_num, int(page))
+    main_steps = detected.get("main_steps", []) or []
+    return sorted(
+        {
+            int(item.get("value", 0) or 0)
+            for item in main_steps
+            if int(item.get("value", 0) or 0) > 0
+        }
+    )
+
+
+def _filter_bag_starts_for_save(bag_starts, skipped_rows):
+    filtered_bag_starts = []
+    previous_saved_bag_number = None
+
+    for item in bag_starts or []:
+        bag_number = item.get("bag_number")
+        if bag_number is None:
+            continue
+
+        candidate_bag_number = int(bag_number)
+        card_found = bool(item.get("bag_start_card_found"))
+        sequence_valid = (
+            candidate_bag_number == 1
+            if previous_saved_bag_number is None
+            else candidate_bag_number == previous_saved_bag_number + 1
+        )
+
+        if not card_found:
+            skipped_rows.append(
+                {
+                    "page": int(item.get("page", 0) or 0),
+                    "skipped": True,
+                    "skip_reason": "no_bag_start_card",
+                    "candidate_bag_number": candidate_bag_number,
+                    "sequence_valid": bool(sequence_valid),
+                    "bag_start_card_found": False,
+                    "slow_page": bool(item.get("slow_page")),
+                }
+            )
+            continue
+
+        filtered_bag_starts.append(item)
+        previous_saved_bag_number = candidate_bag_number
+
+    return filtered_bag_starts
 
 
 @router.get("/api/analyze-page-direct")
@@ -184,20 +235,59 @@ def bag_starts_scan(
             }
             slow_pages.append(slow_row)
         if result.get("bag_number") is None:
+            skipped_rows.append(
+                {
+                    "page": int(page),
+                    "skipped": True,
+                    "skip_reason": "no_bag_number",
+                    "slow_page": slow_page,
+                }
+            )
             continue
+        candidate_bag_number = int(result.get("bag_number", 0) or 0)
+        accept_by_card = bool(result.get("bag_start_card_found"))
         if bool(result.get("multi_step_green_boxes")):
+            skipped_rows.append(
+                {
+                    "page": int(page),
+                    "skipped": True,
+                    "skip_reason": "multi_step_green_boxes",
+                    "candidate_bag_number": candidate_bag_number,
+                    "bag_start_card_found": accept_by_card,
+                    "slow_page": slow_page,
+                }
+            )
             continue
         if not bool(result.get("number_box_found")):
+            skipped_rows.append(
+                {
+                    "page": int(page),
+                    "skipped": True,
+                    "skip_reason": "no_number_box",
+                    "candidate_bag_number": candidate_bag_number,
+                    "bag_start_card_found": accept_by_card,
+                    "slow_page": slow_page,
+                }
+            )
             continue
         number_box_area = result.get("number_box_area")
         if number_box_area is not None:
             area = int(number_box_area)
-            if expected_next_bag is not None:
-                if area <= 20000:
-                    continue
-            else:
-                if area <= 40000:
-                    continue
+            min_area = 20000 if expected_next_bag is not None else 40000
+            if area <= min_area and not accept_by_card:
+                skipped_rows.append(
+                    {
+                        "page": int(page),
+                        "skipped": True,
+                        "skip_reason": "number_box_area_too_small",
+                        "candidate_bag_number": candidate_bag_number,
+                        "bag_start_card_found": accept_by_card,
+                        "number_box_area": area,
+                        "min_number_box_area": min_area,
+                        "slow_page": slow_page,
+                    }
+                )
+                continue
         panel_box = result.get("panel_box")
         number_box = result.get("number_box")
         step_role_row = step_role_by_page.get(int(page))
@@ -228,7 +318,6 @@ def bag_starts_scan(
                 }
             )
             continue
-        accept_by_card = bool(result.get("bag_start_card_found"))
         accept_by_strict_pattern = (
             result.get("panel_source") == "strict_top_left"
             and bool(result.get("number_box_found"))
@@ -282,6 +371,13 @@ def bag_starts_scan(
         current_expected_bag = int(expected_next_bag)
         for item in bag_starts:
             candidate_bag_number = item.get("bag_number")
+            if (
+                int(candidate_bag_number or 0) == 1
+                and bool(item.get("bag_start_card_found"))
+            ):
+                filtered_bag_starts.append(item)
+                current_expected_bag = 2
+                continue
             if candidate_bag_number == current_expected_bag:
                 filtered_bag_starts.append(item)
                 current_expected_bag += 1
@@ -326,6 +422,10 @@ def bag_starts_scan(
         )
 
     bag_starts = kept_bag_starts
+    bag_starts = _filter_bag_starts_for_save(
+        bag_starts=bag_starts,
+        skipped_rows=skipped_rows,
+    )
 
     next_start_page = None
     remaining_pages = 0
@@ -421,6 +521,13 @@ def full_bag_scan(
             next_expected_bag = int(current_expected_bag)
             for item in chunk_bag_starts:
                 candidate_bag_number = item.get("bag_number")
+                if (
+                    int(candidate_bag_number or 0) == 1
+                    and bool(item.get("bag_start_card_found"))
+                ):
+                    accepted_chunk_bag_starts.append(item)
+                    next_expected_bag = 2
+                    continue
                 if candidate_bag_number == next_expected_bag:
                     accepted_chunk_bag_starts.append(item)
                     next_expected_bag += 1
@@ -496,6 +603,54 @@ def full_bag_scan(
     }
 
 
+@router.get("/api/bag-find-chunked")
+def api_bag_find_chunked(
+    set_num: str = Query(...),
+    start: int = Query(1, ge=1),
+    chunk_size: int = Query(10, ge=1),
+):
+    pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
+    if pages_dir is None:
+        raise HTTPException(status_code=404, detail="no rendered pages found for set")
+
+    rendered_pages = _list_rendered_pages(pages_dir)
+    total_pages = len(rendered_pages)
+    last_rendered_page = int(rendered_pages[-1]) if rendered_pages else None
+    scanned_start = int(start)
+    requested_end = int(scanned_start) + int(chunk_size) - 1
+    scanned_end = (
+        min(int(requested_end), int(last_rendered_page))
+        if last_rendered_page is not None
+        else int(requested_end)
+    )
+
+    chunk = bag_starts_scan(
+        set_num=set_num,
+        start=scanned_start,
+        end=requested_end,
+        limit=chunk_size,
+        expected_next_bag=None,
+    )
+
+    next_start_page = None
+    for page in rendered_pages:
+        if int(page) > int(requested_end):
+            next_start_page = int(page)
+            break
+
+    return {
+        "set_num": str(set_num),
+        "total_pages": int(total_pages),
+        "scanned_start": int(scanned_start),
+        "scanned_end": int(scanned_end),
+        "next_start_page": next_start_page,
+        "done": next_start_page is None,
+        "bag_starts": list(chunk.get("bag_starts", []) or []),
+        "saved_truth": list(chunk.get("saved_truth", []) or []),
+        "skipped_rows": list(chunk.get("skipped_rows", []) or []),
+    }
+
+
 @router.get("/api/bag-truth")
 def api_bag_truth(
     set_num: str = Query(...),
@@ -504,6 +659,112 @@ def api_bag_truth(
         "set_num": str(set_num),
         "saved_truth": bag_truth_store.get_bag_truth(set_num),
         "conflicts": bag_truth_store.get_conflicts(set_num),
+    }
+
+
+@router.get("/api/bag-step-ranges")
+def api_bag_step_ranges(
+    set_num: str = Query(...),
+    start_bag: Optional[int] = Query(None, ge=1),
+    end_bag: Optional[int] = Query(None, ge=1),
+    max_pages: int = Query(10, ge=1),
+):
+    pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
+    if pages_dir is None:
+        raise HTTPException(status_code=404, detail="no rendered pages found for set")
+
+    pages = _list_rendered_pages(pages_dir)
+    last_page = int(pages[-1]) if pages else None
+    bag_truth = sorted(
+        bag_truth_store.get_bag_truth(set_num),
+        key=lambda item: (
+            int(item.get("bag_number", 0) or 0),
+            int(item.get("start_page", 0) or 0),
+        ),
+    )
+    if start_bag is not None:
+        bag_truth = [
+            item for item in bag_truth if int(item.get("bag_number", 0) or 0) >= int(start_bag)
+        ]
+    if end_bag is not None:
+        bag_truth = [
+            item for item in bag_truth if int(item.get("bag_number", 0) or 0) <= int(end_bag)
+        ]
+
+    configure_pages_dir(str(pages_dir))
+    bag_ranges = []
+    total_bags_requested = len(bag_truth)
+    pages_scanned = 0
+    stopped_early = False
+    next_bag_number = None
+    progress = {
+        "current_bag_number": None,
+        "current_page": None,
+        "total_bags_requested": total_bags_requested,
+    }
+
+    for index, item in enumerate(bag_truth):
+        if pages_scanned >= int(max_pages):
+            stopped_early = True
+            next_bag_number = int(item["bag_number"])
+            progress["current_bag_number"] = int(item["bag_number"])
+            progress["current_page"] = int(item["start_page"])
+            break
+
+        bag_number = int(item["bag_number"])
+        start_page = int(item["start_page"])
+        next_start_page = (
+            int(bag_truth[index + 1]["start_page"])
+            if index + 1 < len(bag_truth)
+            else None
+        )
+        end_page = int(next_start_page) - 1 if next_start_page is not None else None
+        scan_end_page = end_page if end_page is not None else last_page
+
+        main_step_values = []
+        if scan_end_page is not None and int(scan_end_page) >= start_page:
+            for page in pages:
+                if int(page) < start_page:
+                    continue
+                if int(page) > int(scan_end_page):
+                    break
+                if pages_scanned >= int(max_pages):
+                    stopped_early = True
+                    next_bag_number = bag_number
+                    progress["current_bag_number"] = bag_number
+                    progress["current_page"] = int(page)
+                    break
+                progress["current_bag_number"] = bag_number
+                progress["current_page"] = int(page)
+                pages_scanned += 1
+                main_step_values.extend(_load_page_main_steps(set_num, int(page)))
+
+        result_end_page = end_page
+        if stopped_early and progress.get("current_page") is not None:
+            result_end_page = int(progress["current_page"]) - 1
+
+        bag_ranges.append(
+            {
+                "bag_number": bag_number,
+                "start_page": start_page,
+                "end_page": result_end_page,
+                "start_step": (
+                    int(min(main_step_values)) if main_step_values else None
+                ),
+                "end_step": int(max(main_step_values)) if main_step_values else None,
+            }
+        )
+        if stopped_early:
+            break
+
+    return {
+        "set_num": str(set_num),
+        "bag_ranges": bag_ranges,
+        "pages_scanned": int(pages_scanned),
+        "max_pages": int(max_pages),
+        "stopped_early": bool(stopped_early),
+        "next_bag_number": next_bag_number,
+        "progress": progress,
     }
 
 

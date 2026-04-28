@@ -344,6 +344,42 @@ def _box_iou(box_a, box_b):
 
     return inter_area / float(union_area)
 
+
+def _box_is_inside(inner_box, outer_box, padding=0):
+    if inner_box is None or outer_box is None:
+        return False
+
+    ix, iy, iw, ih = [int(v) for v in inner_box]
+    ox, oy, ow, oh = [int(v) for v in outer_box]
+    pad = int(max(0, padding))
+
+    return (
+        ix >= (ox - pad)
+        and iy >= (oy - pad)
+        and (ix + iw) <= (ox + ow + pad)
+        and (iy + ih) <= (oy + oh + pad)
+    )
+
+
+def _should_ignore_footer_number_box(box, page_shape):
+    if box is None or page_shape is None:
+        return False
+
+    page_h, page_w = page_shape[:2]
+    if page_h <= 0 or page_w <= 0:
+        return False
+
+    x, y, w, h = [int(v) for v in box]
+    center_x = x + (w * 0.5)
+    center_y = y + (h * 0.5)
+
+    in_footer_band = y >= int(page_h * 0.85) or center_y >= (page_h * 0.88)
+    in_bottom_page_zone = (
+        center_y >= (page_h * 0.84)
+        and (center_x <= (page_w * 0.22) or center_x >= (page_w * 0.78))
+    )
+    return bool(in_footer_band or in_bottom_page_zone)
+
 def _border_center_stats(gray_roi):
     if gray_roi is None or gray_roi.size == 0:
         return None
@@ -1544,6 +1580,8 @@ def _find_best_ocr_number_in_region(
         if nw > (region_w * 0.35) or nh > (region_h * 0.35):
             continue
         number_abs_try = (px + nx, py + ny, nw, nh)
+        if _should_ignore_footer_number_box(number_abs_try, page_img.shape):
+            continue
         number_img = crop(page_img, number_abs_try)
         if number_img is None or number_img.size == 0:
             continue
@@ -1734,6 +1772,119 @@ def _is_effectively_full_page_region(region_box, page_shape):
         and h >= int(page_h * 0.95)
     )
 
+
+def _refine_bag_number_from_card(page_img, card_box, current_number_box):
+    if page_img is None or page_img.size == 0 or card_box is None:
+        return None
+
+    cx, cy, cw, ch = [int(v) for v in card_box]
+    if cw <= 0 or ch <= 0:
+        return None
+
+    card_img = crop(page_img, card_box)
+    best_candidate = None
+    if card_img is not None and card_img.size != 0:
+        for number_rel in find_number_crop(card_img):
+            nx, ny, nw, nh = [int(v) for v in number_rel]
+            if nw <= 0 or nh <= 0:
+                continue
+            if nw < max(24, int(cw * 0.04)) or nh < max(28, int(ch * 0.12)):
+                continue
+            if nw > int(cw * 0.85) or nh > int(ch * 0.80):
+                continue
+
+            number_abs = (cx + nx, cy + ny, nw, nh)
+            if _should_ignore_footer_number_box(number_abs, page_img.shape):
+                continue
+
+            number_img = crop(page_img, number_abs)
+            if number_img is None or number_img.size == 0:
+                continue
+
+            val, raw, score = read_bag_number_with_score(number_img)
+            if val is None or not (1 <= int(val) <= 24) or float(score) < 40.0:
+                continue
+
+            candidate = {
+                "score": float(score),
+                "number": int(val),
+                "raw": raw,
+                "box": number_abs,
+            }
+            if best_candidate is None or float(candidate["score"]) > float(best_candidate["score"]):
+                best_candidate = candidate
+
+    candidate_regions = []
+    if current_number_box is not None and _box_is_inside(current_number_box, card_box, padding=24):
+        nx, ny, nw, nh = [int(v) for v in current_number_box]
+        inset_box = (
+            nx + int(nw * 0.18),
+            ny + int(nh * 0.12),
+            max(24, int(nw * 0.54)),
+            max(28, int(nh * 0.64)),
+        )
+        candidate_regions.append(inset_box)
+
+    candidate_regions.extend(
+        [
+            (
+                cx + int(cw * 0.08),
+                cy + int(ch * 0.14),
+                int(cw * 0.28),
+                int(ch * 0.40),
+            ),
+            (
+                cx + int(cw * 0.12),
+                cy + int(ch * 0.18),
+                int(cw * 0.20),
+                int(ch * 0.32),
+            ),
+            (
+                cx + int(cw * 0.16),
+                cy + int(ch * 0.20),
+                int(cw * 0.15),
+                int(ch * 0.26),
+            ),
+        ]
+    )
+
+    seen = set()
+    for region_box in candidate_regions:
+        rx, ry, rw, rh = [int(v) for v in region_box]
+        if rw <= 0 or rh <= 0:
+            continue
+        key = (rx, ry, rw, rh)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        candidate = _find_best_ocr_number_in_region(
+            page_img,
+            key,
+            single_digit_min_score=40.0,
+            reject_step_strips=False,
+        )
+        if candidate is None:
+            region_img = crop(page_img, key)
+            if region_img is not None and region_img.size != 0:
+                val, raw, score = read_bag_number_with_score(region_img)
+                if val is not None and 1 <= int(val) <= 24 and float(score) >= 40.0:
+                    candidate = {
+                        "score": float(score),
+                        "number": int(val),
+                        "raw": raw,
+                        "box": key,
+                    }
+
+        if candidate is None:
+            continue
+        if not _box_is_inside(candidate["box"], card_box, padding=8):
+            continue
+        if best_candidate is None or float(candidate["score"]) > float(best_candidate["score"]):
+            best_candidate = candidate
+
+    return best_candidate
+
 def _cluster_band_count(values, gap_threshold):
     if not values:
         return 0
@@ -1799,6 +1950,9 @@ def _collect_page_bag_number_candidates(page_img, max_candidates=32):
         if float(ocr_score) < 65.0:
             continue
 
+        if _should_ignore_footer_number_box(number_rel, page_img.shape):
+            continue
+
         add_candidate(number_rel, val, raw, ocr_score)
 
     gray = cv2.cvtColor(page_img, cv2.COLOR_BGR2GRAY)
@@ -1845,6 +1999,8 @@ def _collect_page_bag_number_candidates(page_img, max_candidates=32):
             continue
 
         box = (x, y, w, h)
+        if _should_ignore_footer_number_box(box, page_img.shape):
+            continue
         number_img = crop(page_img, box)
         if number_img is None or number_img.size == 0:
             continue
@@ -2350,13 +2506,34 @@ def analyze_page(page: int, include_image: bool = True):
     panel_found = panel is not None
     shell_found = square_abs is not None
     grey_bag_found = bag_abs is not None
-    number_box_found = number_abs is not None
+    initial_number_box_found = number_abs is not None
     bag_region_flags = _bag_region_quality_flags(img.shape, square_abs, bag_abs)
     bag_start_card = detect_bag_start_card(
         img,
         panel if panel_found else None,
-        number_abs if number_box_found else None,
+        number_abs if initial_number_box_found else None,
     )
+    if bool(bag_start_card.get("bag_start_card_found")):
+        card_box = bag_start_card.get("bag_start_card_box")
+        refined_card_candidate = _refine_bag_number_from_card(
+            img,
+            tuple(card_box) if card_box is not None else None,
+            number_abs,
+        )
+        if refined_card_candidate is not None:
+            bag_number = refined_card_candidate["number"]
+            ocr_raw = refined_card_candidate["raw"]
+            number_abs = refined_card_candidate["box"]
+        elif number_abs is not None and card_box is not None and not _box_is_inside(
+            number_abs,
+            card_box,
+            padding=12,
+        ):
+            bag_number = None
+            ocr_raw = ""
+            number_abs = None
+
+    number_box_found = number_abs is not None
 
     confidence = compute_confidence(
         panel_found,
