@@ -1523,9 +1523,38 @@ def api_bag_step_ranges(
             for page in pages
             if start_page <= int(page) <= int(end_page)
         ]
-        pages_to_scan = pages_in_range[: int(max_pages)]
-        for page in pages_to_scan:
-            main_step_values.extend(_load_page_main_steps(set_num, int(page)))
+        pages_scanned = 0
+        current_max_step = None
+        consecutive_pages_without_increase = 0
+
+        for page in pages_in_range:
+            if pages_scanned >= int(max_pages):
+                break
+
+            previous_max_step = current_max_step
+            page_main_steps = _load_page_main_steps(set_num, int(page))
+            main_step_values.extend(page_main_steps)
+            pages_scanned += 1
+
+            if page_main_steps:
+                page_max_step = max(int(value) for value in page_main_steps)
+                current_max_step = (
+                    page_max_step
+                    if current_max_step is None
+                    else max(int(current_max_step), page_max_step)
+                )
+
+            if (
+                previous_max_step is not None
+                and current_max_step is not None
+                and int(current_max_step) == int(previous_max_step)
+            ):
+                consecutive_pages_without_increase += 1
+            else:
+                consecutive_pages_without_increase = 0
+
+            if consecutive_pages_without_increase >= 2:
+                break
 
         bag_step_ranges.append(
             {
@@ -1536,7 +1565,7 @@ def api_bag_step_ranges(
                     int(min(main_step_values)) if main_step_values else None
                 ),
                 "end_step": int(max(main_step_values)) if main_step_values else None,
-                "pages_scanned": len(pages_to_scan),
+                "pages_scanned": int(pages_scanned),
             }
         )
 
