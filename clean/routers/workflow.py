@@ -3,6 +3,8 @@ from html import escape
 import time
 from typing import Optional
 
+import cv2
+import numpy as np
 from fastapi import APIRouter, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -96,6 +98,58 @@ def _load_page_main_steps(set_num: str, page: int):
     )
 
 
+def _fast_bag_prefilter(page_img) -> tuple[bool, dict]:
+    if page_img is None or getattr(page_img, "size", 0) == 0:
+        return True, {
+            "white_ratio_top": None,
+            "warm_ratio_top": None,
+            "dark_ratio_top": None,
+        }
+
+    page_h, page_w = page_img.shape[:2]
+    if page_h <= 0 or page_w <= 0:
+        return True, {
+            "white_ratio_top": None,
+            "warm_ratio_top": None,
+            "dark_ratio_top": None,
+        }
+
+    target_w = 300
+    scale = float(target_w) / float(max(1, page_w))
+    resized_h = max(1, int(round(page_h * scale)))
+    small = cv2.resize(page_img, (target_w, resized_h), interpolation=cv2.INTER_AREA)
+
+    top_h = max(1, int(round(small.shape[0] * 0.35)))
+    top = small[:top_h, :]
+    gray = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)
+
+    white_ratio_top = float(np.mean(gray >= 225))
+    dark_ratio_top = float(np.mean(gray <= 95))
+    warm_mask = (
+        (
+            ((hsv[:, :, 0] <= 12) | (hsv[:, :, 0] >= 170))
+            & (hsv[:, :, 1] >= 70)
+            & (hsv[:, :, 2] >= 140)
+        )
+        | (
+            (hsv[:, :, 0] >= 8)
+            & (hsv[:, :, 0] <= 28)
+            & (hsv[:, :, 1] >= 70)
+            & (hsv[:, :, 2] >= 140)
+        )
+    )
+    warm_ratio_top = float(np.mean(warm_mask))
+
+    metrics = {
+        "white_ratio_top": round(white_ratio_top, 4),
+        "warm_ratio_top": round(warm_ratio_top, 4),
+        "dark_ratio_top": round(dark_ratio_top, 4),
+    }
+    passed = bool(white_ratio_top > 0.35 or warm_ratio_top > 0.002)
+    return passed, metrics
+
+
 def _filter_bag_starts_for_save(bag_starts, skipped_rows):
     filtered_bag_starts = []
     previous_saved_bag_number = None
@@ -107,13 +161,19 @@ def _filter_bag_starts_for_save(bag_starts, skipped_rows):
 
         candidate_bag_number = int(bag_number)
         card_found = bool(item.get("bag_start_card_found"))
+        bag_start_layout = str(item.get("bag_start_layout", "") or "")
+        transition_reset_layout = bag_start_layout in {
+            "transition_reset",
+            "hero_transition_reset",
+            "white_box_transition",
+        }
         sequence_valid = (
             candidate_bag_number == 1
             if previous_saved_bag_number is None
             else candidate_bag_number == previous_saved_bag_number + 1
         )
 
-        if not card_found:
+        if not card_found and not transition_reset_layout:
             skipped_rows.append(
                 {
                     "page": int(item.get("page", 0) or 0),
@@ -122,6 +182,10 @@ def _filter_bag_starts_for_save(bag_starts, skipped_rows):
                     "candidate_bag_number": candidate_bag_number,
                     "sequence_valid": bool(sequence_valid),
                     "bag_start_card_found": False,
+                    "step_sequence_role": item.get("step_sequence_role"),
+                    "step_drop": item.get("step_drop"),
+                    "previous_max_step": item.get("previous_max_step"),
+                    "bag_start_layout": bag_start_layout or None,
                     "slow_page": bool(item.get("slow_page")),
                 }
             )
@@ -131,6 +195,353 @@ def _filter_bag_starts_for_save(bag_starts, skipped_rows):
         previous_saved_bag_number = candidate_bag_number
 
     return filtered_bag_starts
+
+
+def _build_existing_truth_by_page(existing_bag_truth):
+    truth_by_page = {}
+    for item in existing_bag_truth or []:
+        start_page = int(item.get("start_page", 0) or 0)
+        bag_number = int(item.get("bag_number", 0) or 0)
+        if start_page <= 0 or bag_number <= 0:
+            continue
+        truth_by_page[start_page] = {
+            "start_page": start_page,
+            "bag_number": bag_number,
+        }
+    return truth_by_page
+
+
+def _last_confirmed_bag_before_page(existing_bag_truth, page):
+    target_page = int(page)
+    last_confirmed_bag = 0
+    for item in sorted(
+        existing_bag_truth or [],
+        key=lambda row: int(row.get("start_page", 0) or 0),
+    ):
+        start_page = int(item.get("start_page", 0) or 0)
+        bag_number = int(item.get("bag_number", 0) or 0)
+        if start_page <= 0 or bag_number <= 0:
+            continue
+        if start_page >= target_page:
+            break
+        last_confirmed_bag = bag_number
+    return last_confirmed_bag
+
+
+def _last_confirmed_bag_before_page_with_candidates(
+    existing_bag_truth,
+    provisional_bag_starts,
+    page,
+):
+    last_confirmed_bag = _last_confirmed_bag_before_page(existing_bag_truth, page)
+    for item in sorted(
+        provisional_bag_starts or [],
+        key=lambda row: int(row.get("page", 0) or 0),
+    ):
+        candidate_page = int(item.get("page", 0) or 0)
+        candidate_bag_number = int(item.get("bag_number", 0) or 0)
+        if candidate_page <= 0 or candidate_bag_number <= 0:
+            continue
+        if candidate_page >= int(page):
+            break
+        if candidate_bag_number > last_confirmed_bag:
+            last_confirmed_bag = candidate_bag_number
+    return last_confirmed_bag
+
+
+def _split_bag_starts_for_existing_truth(bag_starts, existing_truth_by_page, skipped_rows):
+    filtered_bag_starts = []
+    bag_starts_to_save = []
+
+    for item in bag_starts or []:
+        page = int(item.get("page", 0) or 0)
+        candidate_bag_number = int(item.get("bag_number", 0) or 0)
+        existing_truth = (existing_truth_by_page or {}).get(page)
+        if existing_truth is None:
+            filtered_bag_starts.append(item)
+            bag_starts_to_save.append(item)
+            continue
+
+        existing_bag_number = int(existing_truth.get("bag_number", 0) or 0)
+        if existing_bag_number != candidate_bag_number:
+            skipped_rows.append(
+                {
+                    "page": page,
+                    "skipped": True,
+                    "skip_reason": "same_page_different_bag_already_saved",
+                    "existing_bag_number": existing_bag_number,
+                    "candidate_bag_number": candidate_bag_number,
+                    "step_sequence_role": item.get("step_sequence_role"),
+                    "step_drop": item.get("step_drop"),
+                    "previous_max_step": item.get("previous_max_step"),
+                    "bag_start_layout": item.get("bag_start_layout"),
+                    "inferred_bag_number_source": item.get("inferred_bag_number_source"),
+                    "slow_page": bool(item.get("slow_page")),
+                }
+            )
+            continue
+
+        item["already_saved_same_page"] = True
+        item["existing_truth_bag_number"] = existing_bag_number
+        filtered_bag_starts.append(item)
+
+    return filtered_bag_starts, bag_starts_to_save
+
+
+def _has_strong_hero_transition_evidence(result):
+    if bool(result.get("white_box_transition_found")):
+        return True
+    if bool(result.get("bag_start_card_found")):
+        return True
+    if float(result.get("bag_start_card_score", 0.0) or 0.0) >= 70.0:
+        return True
+    return bool(
+        result.get("panel_found")
+        and result.get("panel_source") == "strict_top_left"
+        and float(result.get("panel_score", 0.0) or 0.0) >= 150.0
+        and not bool(result.get("build_step_page"))
+        and int(result.get("step_grid_number_count", 0) or 0) == 0
+        and float(result.get("bag_region_quality", 0.0) or 0.0) >= 0.9
+    )
+
+
+def _resolve_transition_step_sequence_role(step_role_row, result):
+    step_role_row = step_role_row or {}
+    step_sequence_role = step_role_row.get("step_sequence_role")
+    if step_sequence_role == "step_sequence_reset":
+        return "step_sequence_reset"
+    if bool(step_role_row.get("hero_transition_reset_candidate")) and _has_strong_hero_transition_evidence(result):
+        return "hero_transition_reset"
+    return step_sequence_role
+
+
+def _infer_reset_bag_number(
+    page,
+    step_sequence_role,
+    result,
+    existing_bag_truth,
+    existing_truth_by_page,
+    provisional_bag_starts=None,
+):
+    if step_sequence_role not in {"step_sequence_reset", "hero_transition_reset"}:
+        return None, None
+    if not bool(result.get("panel_found")) or result.get("panel_source") != "strict_top_left":
+        return None, None
+
+    existing_truth_same_page = (existing_truth_by_page or {}).get(int(page))
+    if existing_truth_same_page is not None:
+        return (
+            int(existing_truth_same_page.get("bag_number", 0) or 0),
+            "existing_truth_same_page",
+        )
+
+    last_confirmed_bag = _last_confirmed_bag_before_page(
+        existing_bag_truth=existing_bag_truth,
+        page=int(page),
+    )
+    if provisional_bag_starts:
+        last_confirmed_bag = _last_confirmed_bag_before_page_with_candidates(
+            existing_bag_truth=existing_bag_truth,
+            provisional_bag_starts=provisional_bag_starts,
+            page=int(page),
+        )
+    if last_confirmed_bag <= 0:
+        return 1, "last_confirmed_bag_sequence"
+    return int(last_confirmed_bag) + 1, "last_confirmed_bag_sequence"
+
+
+def _infer_white_box_transition_bag_number(
+    page,
+    result,
+    existing_bag_truth,
+    existing_truth_by_page,
+    provisional_bag_starts=None,
+):
+    if not bool(result.get("white_box_transition_found")):
+        return None, None
+
+    existing_truth_same_page = (existing_truth_by_page or {}).get(int(page))
+    if existing_truth_same_page is not None:
+        return (
+            int(existing_truth_same_page.get("bag_number", 0) or 0),
+            "existing_truth_same_page",
+        )
+
+    last_confirmed_bag = _last_confirmed_bag_before_page(
+        existing_bag_truth=existing_bag_truth,
+        page=int(page),
+    )
+    if provisional_bag_starts:
+        last_confirmed_bag = _last_confirmed_bag_before_page_with_candidates(
+            existing_bag_truth=existing_bag_truth,
+            provisional_bag_starts=provisional_bag_starts,
+            page=int(page),
+        )
+    if last_confirmed_bag <= 0:
+        return 1, "last_confirmed_bag_sequence"
+    return int(last_confirmed_bag) + 1, "last_confirmed_bag_sequence"
+
+
+def _build_bag_candidate_report_row(
+    set_num,
+    page,
+    result,
+    step_role_row,
+    existing_bag_truth,
+    existing_truth_by_page,
+    expected_next_bag=None,
+):
+    page = int(page)
+    step_role_row = step_role_row or {}
+    step_sequence_role = _resolve_transition_step_sequence_role(
+        step_role_row=step_role_row,
+        result=result,
+    )
+    previous_max_step = step_role_row.get("previous_max_step")
+    main_step_min = step_role_row.get("main_step_min")
+    step_drop = step_role_row.get("step_drop")
+    inferred_white_box_bag_number = None
+    inferred_white_box_bag_number_source = None
+    inferred_transition_bag_number = None
+    inferred_bag_number_source = None
+
+    if bool(result.get("white_box_transition_found")):
+        (
+            inferred_white_box_bag_number,
+            inferred_white_box_bag_number_source,
+        ) = _infer_white_box_transition_bag_number(
+            page=page,
+            result=result,
+            existing_bag_truth=existing_bag_truth,
+            existing_truth_by_page=existing_truth_by_page,
+        )
+
+    if result.get("bag_number") is None and inferred_white_box_bag_number is None:
+        (
+            inferred_transition_bag_number,
+            inferred_bag_number_source,
+        ) = _infer_reset_bag_number(
+            page=page,
+            step_sequence_role=step_sequence_role,
+            result=result,
+            existing_bag_truth=existing_bag_truth,
+            existing_truth_by_page=existing_truth_by_page,
+        )
+
+    effective_bag_number = result.get("bag_number")
+    if inferred_white_box_bag_number is not None:
+        effective_bag_number = int(inferred_white_box_bag_number)
+        inferred_bag_number_source = inferred_white_box_bag_number_source
+    elif effective_bag_number is None and inferred_transition_bag_number is not None:
+        effective_bag_number = int(inferred_transition_bag_number)
+
+    accept_by_card = bool(result.get("bag_start_card_found"))
+    accept_by_white_box_transition = bool(
+        result.get("white_box_transition_found")
+        and inferred_white_box_bag_number is not None
+    )
+    accept_by_transition_reset = (
+        step_sequence_role in {"step_sequence_reset", "hero_transition_reset"}
+        and effective_bag_number is not None
+        and (
+            bool(result.get("number_box_found"))
+            or inferred_transition_bag_number is not None
+        )
+    )
+    accept_by_strict_pattern = (
+        result.get("panel_source") == "strict_top_left"
+        and bool(result.get("number_box_found"))
+    )
+
+    bag_start_layout = None
+    if accept_by_white_box_transition:
+        bag_start_layout = "white_box_transition"
+    elif accept_by_card:
+        bag_start_layout = "card"
+    elif accept_by_transition_reset:
+        bag_start_layout = (
+            "hero_transition_reset"
+            if step_sequence_role == "hero_transition_reset"
+            else "transition_reset"
+        )
+    elif accept_by_strict_pattern:
+        bag_start_layout = "strict_top_left"
+
+    rejection_reason = None
+    if effective_bag_number is None:
+        rejection_reason = "no_bag_number"
+    elif bool(result.get("multi_step_green_boxes")):
+        rejection_reason = "multi_step_green_boxes"
+    elif (
+        step_sequence_role == "build_step_sequence_page"
+        or not bool(step_role_row.get("bag_start_allowed", True))
+    ) and not accept_by_white_box_transition:
+        rejection_reason = "build_step_sequence_page"
+    elif (
+        not bool(result.get("number_box_found"))
+        and not accept_by_transition_reset
+        and not accept_by_white_box_transition
+    ):
+        rejection_reason = "no_number_box"
+    else:
+        number_box_area = result.get("number_box_area")
+        if number_box_area is not None:
+            area = int(number_box_area)
+            min_area = 20000 if expected_next_bag is not None else 40000
+            if area <= min_area and not (
+                accept_by_card
+                or accept_by_transition_reset
+                or accept_by_white_box_transition
+            ):
+                rejection_reason = "number_box_area_too_small"
+
+        if rejection_reason is None:
+            panel_box = result.get("panel_box")
+            number_box = result.get("number_box")
+            detected_step_boxes = list(step_role_row.get("detected_step_boxes", []) or [])
+            main_step_boxes = [
+                item.get("box")
+                for item in detected_step_boxes
+                if item.get("step_group") == "main_steps"
+            ]
+            for main_step_box in main_step_boxes:
+                if _boxes_overlap(main_step_box, number_box):
+                    rejection_reason = "step_box_contaminates_bag_number"
+                    break
+
+        if rejection_reason is None and not (
+            accept_by_card
+            or accept_by_transition_reset
+            or accept_by_white_box_transition
+            or accept_by_strict_pattern
+        ):
+            rejection_reason = "no_valid_bag_start_pattern"
+
+    return {
+        "page": page,
+        "bag_number": effective_bag_number,
+        "ocr_raw": result.get("ocr_raw", "") or "",
+        "bag_start_card_found": bool(result.get("bag_start_card_found")),
+        "bag_start_card_score": float(
+            result.get("bag_start_card_score", 0.0) or 0.0
+        ),
+        "number_box_found": bool(result.get("number_box_found")),
+        "number_box_area": result.get("number_box_area"),
+        "step_sequence_role": step_sequence_role,
+        "previous_max_step": previous_max_step,
+        "main_step_min": main_step_min,
+        "step_drop": step_drop,
+        "would_accept_card": accept_by_card,
+        "would_accept_reset": accept_by_transition_reset,
+        "white_box_transition_found": bool(result.get("white_box_transition_found")),
+        "final_decision": "accepted" if rejection_reason is None else "rejected",
+        "rejection_reason": rejection_reason,
+        "debug_page_image_url": (
+            f"/debug/page-image?set_num={set_num}&page={page}"
+        ),
+        "bag_start_layout": bag_start_layout,
+        "inferred_bag_number_source": inferred_bag_number_source,
+    }
 
 
 @router.get("/api/analyze-page-direct")
@@ -204,6 +615,8 @@ def bag_starts_scan(
     step_role_by_page = {
         int(item.get("page", 0) or 0): item for item in (step_role_map or [])
     }
+    existing_bag_truth = list(bag_truth_store.get_bag_truth(set_num) or [])
+    existing_truth_by_page = _build_existing_truth_by_page(existing_bag_truth)
 
     bag_starts = []
     skipped_rows = []
@@ -217,6 +630,22 @@ def bag_starts_scan(
 
         scanned_pages_count += 1
         last_scanned_page = int(page)
+        prefilter = None
+        page_image_path = debug_service.resolve_page_image_path(set_num, int(page))
+        if page_image_path is not None:
+            page_img = cv2.imread(str(page_image_path))
+            if page_img is not None:
+                prefilter_passed, prefilter = _fast_bag_prefilter(page_img)
+                if not prefilter_passed:
+                    skipped_rows.append(
+                        {
+                            "page": int(page),
+                            "skipped": True,
+                            "skip_reason": "fast_prefilter_reject",
+                            "prefilter": prefilter,
+                        }
+                    )
+                    continue
         page_started_at = time.monotonic()
         result = analyze_page(int(page), include_image=False)
         elapsed_seconds = round(time.monotonic() - page_started_at, 3)
@@ -234,18 +663,69 @@ def bag_starts_scan(
                 "elapsed_seconds": elapsed_seconds,
             }
             slow_pages.append(slow_row)
-        if result.get("bag_number") is None:
+        step_role_row = step_role_by_page.get(int(page))
+        step_sequence_role = _resolve_transition_step_sequence_role(
+            step_role_row=step_role_row,
+            result=result,
+        )
+        previous_max_step = (step_role_row or {}).get("previous_max_step")
+        step_drop = (step_role_row or {}).get("step_drop")
+        inferred_white_box_bag_number = None
+        inferred_white_box_bag_number_source = None
+        inferred_transition_bag_number = None
+        inferred_bag_number_source = None
+        if bool(result.get("white_box_transition_found")):
+            (
+                inferred_white_box_bag_number,
+                inferred_white_box_bag_number_source,
+            ) = _infer_white_box_transition_bag_number(
+                page=int(page),
+                result=result,
+                existing_bag_truth=existing_bag_truth,
+                existing_truth_by_page=existing_truth_by_page,
+                provisional_bag_starts=bag_starts,
+            )
+        if result.get("bag_number") is None and inferred_white_box_bag_number is None:
+            (
+                inferred_transition_bag_number,
+                inferred_bag_number_source,
+            ) = _infer_reset_bag_number(
+                page=int(page),
+                step_sequence_role=step_sequence_role,
+                result=result,
+                existing_bag_truth=existing_bag_truth,
+                existing_truth_by_page=existing_truth_by_page,
+                provisional_bag_starts=bag_starts,
+            )
+
+        effective_bag_number = result.get("bag_number")
+        if inferred_white_box_bag_number is not None:
+            effective_bag_number = int(inferred_white_box_bag_number)
+            inferred_bag_number_source = inferred_white_box_bag_number_source
+        elif effective_bag_number is None and inferred_transition_bag_number is not None:
+            effective_bag_number = int(inferred_transition_bag_number)
+
+        if effective_bag_number is None:
             skipped_rows.append(
                 {
                     "page": int(page),
                     "skipped": True,
                     "skip_reason": "no_bag_number",
+                    "step_sequence_role": step_sequence_role,
+                    "step_drop": step_drop,
+                    "previous_max_step": previous_max_step,
+                    "bag_start_layout": None,
+                    "inferred_bag_number_source": inferred_bag_number_source,
                     "slow_page": slow_page,
                 }
             )
             continue
-        candidate_bag_number = int(result.get("bag_number", 0) or 0)
+        candidate_bag_number = int(effective_bag_number or 0)
         accept_by_card = bool(result.get("bag_start_card_found"))
+        accept_by_white_box_transition = bool(
+            result.get("white_box_transition_found")
+            and inferred_white_box_bag_number is not None
+        )
         if bool(result.get("multi_step_green_boxes")):
             skipped_rows.append(
                 {
@@ -254,11 +734,72 @@ def bag_starts_scan(
                     "skip_reason": "multi_step_green_boxes",
                     "candidate_bag_number": candidate_bag_number,
                     "bag_start_card_found": accept_by_card,
+                    "step_sequence_role": step_sequence_role,
+                    "step_drop": step_drop,
+                    "previous_max_step": previous_max_step,
+                    "bag_start_layout": None,
+                    "inferred_bag_number_source": inferred_bag_number_source,
+                    "white_box_transition_found": bool(
+                        result.get("white_box_transition_found")
+                    ),
                     "slow_page": slow_page,
                 }
             )
             continue
-        if not bool(result.get("number_box_found")):
+        accept_by_transition_reset = (
+            step_sequence_role in {"step_sequence_reset", "hero_transition_reset"}
+            and effective_bag_number is not None
+            and (
+                bool(result.get("number_box_found"))
+                or inferred_transition_bag_number is not None
+            )
+        )
+        bag_start_layout = None
+        if accept_by_white_box_transition:
+            bag_start_layout = "white_box_transition"
+        elif accept_by_card:
+            bag_start_layout = "card"
+        elif accept_by_transition_reset:
+            bag_start_layout = (
+                "hero_transition_reset"
+                if step_sequence_role == "hero_transition_reset"
+                else "transition_reset"
+            )
+        elif (
+            result.get("panel_source") == "strict_top_left"
+            and bool(result.get("number_box_found"))
+        ):
+            bag_start_layout = "strict_top_left"
+        if (
+            step_sequence_role == "build_step_sequence_page"
+            or not bool((step_role_row or {}).get("bag_start_allowed", True))
+        ) and not accept_by_white_box_transition:
+            skipped_rows.append(
+                {
+                    "page": int(page),
+                    "skipped": True,
+                    "skip_reason": "build_step_sequence_page",
+                    "candidate_bag_number": candidate_bag_number,
+                    "bag_start_card_found": accept_by_card,
+                    "step_sequence_role": step_sequence_role,
+                    "step_role_reason": (step_role_row or {}).get("step_role_reason"),
+                    "step_drop": step_drop,
+                    "previous_max_step": previous_max_step,
+                    "bag_start_layout": bag_start_layout,
+                    "inferred_bag_number_source": inferred_bag_number_source,
+                    "white_box_transition_found": bool(
+                        result.get("white_box_transition_found")
+                    ),
+                    "main_steps": list((step_role_row or {}).get("main_steps", []) or []),
+                    "slow_page": slow_page,
+                }
+            )
+            continue
+        if (
+            not bool(result.get("number_box_found"))
+            and not accept_by_transition_reset
+            and not accept_by_white_box_transition
+        ):
             skipped_rows.append(
                 {
                     "page": int(page),
@@ -266,6 +807,14 @@ def bag_starts_scan(
                     "skip_reason": "no_number_box",
                     "candidate_bag_number": candidate_bag_number,
                     "bag_start_card_found": accept_by_card,
+                    "step_sequence_role": step_sequence_role,
+                    "step_drop": step_drop,
+                    "previous_max_step": previous_max_step,
+                    "bag_start_layout": bag_start_layout,
+                    "inferred_bag_number_source": inferred_bag_number_source,
+                    "white_box_transition_found": bool(
+                        result.get("white_box_transition_found")
+                    ),
                     "slow_page": slow_page,
                 }
             )
@@ -274,7 +823,11 @@ def bag_starts_scan(
         if number_box_area is not None:
             area = int(number_box_area)
             min_area = 20000 if expected_next_bag is not None else 40000
-            if area <= min_area and not accept_by_card:
+            if area <= min_area and not (
+                accept_by_card
+                or accept_by_transition_reset
+                or accept_by_white_box_transition
+            ):
                 skipped_rows.append(
                     {
                         "page": int(page),
@@ -284,13 +837,20 @@ def bag_starts_scan(
                         "bag_start_card_found": accept_by_card,
                         "number_box_area": area,
                         "min_number_box_area": min_area,
+                        "step_sequence_role": step_sequence_role,
+                        "step_drop": step_drop,
+                        "previous_max_step": previous_max_step,
+                        "bag_start_layout": bag_start_layout,
+                        "inferred_bag_number_source": inferred_bag_number_source,
+                        "white_box_transition_found": bool(
+                            result.get("white_box_transition_found")
+                        ),
                         "slow_page": slow_page,
                     }
                 )
                 continue
         panel_box = result.get("panel_box")
         number_box = result.get("number_box")
-        step_role_row = step_role_by_page.get(int(page))
         detected_step_boxes = list(
             (step_role_row or {}).get("detected_step_boxes", []) or []
         )
@@ -314,6 +874,14 @@ def bag_starts_scan(
                     "number_box": number_box,
                     "panel_box": panel_box,
                     "main_step_box": contaminating_step_box,
+                    "step_sequence_role": step_sequence_role,
+                    "step_drop": step_drop,
+                    "previous_max_step": previous_max_step,
+                    "bag_start_layout": bag_start_layout,
+                    "inferred_bag_number_source": inferred_bag_number_source,
+                    "white_box_transition_found": bool(
+                        result.get("white_box_transition_found")
+                    ),
                     "slow_page": slow_page,
                 }
             )
@@ -322,7 +890,12 @@ def bag_starts_scan(
             result.get("panel_source") == "strict_top_left"
             and bool(result.get("number_box_found"))
         )
-        if not (accept_by_card or accept_by_strict_pattern):
+        if not (
+            accept_by_card
+            or accept_by_transition_reset
+            or accept_by_white_box_transition
+            or accept_by_strict_pattern
+        ):
             skipped_rows.append(
                 {
                     "page": int(page),
@@ -337,6 +910,14 @@ def bag_starts_scan(
                     "bag_start_card_reasons": list(
                         result.get("bag_start_card_reasons", []) or []
                     ),
+                    "step_sequence_role": step_sequence_role,
+                    "step_drop": step_drop,
+                    "previous_max_step": previous_max_step,
+                    "bag_start_layout": bag_start_layout,
+                    "inferred_bag_number_source": inferred_bag_number_source,
+                    "white_box_transition_found": bool(
+                        result.get("white_box_transition_found")
+                    ),
                     "slow_page": slow_page,
                 }
             )
@@ -345,7 +926,7 @@ def bag_starts_scan(
         bag_starts.append(
             {
                 "page": int(result.get("page", page) or page),
-                "bag_number": result.get("bag_number"),
+                "bag_number": effective_bag_number,
                 "panel_found": bool(result.get("panel_found")),
                 "panel_source": result.get("panel_source"),
                 "number_box_found": bool(result.get("number_box_found")),
@@ -361,11 +942,23 @@ def bag_starts_scan(
                 "bag_start_card_reasons": list(
                     result.get("bag_start_card_reasons", []) or []
                 ),
+                "step_sequence_role": step_sequence_role,
+                "step_drop": step_drop,
+                "previous_max_step": previous_max_step,
+                "bag_start_layout": bag_start_layout,
+                "inferred_bag_number_source": inferred_bag_number_source,
+                "white_box_transition_found": bool(
+                    result.get("white_box_transition_found")
+                ),
                 "slow_page": slow_page,
             }
         )
 
     bag_starts.sort(key=lambda item: int(item["page"]))
+    bag_starts = _filter_bag_starts_for_save(
+        bag_starts=bag_starts,
+        skipped_rows=skipped_rows,
+    )
     if expected_next_bag is not None:
         filtered_bag_starts = []
         current_expected_bag = int(expected_next_bag)
@@ -390,6 +983,10 @@ def bag_starts_scan(
                     "skip_reason": "unexpected_bag_number",
                     "expected_bag_number": current_expected_bag,
                     "candidate_bag_number": candidate_bag_number,
+                    "step_sequence_role": item.get("step_sequence_role"),
+                    "step_drop": item.get("step_drop"),
+                    "previous_max_step": item.get("previous_max_step"),
+                    "bag_start_layout": item.get("bag_start_layout"),
                     "slow_page": bool(item.get("slow_page")),
                 }
             )
@@ -417,13 +1014,18 @@ def bag_starts_scan(
                 "skip_reason": "bag_number_jump",
                 "previous_bag_number": previous_kept_bag_number,
                 "candidate_bag_number": candidate_bag_number,
+                "step_sequence_role": item.get("step_sequence_role"),
+                "step_drop": item.get("step_drop"),
+                "previous_max_step": item.get("previous_max_step"),
+                "bag_start_layout": item.get("bag_start_layout"),
                 "slow_page": bool(item.get("slow_page")),
             }
         )
 
     bag_starts = kept_bag_starts
-    bag_starts = _filter_bag_starts_for_save(
+    bag_starts, bag_starts_to_save = _split_bag_starts_for_existing_truth(
         bag_starts=bag_starts,
+        existing_truth_by_page=existing_truth_by_page,
         skipped_rows=skipped_rows,
     )
 
@@ -439,11 +1041,17 @@ def bag_starts_scan(
     bag_ranges = []
     if scanned_pages_count > 0 and last_scanned_page is not None:
         bag_ranges = _build_bag_ranges(bag_starts, int(last_scanned_page))
-    save_summary = bag_truth_store.save_many_bag_starts(
-        set_num=set_num,
-        bag_starts=bag_starts,
-        source="detector",
-    )
+    if bag_starts_to_save:
+        save_summary = bag_truth_store.save_many_bag_starts(
+            set_num=set_num,
+            bag_starts=bag_starts_to_save,
+            source="detector",
+        )
+    else:
+        save_summary = {
+            "saved_truth": bag_truth_store.get_bag_truth(set_num),
+            "conflicts": bag_truth_store.get_conflicts(set_num),
+        }
 
     return {
         "ok": True,
@@ -540,6 +1148,10 @@ def full_bag_scan(
                         "skip_reason": "unexpected_bag_number",
                         "expected_bag_number": next_expected_bag,
                         "candidate_bag_number": candidate_bag_number,
+                        "step_sequence_role": item.get("step_sequence_role"),
+                        "step_drop": item.get("step_drop"),
+                        "previous_max_step": item.get("previous_max_step"),
+                        "bag_start_layout": item.get("bag_start_layout"),
                         "slow_page": bool(item.get("slow_page")),
                     }
                 )
@@ -578,12 +1190,25 @@ def full_bag_scan(
         current_start = int(chunk_next_start_page)
 
     all_bag_starts.sort(key=lambda item: int(item["page"]))
-    bag_ranges = _build_bag_ranges(all_bag_starts, last_scanned_page)
-    save_summary = bag_truth_store.save_many_bag_starts(
-        set_num=set_num,
+    existing_bag_truth = list(bag_truth_store.get_bag_truth(set_num) or [])
+    existing_truth_by_page = _build_existing_truth_by_page(existing_bag_truth)
+    all_bag_starts, all_bag_starts_to_save = _split_bag_starts_for_existing_truth(
         bag_starts=all_bag_starts,
-        source="detector",
+        existing_truth_by_page=existing_truth_by_page,
+        skipped_rows=all_skipped_rows,
     )
+    bag_ranges = _build_bag_ranges(all_bag_starts, last_scanned_page)
+    if all_bag_starts_to_save:
+        save_summary = bag_truth_store.save_many_bag_starts(
+            set_num=set_num,
+            bag_starts=all_bag_starts_to_save,
+            source="detector",
+        )
+    else:
+        save_summary = {
+            "saved_truth": bag_truth_store.get_bag_truth(set_num),
+            "conflicts": bag_truth_store.get_conflicts(set_num),
+        }
 
     return {
         "ok": True,
@@ -659,6 +1284,190 @@ def api_bag_truth(
         "set_num": str(set_num),
         "saved_truth": bag_truth_store.get_bag_truth(set_num),
         "conflicts": bag_truth_store.get_conflicts(set_num),
+    }
+
+
+@router.get("/api/bag-candidate-report")
+def api_bag_candidate_report(
+    set_num: str = Query(...),
+    start: int = Query(..., ge=1),
+    end: int = Query(..., ge=1),
+):
+    if int(end) < int(start):
+        raise HTTPException(status_code=400, detail="end must be >= start")
+
+    pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
+    if pages_dir is None:
+        raise HTTPException(status_code=404, detail="no rendered pages found for set")
+
+    rendered_pages = [
+        int(page)
+        for page in _list_rendered_pages(pages_dir)
+        if int(start) <= int(page) <= int(end)
+    ]
+
+    configure_pages_dir(str(pages_dir))
+    step_role_map = step_sequence_bag_service.build_step_sequence_prepass_for_pages(
+        set_num=set_num,
+        pages=rendered_pages,
+    )
+    step_role_by_page = {
+        int(item.get("page", 0) or 0): item for item in (step_role_map or [])
+    }
+    existing_bag_truth = list(bag_truth_store.get_bag_truth(set_num) or [])
+    existing_truth_by_page = _build_existing_truth_by_page(existing_bag_truth)
+
+    rows = []
+    for page in rendered_pages:
+        result = analyze_page(int(page), include_image=False)
+        rows.append(
+            _build_bag_candidate_report_row(
+                set_num=set_num,
+                page=int(page),
+                result=result,
+                step_role_row=step_role_by_page.get(int(page)),
+                existing_bag_truth=existing_bag_truth,
+                existing_truth_by_page=existing_truth_by_page,
+                expected_next_bag=None,
+            )
+        )
+
+    return {
+        "set_num": str(set_num),
+        "start": int(start),
+        "end": int(end),
+        "rows": rows,
+    }
+
+
+@router.get("/api/missing-bag-gap-report")
+def api_missing_bag_gap_report(
+    set_num: str = Query(...),
+    from_bag: int = Query(..., ge=1),
+    to_bag: int = Query(..., ge=1),
+):
+    if int(to_bag) <= int(from_bag):
+        raise HTTPException(status_code=400, detail="to_bag must be > from_bag")
+
+    pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
+    if pages_dir is None:
+        raise HTTPException(status_code=404, detail="no rendered pages found for set")
+
+    bag_truth = sorted(
+        list(bag_truth_store.get_bag_truth(set_num) or []),
+        key=lambda item: int(item.get("start_page", 0) or 0),
+    )
+    from_bag_row = next(
+        (
+            item
+            for item in bag_truth
+            if int(item.get("bag_number", 0) or 0) == int(from_bag)
+        ),
+        None,
+    )
+    to_bag_row = next(
+        (
+            item
+            for item in bag_truth
+            if int(item.get("bag_number", 0) or 0) == int(to_bag)
+        ),
+        None,
+    )
+    if from_bag_row is None:
+        raise HTTPException(status_code=404, detail=f"from_bag {from_bag} not found in bag_truth")
+    if to_bag_row is None:
+        raise HTTPException(status_code=404, detail=f"to_bag {to_bag} not found in bag_truth")
+
+    from_bag_page = int(from_bag_row.get("start_page", 0) or 0)
+    to_bag_page = int(to_bag_row.get("start_page", 0) or 0)
+    if int(to_bag_page) <= int(from_bag_page):
+        raise HTTPException(
+            status_code=400,
+            detail="to_bag start page must be after from_bag start page",
+        )
+
+    missing_bag_numbers = list(range(int(from_bag) + 1, int(to_bag)))
+    rendered_pages = [
+        int(page)
+        for page in _list_rendered_pages(pages_dir)
+        if int(from_bag_page) < int(page) < int(to_bag_page)
+    ]
+
+    configure_pages_dir(str(pages_dir))
+    step_role_map = step_sequence_bag_service.build_step_sequence_prepass_for_pages(
+        set_num=set_num,
+        pages=rendered_pages,
+    )
+    step_role_by_page = {
+        int(item.get("page", 0) or 0): item for item in (step_role_map or [])
+    }
+
+    working_truth = list(bag_truth)
+    rows = []
+    for page in rendered_pages:
+        existing_truth_by_page = _build_existing_truth_by_page(working_truth)
+        result = analyze_page(int(page), include_image=False)
+        report_row = _build_bag_candidate_report_row(
+            set_num=set_num,
+            page=int(page),
+            result=result,
+            step_role_row=step_role_by_page.get(int(page)),
+            existing_bag_truth=working_truth,
+            existing_truth_by_page=existing_truth_by_page,
+            expected_next_bag=None,
+        )
+        step_role = str(report_row.get("step_sequence_role") or "")
+        enriched_row = {
+            "page": int(page),
+            "detected_bag_number": report_row.get("bag_number"),
+            "bag_start_card_found": bool(report_row.get("bag_start_card_found")),
+            "white_box_transition_found": bool(
+                report_row.get("white_box_transition_found")
+            ),
+            "step_sequence_reset": step_role == "step_sequence_reset",
+            "hero_transition_reset": step_role == "hero_transition_reset",
+            "main_step_min": (step_role_by_page.get(int(page)) or {}).get("main_step_min"),
+            "main_step_max": (step_role_by_page.get(int(page)) or {}).get("main_step_max"),
+            "final_decision": report_row.get("final_decision"),
+            "rejection_reason": report_row.get("rejection_reason"),
+            "why": (
+                report_row.get("rejection_reason")
+                if report_row.get("final_decision") == "rejected"
+                else str(report_row.get("bag_start_layout") or "accepted")
+            ),
+            "thumbnail_url": f"/debug/page-image?set_num={set_num}&page={int(page)}",
+            "debug_page_image_url": report_row.get("debug_page_image_url"),
+            "bag_start_layout": report_row.get("bag_start_layout"),
+            "inferred_bag_number_source": report_row.get("inferred_bag_number_source"),
+        }
+        rows.append(enriched_row)
+
+        if report_row.get("final_decision") == "accepted":
+            accepted_bag_number = int(report_row.get("bag_number", 0) or 0)
+            if accepted_bag_number > 0 and not any(
+                int(item.get("start_page", 0) or 0) == int(page)
+                for item in working_truth
+            ):
+                working_truth.append(
+                    {
+                        "bag_number": accepted_bag_number,
+                        "start_page": int(page),
+                    }
+                )
+                working_truth.sort(
+                    key=lambda item: int(item.get("start_page", 0) or 0)
+                )
+
+    return {
+        "set_num": str(set_num),
+        "from_bag": int(from_bag),
+        "to_bag": int(to_bag),
+        "from_bag_page": int(from_bag_page),
+        "to_bag_page": int(to_bag_page),
+        "missing_bag_numbers": missing_bag_numbers,
+        "scan_start_page": int(from_bag_page) + 1,
+        "scan_end_page": int(to_bag_page) - 1,
+        "rows": rows,
     }
 
 

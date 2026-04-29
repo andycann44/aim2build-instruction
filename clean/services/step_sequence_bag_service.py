@@ -35,6 +35,7 @@ def _build_step_sequence_row(
         "step_sequence_role": "no_step_data",
         "step_role_reason": "no main_steps detected",
         "bag_start_allowed": True,
+        "hero_transition_reset_candidate": False,
         "detected_step_boxes": list(classified_step_boxes or []),
     }
 
@@ -55,10 +56,19 @@ def _build_step_sequence_row(
 
     if (
         previous_max_step is not None
-        and int(previous_max_step) >= 8
+        and int(previous_max_step) >= 20
+        and int(main_step_min) <= 9
+        and step_drop is not None
+        and int(step_drop) >= 10
+    ):
+        row["hero_transition_reset_candidate"] = True
+
+    if (
+        previous_max_step is not None
+        and int(previous_max_step) >= 20
         and int(main_step_min) <= 3
         and step_drop is not None
-        and int(step_drop) >= 8
+        and int(step_drop) >= 10
     ):
         row["step_sequence_role"] = "step_sequence_reset"
         row["step_role_reason"] = (

@@ -1,17 +1,30 @@
-# Debug / runtime
-debug/
-*.db
-*.sqlite
-
-# PDFs / datasets
-*.pdf
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Env
+.env
+.venv/
 
 # Mac
-.DS_Store*
-!clean/
-!clean/**
-!.gitignore
+.DS_Store
+
+# SQLite / local data
+*.db
+*.sqlite
+debug/*.db
+
+# Logs
+*.log
+
+# Temp
+/tmp/
+*.work
+
+# VSCode
+.vscode/
+
+# Cache
+.cache/

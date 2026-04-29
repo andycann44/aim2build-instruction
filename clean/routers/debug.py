@@ -22,6 +22,16 @@ from clean.services import (
 router = APIRouter()
 
 
+def _list_rendered_pages(pages_dir: Path) -> List[int]:
+    pages: List[int] = []
+    for path in sorted(pages_dir.glob("page_*.png")):
+        try:
+            pages.append(int(path.stem.replace("page_", "")))
+        except ValueError:
+            continue
+    return pages
+
+
 def _strong_structure_from_result(result: Dict[str, Any]) -> bool:
     return bool(
         result.get("strong_structure")
@@ -851,6 +861,9 @@ def debug_bag_truth_visual(
             <article class="tile">
               <a class="thumb-wrap" href="{image_url}" target="_blank">
                 <img class="thumb" src="{image_url}" alt="Bag {bag_number} page {start_page}" loading="lazy" />
+                <span class="thumb-preview" aria-hidden="true">
+                  <img class="thumb-preview-img" src="{image_url}" alt="" loading="lazy" />
+                </span>
               </a>
               <div class="tile-body">
                 <h3>Bag {bag_number}</h3>
@@ -930,24 +943,62 @@ def debug_bag_truth_visual(
               display: grid;
               grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
               gap: 16px;
+              overflow: visible;
             }}
             .tile {{
               background: var(--panel);
               border: 1px solid var(--border);
               border-radius: 16px;
-              overflow: hidden;
+              overflow: visible;
               box-shadow: var(--shadow);
             }}
             .thumb-wrap {{
               display: block;
               background: #dbe7db;
               aspect-ratio: 1 / 1.25;
+              position: relative;
+              overflow: visible;
             }}
             .thumb {{
               width: 100%;
               height: 100%;
               object-fit: cover;
               display: block;
+            }}
+            .thumb-preview {{
+              position: fixed;
+              inset: 24px;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              padding: 24px;
+              background: rgba(23, 48, 31, 0.44);
+              opacity: 0;
+              visibility: hidden;
+              pointer-events: none;
+              z-index: 99999;
+              transition:
+                opacity 0.15s ease,
+                visibility 0s linear 1s;
+            }}
+            .thumb-preview-img {{
+              display: block;
+              width: auto;
+              height: auto;
+              max-width: min(92vw, 1200px);
+              max-height: 92vh;
+              object-fit: contain;
+              border-radius: 14px;
+              box-shadow: 0 20px 80px rgba(10, 24, 15, 0.45);
+              background: #ffffff;
+            }}
+            .thumb-wrap:hover .thumb-preview,
+            .thumb-wrap:focus-visible .thumb-preview {{
+              opacity: 1;
+              visibility: visible;
+              transition:
+                opacity 0.15s ease 1s,
+                visibility 0s;
             }}
             .tile-body {{
               padding: 14px;
@@ -1009,6 +1060,214 @@ def debug_bag_truth_visual(
               <p><strong>Set:</strong> {escape(str(set_num))}</p>
               <p><strong>Saved bags:</strong> {len(saved_truth)}</p>
               <p><a href="/api/bag-truth?set_num={escape(str(set_num))}" target="_blank">Open raw bag truth JSON</a></p>
+            </section>
+            <section class="grid">
+              {cards_block}
+            </section>
+          </div>
+        </body>
+        </html>
+        """
+    )
+
+
+@router.get("/debug/page-range-thumbs", response_class=HTMLResponse)
+def debug_page_range_thumbs(
+    set_num: str = Query(...),
+    start: int = Query(..., ge=1),
+    end: int = Query(..., ge=1),
+):
+    if int(end) < int(start):
+        raise HTTPException(status_code=400, detail="end must be >= start")
+
+    pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
+    if pages_dir is None:
+        raise HTTPException(status_code=404, detail="no rendered pages found for set")
+
+    rendered_pages = [
+        int(page)
+        for page in _list_rendered_pages(pages_dir)
+        if int(start) <= int(page) <= int(end)
+    ]
+
+    cards: List[str] = []
+    for page in rendered_pages:
+        image_url = f"/debug/page-image?set_num={escape(str(set_num))}&page={int(page)}"
+        analyze_url = (
+            f"/api/analyze-page-direct?set_num={escape(str(set_num))}&page={int(page)}"
+        )
+        cards.append(
+            f"""
+            <article class="tile">
+              <a class="thumb-wrap" href="{image_url}" target="_blank">
+                <img class="thumb" src="{image_url}" alt="Page {int(page)}" loading="lazy" />
+                <span class="thumb-preview" aria-hidden="true">
+                  <img class="thumb-preview-img" src="{image_url}" alt="" loading="lazy" />
+                </span>
+              </a>
+              <div class="tile-body">
+                <h3>Page {int(page)}</h3>
+                <p class="actions">
+                  <a href="{image_url}" target="_blank">Open image</a>
+                  <span class="sep">|</span>
+                  <a href="{analyze_url}" target="_blank">Analyze JSON</a>
+                </p>
+              </div>
+            </article>
+            """
+        )
+
+    cards_block = (
+        "\n".join(cards)
+        if cards
+        else "<div class='empty'>No rendered pages found in this range.</div>"
+    )
+
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Page Range Thumbnails</title>
+          <style>
+            :root {{
+              --bg: #f4f6f3;
+              --panel: #ffffff;
+              --border: #d7ddd5;
+              --text: #1d2d22;
+              --muted: #64756a;
+              --accent: #2f8f55;
+              --shadow: 0 10px 28px rgba(25, 47, 33, 0.08);
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{
+              margin: 0;
+              padding: 24px;
+              background: linear-gradient(180deg, #eef3ed 0%, var(--bg) 100%);
+              color: var(--text);
+              font-family: Arial, sans-serif;
+            }}
+            .shell {{
+              max-width: 1380px;
+              margin: 0 auto;
+            }}
+            .hero {{
+              background: var(--panel);
+              border: 1px solid var(--border);
+              border-radius: 16px;
+              padding: 18px 20px;
+              margin-bottom: 18px;
+              box-shadow: var(--shadow);
+            }}
+            .hero h1 {{
+              margin: 0 0 8px;
+              font-size: 28px;
+            }}
+            .hero p {{
+              margin: 4px 0;
+              color: var(--muted);
+            }}
+            .hero a {{
+              color: var(--accent);
+              text-decoration: none;
+            }}
+            .grid {{
+              display: grid;
+              grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+              gap: 16px;
+              overflow: visible;
+            }}
+            .tile {{
+              background: var(--panel);
+              border: 1px solid var(--border);
+              border-radius: 16px;
+              overflow: visible;
+              box-shadow: var(--shadow);
+            }}
+            .thumb-wrap {{
+              display: block;
+              background: #dce7dc;
+              aspect-ratio: 1 / 1.25;
+              position: relative;
+              overflow: visible;
+            }}
+            .thumb {{
+              display: block;
+              width: 100%;
+              height: 100%;
+              object-fit: cover;
+            }}
+            .thumb-preview {{
+              position: fixed;
+              inset: 24px;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              padding: 24px;
+              background: rgba(29, 45, 34, 0.44);
+              opacity: 0;
+              visibility: hidden;
+              pointer-events: none;
+              z-index: 99999;
+              transition:
+                opacity 0.15s ease,
+                visibility 0s linear 1s;
+            }}
+            .thumb-preview-img {{
+              display: block;
+              width: auto;
+              height: auto;
+              max-width: min(92vw, 1200px);
+              max-height: 92vh;
+              object-fit: contain;
+              border-radius: 14px;
+              box-shadow: 0 20px 80px rgba(10, 24, 15, 0.45);
+              background: #ffffff;
+            }}
+            .thumb-wrap:hover .thumb-preview,
+            .thumb-wrap:focus-visible .thumb-preview {{
+              opacity: 1;
+              visibility: visible;
+              transition:
+                opacity 0.15s ease 1s,
+                visibility 0s;
+            }}
+            .tile-body {{
+              padding: 12px 14px 14px;
+            }}
+            .tile-body h3 {{
+              margin: 0 0 8px;
+              font-size: 19px;
+            }}
+            .actions {{
+              margin: 0;
+              font-size: 14px;
+            }}
+            .actions a {{
+              color: var(--accent);
+              text-decoration: none;
+            }}
+            .sep {{
+              color: #93a095;
+              margin: 0 6px;
+            }}
+            .empty {{
+              background: var(--panel);
+              border: 1px dashed var(--border);
+              border-radius: 16px;
+              padding: 30px;
+              color: var(--muted);
+            }}
+          </style>
+        </head>
+        <body>
+          <div class="shell">
+            <section class="hero">
+              <h1>Page Range Thumbnails</h1>
+              <p><strong>Set:</strong> {escape(str(set_num))}</p>
+              <p><strong>Range:</strong> pages {int(start)}-{int(end)}</p>
+              <p><strong>Pages shown:</strong> {len(rendered_pages)}</p>
             </section>
             <section class="grid">
               {cards_block}

@@ -380,6 +380,290 @@ def _should_ignore_footer_number_box(box, page_shape):
     )
     return bool(in_footer_band or in_bottom_page_zone)
 
+
+def _count_right_beige_callout_boxes(img, transition_band_bottom):
+    if img is None or img.size == 0:
+        return 0
+
+    page_h, page_w = img.shape[:2]
+    y_cutoff = max(0, min(page_h, int(transition_band_bottom)))
+    x_cutoff = int(page_w * 0.58)
+    search = img[y_cutoff:page_h, x_cutoff:page_w]
+    if search.size == 0:
+        return 0
+
+    hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
+    beige_mask = cv2.inRange(
+        hsv,
+        np.array((10, 20, 180), dtype=np.uint8),
+        np.array((40, 140, 255), dtype=np.uint8),
+    )
+    beige_mask = cv2.morphologyEx(
+        beige_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)
+    )
+    beige_mask = cv2.morphologyEx(
+        beige_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+    )
+
+    cnts, _ = cv2.findContours(
+        beige_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    count = 0
+    page_area = float(max(1, page_h * page_w))
+
+    for contour in cnts:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+
+        area_ratio = float(w * h) / page_area
+        aspect_ratio = float(w) / float(max(h, 1))
+        contour_area = float(cv2.contourArea(contour))
+        fill_ratio = contour_area / float(max(1, w * h))
+
+        if area_ratio < 0.018 or area_ratio > 0.18:
+            continue
+        if aspect_ratio < 0.35 or aspect_ratio > 1.85:
+            continue
+        if fill_ratio < 0.60:
+            continue
+
+        count += 1
+
+    return int(count)
+
+
+def _count_large_model_panels_below_transition_band(img, transition_band_bottom):
+    if img is None or img.size == 0:
+        return 0
+
+    page_h, page_w = img.shape[:2]
+    y_cutoff = max(0, min(page_h, int(transition_band_bottom)))
+    search = img[y_cutoff:page_h, :]
+    if search.size == 0:
+        return 0
+
+    border_samples = np.concatenate(
+        [
+            search[: max(1, search.shape[0] // 12), :, :].reshape(-1, 3),
+            search[:, : max(1, search.shape[1] // 16), :].reshape(-1, 3),
+            search[:, -max(1, search.shape[1] // 16) :, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    background = np.median(border_samples, axis=0).astype(np.float32)
+    diff = np.linalg.norm(search.astype(np.float32) - background[None, None, :], axis=2)
+    model_mask = np.uint8(diff >= 28.0) * 255
+    model_mask = cv2.morphologyEx(
+        model_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8)
+    )
+    model_mask = cv2.morphologyEx(
+        model_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
+    )
+
+    cnts, _ = cv2.findContours(
+        model_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    count = 0
+    page_area = float(max(1, page_h * page_w))
+
+    for contour in cnts:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+
+        area_ratio = float(w * h) / page_area
+        width_ratio = float(w) / float(max(1, page_w))
+        height_ratio = float(h) / float(max(1, page_h))
+        contour_area = float(cv2.contourArea(contour))
+        fill_ratio = contour_area / float(max(1, w * h))
+
+        if area_ratio < 0.080:
+            continue
+        if width_ratio < 0.35:
+            continue
+        if height_ratio < 0.15:
+            continue
+        if fill_ratio < 0.18:
+            continue
+
+        count += 1
+
+    return int(count)
+
+
+def detect_white_box_transition(
+    img,
+    panel_box,
+    panel_source,
+    panel_score,
+    build_step_page,
+    step_grid_number_count,
+    bag_start_card_found=False,
+):
+    result = {
+        "white_box_transition_found": False,
+        "white_box_transition_score": 0.0,
+        "white_box_transition_box": None,
+        "white_box_transition_reasons": [],
+    }
+
+    if img is None or img.size == 0:
+        result["white_box_transition_reasons"].append("no_image")
+        return result
+    if panel_box is None:
+        result["white_box_transition_reasons"].append("no_panel_box")
+        return result
+    if panel_source != "strict_top_left":
+        result["white_box_transition_reasons"].append("panel_source_not_strict_top_left")
+        return result
+
+    page_h, page_w = img.shape[:2]
+    px, py, pw, ph = [int(v) for v in panel_box]
+    if pw <= 0 or ph <= 0:
+        result["white_box_transition_reasons"].append("invalid_panel_box")
+        return result
+
+    panel_area_ratio = float(pw * ph) / float(max(1, page_h * page_w))
+    if panel_area_ratio < 0.12:
+        result["white_box_transition_reasons"].append("panel_area_too_small")
+        return result
+
+    panel_img = crop(img, panel_box)
+    if panel_img is None or panel_img.size == 0:
+        result["white_box_transition_reasons"].append("empty_panel_crop")
+        return result
+
+    gray = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(panel_img, cv2.COLOR_BGR2HSV)
+
+    light_mask = cv2.inRange(gray, 228, 255)
+    light_mask = cv2.morphologyEx(
+        light_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)
+    )
+    cnts, _ = cv2.findContours(light_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_light_box = None
+    best_light_area_ratio = 0.0
+    best_light_fill_ratio = 0.0
+
+    for contour in cnts:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+
+        contour_area = float(cv2.contourArea(contour))
+        box_area = float(max(1, w * h))
+        fill_ratio = contour_area / box_area
+        local_area_ratio = box_area / float(max(1, pw * ph))
+        aspect_ratio = float(w) / float(max(h, 1))
+
+        if local_area_ratio < 0.28:
+            continue
+        if aspect_ratio < 1.6:
+            continue
+        if fill_ratio < 0.82:
+            continue
+        if y > int(ph * 0.18):
+            continue
+
+        if local_area_ratio > best_light_area_ratio:
+            best_light_area_ratio = local_area_ratio
+            best_light_fill_ratio = fill_ratio
+            best_light_box = (px + x, py + y, w, h)
+
+    if best_light_box is None:
+        result["white_box_transition_reasons"].append("no_large_light_box")
+        return result
+
+    bx, by, bw, bh = best_light_box
+    white_roi = crop(img, best_light_box)
+    if white_roi is None or white_roi.size == 0:
+        result["white_box_transition_reasons"].append("empty_light_box_crop")
+        return result
+
+    white_gray = cv2.cvtColor(white_roi, cv2.COLOR_BGR2GRAY)
+    white_hsv = cv2.cvtColor(white_roi, cv2.COLOR_BGR2HSV)
+    bright_ratio = float(np.mean(white_gray >= 232))
+    white_mean = float(np.mean(white_gray))
+    white_std = float(np.std(white_gray))
+    warm_mask = (
+        (
+            ((white_hsv[:, :, 0] <= 12) | (white_hsv[:, :, 0] >= 170))
+            & (white_hsv[:, :, 1] >= 70)
+            & (white_hsv[:, :, 2] >= 140)
+        )
+        | (
+            (white_hsv[:, :, 0] >= 8)
+            & (white_hsv[:, :, 0] <= 25)
+            & (white_hsv[:, :, 1] >= 70)
+            & (white_hsv[:, :, 2] >= 140)
+        )
+    )
+    warm_ratio = float(np.mean(warm_mask))
+    edge_density = float(np.mean(cv2.Canny(white_gray, 40, 130) > 0))
+
+    score = 0.0
+    if panel_score is not None:
+        score += min(1.0, float(panel_score) / 220.0) * 0.24
+    score += min(1.0, best_light_area_ratio / 0.65) * 0.28
+    score += min(1.0, best_light_fill_ratio / 0.95) * 0.10
+    score += min(1.0, bright_ratio / 0.78) * 0.18
+    score += min(1.0, warm_ratio / 0.010) * 0.12
+    score += min(1.0, edge_density / 0.08) * 0.05
+    if not bool(build_step_page):
+        score += 0.02
+    if int(step_grid_number_count or 0) <= 2:
+        score += 0.03
+
+    reasons = result["white_box_transition_reasons"]
+    reasons.append("strict_top_left_panel")
+    reasons.append("large_light_box")
+    if panel_score is not None and float(panel_score) >= 150.0:
+        reasons.append("high_panel_score")
+    if bright_ratio >= 0.68 and white_mean >= 220.0:
+        reasons.append("bright_white_box")
+    if warm_ratio >= 0.0025:
+        reasons.append("warm_arrow_signal")
+    if not bool(build_step_page):
+        reasons.append("not_build_step_page")
+    if int(step_grid_number_count or 0) <= 2:
+        reasons.append("low_step_grid_count")
+
+    result["white_box_transition_score"] = round(float(score), 3)
+    result["white_box_transition_box"] = list(best_light_box)
+    transition_band_bottom = by + int(bh * 0.55)
+    right_callout_count = _count_right_beige_callout_boxes(
+        img,
+        transition_band_bottom=transition_band_bottom,
+    )
+    model_panel_count = _count_large_model_panels_below_transition_band(
+        img,
+        transition_band_bottom=transition_band_bottom,
+    )
+    rejected_multiple_right_callouts = right_callout_count >= 2
+    rejected_multiple_model_panels = (
+        model_panel_count >= 2 and not bool(bag_start_card_found)
+    )
+    result["white_box_transition_found"] = bool(
+        score >= 0.78
+        and best_light_area_ratio >= 0.32
+        and warm_ratio >= 0.0025
+        and not bool(build_step_page)
+        and int(step_grid_number_count or 0) <= 2
+        and float(panel_score or 0.0) >= 150.0
+        and not rejected_multiple_right_callouts
+        and not rejected_multiple_model_panels
+    )
+    if rejected_multiple_right_callouts:
+        reasons.append("rejected_multiple_right_callouts")
+    if rejected_multiple_model_panels:
+        reasons.append("rejected_multiple_model_panels")
+    if not result["white_box_transition_found"]:
+        reasons.append("white_box_transition_threshold_not_met")
+
+    return result
+
 def _border_center_stats(gray_roi):
     if gray_roi is None or gray_roi.size == 0:
         return None
@@ -2513,6 +2797,15 @@ def analyze_page(page: int, include_image: bool = True):
         panel if panel_found else None,
         number_abs if initial_number_box_found else None,
     )
+    white_box_transition = detect_white_box_transition(
+        img=img,
+        panel_box=panel if panel_found else None,
+        panel_source=panel_source,
+        panel_score=panel_score,
+        build_step_page=build_step_page,
+        step_grid_number_count=step_grid_number_count,
+        bag_start_card_found=bool(bag_start_card.get("bag_start_card_found")),
+    )
     if bool(bag_start_card.get("bag_start_card_found")):
         card_box = bag_start_card.get("bag_start_card_box")
         refined_card_candidate = _refine_bag_number_from_card(
@@ -2725,6 +3018,18 @@ def analyze_page(page: int, include_image: bool = True):
         "bag_start_card_box": bag_start_card.get("bag_start_card_box"),
         "bag_start_card_reasons": list(
             bag_start_card.get("bag_start_card_reasons", []) or []
+        ),
+        "white_box_transition_found": bool(
+            white_box_transition.get("white_box_transition_found")
+        ),
+        "white_box_transition_score": float(
+            white_box_transition.get("white_box_transition_score", 0.0) or 0.0
+        ),
+        "white_box_transition_box": white_box_transition.get(
+            "white_box_transition_box"
+        ),
+        "white_box_transition_reasons": list(
+            white_box_transition.get("white_box_transition_reasons", []) or []
         ),
         "ocr_error": _get_ocr_error(),
         "rejection_reason": (
