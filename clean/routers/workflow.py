@@ -1476,7 +1476,7 @@ def api_bag_step_ranges(
     set_num: str = Query(...),
     start_bag: Optional[int] = Query(None, ge=1),
     end_bag: Optional[int] = Query(None, ge=1),
-    max_pages: int = Query(5, ge=1),
+    max_pages: int = Query(15, ge=1),
 ):
     pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
     if pages_dir is None:
@@ -1524,46 +1524,21 @@ def api_bag_step_ranges(
             if start_page <= int(page) <= int(end_page)
         ]
         pages_scanned = 0
-        current_max_step = None
-        consecutive_pages_without_increase = 0
 
         for page in pages_in_range:
             if pages_scanned >= int(max_pages):
                 break
 
-            previous_max_step = current_max_step
             page_main_steps = _load_page_main_steps(set_num, int(page))
             main_step_values.extend(page_main_steps)
             pages_scanned += 1
-
-            if page_main_steps:
-                page_max_step = max(int(value) for value in page_main_steps)
-                current_max_step = (
-                    page_max_step
-                    if current_max_step is None
-                    else max(int(current_max_step), page_max_step)
-                )
-
-            if (
-                previous_max_step is not None
-                and current_max_step is not None
-                and int(current_max_step) == int(previous_max_step)
-            ):
-                consecutive_pages_without_increase += 1
-            else:
-                consecutive_pages_without_increase = 0
-
-            if consecutive_pages_without_increase >= 2:
-                break
 
         bag_step_ranges.append(
             {
                 "bag_number": bag_number,
                 "start_page": start_page,
                 "end_page": int(end_page),
-                "start_step": (
-                    int(min(main_step_values)) if main_step_values else None
-                ),
+                "start_step": 1,
                 "end_step": int(max(main_step_values)) if main_step_values else None,
                 "pages_scanned": int(pages_scanned),
             }
