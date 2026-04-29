@@ -28,3 +28,24 @@ debug/*.db
 
 # Cache
 .cache/
+
+# Large data folders
+datasets/
+downloads/
+instructions/
+output/
+debug/
+
+# Images / PDFs
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.pdf
+
+# Optional: keep specific images if needed
+# !assets/*.png
+
