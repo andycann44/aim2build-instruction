@@ -1,6 +1,31 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from clean.services import debug_service, step_detector_service
+
+page_step_cache: Dict[Tuple[str, int], List[int]] = {}
+
+
+def get_cached_page_main_steps(set_num: str, page: int) -> Optional[List[int]]:
+    cached = page_step_cache.get((str(set_num), int(page)))
+    if cached is None:
+        return None
+    return list(cached)
+
+
+def store_cached_page_main_steps(
+    set_num: str,
+    page: int,
+    main_steps: List[int],
+) -> List[int]:
+    normalized = sorted(
+        {
+            int(value)
+            for value in (main_steps or [])
+            if int(value) > 0
+        }
+    )
+    page_step_cache[(str(set_num), int(page))] = list(normalized)
+    return list(normalized)
 
 
 def _list_available_pages(set_num: str) -> List[int]:

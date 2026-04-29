@@ -86,15 +86,24 @@ def _boxes_overlap(box_a, box_b):
 
 
 def _load_page_main_steps(set_num: str, page: int):
+    cached_main_steps = step_sequence_bag_service.get_cached_page_main_steps(
+        set_num,
+        int(page),
+    )
+    if cached_main_steps is not None:
+        return cached_main_steps
+
     analyze_page(int(page), include_image=False)
     detected = step_detector_service.detect_steps(set_num, int(page))
     main_steps = detected.get("main_steps", []) or []
-    return sorted(
+    return step_sequence_bag_service.store_cached_page_main_steps(
+        set_num,
+        int(page),
         {
             int(item.get("value", 0) or 0)
             for item in main_steps
             if int(item.get("value", 0) or 0) > 0
-        }
+        },
     )
 
 
