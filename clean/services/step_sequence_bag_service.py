@@ -1,14 +1,66 @@
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from clean.services import debug_service, step_detector_service
 
+STEP_CACHE_PATH = debug_service.DEBUG_ROOT / "step_cache.json"
 page_step_cache: Dict[Tuple[str, int], List[int]] = {}
+
+
+def _load_page_step_cache_from_disk() -> Dict[Tuple[str, int], List[int]]:
+    if not STEP_CACHE_PATH.exists():
+        return {}
+
+    try:
+        payload = json.loads(STEP_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    loaded: Dict[Tuple[str, int], List[int]] = {}
+    for set_num, page_map in (payload or {}).items():
+        if not isinstance(page_map, dict):
+            continue
+        for page, steps in page_map.items():
+            try:
+                page_num = int(page)
+            except (TypeError, ValueError):
+                continue
+            normalized = sorted(
+                {
+                    int(value)
+                    for value in (steps or [])
+                    if int(value) > 0
+                }
+            )
+            loaded[(str(set_num), int(page_num))] = list(normalized)
+    return loaded
+
+
+def _save_page_step_cache_to_disk() -> None:
+    serialized: Dict[str, Dict[str, List[int]]] = {}
+    for (set_num, page), steps in sorted(
+        page_step_cache.items(),
+        key=lambda item: (str(item[0][0]), int(item[0][1])),
+    ):
+        set_key = str(set_num)
+        page_key = str(int(page))
+        serialized.setdefault(set_key, {})[page_key] = [int(value) for value in steps]
+
+    STEP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STEP_CACHE_PATH.write_text(
+        json.dumps(serialized, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+page_step_cache.update(_load_page_step_cache_from_disk())
 
 
 def get_cached_page_main_steps(set_num: str, page: int) -> Optional[List[int]]:
     cached = page_step_cache.get((str(set_num), int(page)))
     if cached is None:
         return None
+    print(f"CACHE HIT {set_num}-{page}")
     return list(cached)
 
 
@@ -25,6 +77,8 @@ def store_cached_page_main_steps(
         }
     )
     page_step_cache[(str(set_num), int(page))] = list(normalized)
+    _save_page_step_cache_to_disk()
+    print(f"CACHE MISS STORE {set_num}-{page}")
     return list(normalized)
 
 
