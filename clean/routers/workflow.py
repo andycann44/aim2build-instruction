@@ -1476,7 +1476,7 @@ def api_bag_step_ranges(
     set_num: str = Query(...),
     start_bag: Optional[int] = Query(None, ge=1),
     end_bag: Optional[int] = Query(None, ge=1),
-    max_pages: int = Query(10, ge=1),
+    max_pages: int = Query(5, ge=1),
 ):
     pages_dir = debug_service._find_latest_pages_dir_for_set(set_num)
     if pages_dir is None:
@@ -1484,96 +1484,65 @@ def api_bag_step_ranges(
 
     pages = _list_rendered_pages(pages_dir)
     last_page = int(pages[-1]) if pages else None
-    bag_truth = sorted(
+    all_bag_truth = sorted(
         bag_truth_store.get_bag_truth(set_num),
         key=lambda item: (
             int(item.get("bag_number", 0) or 0),
             int(item.get("start_page", 0) or 0),
         ),
     )
-    if start_bag is not None:
-        bag_truth = [
-            item for item in bag_truth if int(item.get("bag_number", 0) or 0) >= int(start_bag)
-        ]
-    if end_bag is not None:
-        bag_truth = [
-            item for item in bag_truth if int(item.get("bag_number", 0) or 0) <= int(end_bag)
-        ]
 
     configure_pages_dir(str(pages_dir))
-    bag_ranges = []
-    total_bags_requested = len(bag_truth)
-    pages_scanned = 0
-    stopped_early = False
-    next_bag_number = None
-    progress = {
-        "current_bag_number": None,
-        "current_page": None,
-        "total_bags_requested": total_bags_requested,
-    }
+    bag_step_ranges = []
+    for index, item in enumerate(all_bag_truth):
+        bag_number = int(item.get("bag_number", 0) or 0)
+        start_page = int(item.get("start_page", 0) or 0)
+        if bag_number <= 0 or start_page <= 0:
+            continue
+        if start_bag is not None and bag_number < int(start_bag):
+            continue
+        if end_bag is not None and bag_number > int(end_bag):
+            continue
 
-    for index, item in enumerate(bag_truth):
-        if pages_scanned >= int(max_pages):
-            stopped_early = True
-            next_bag_number = int(item["bag_number"])
-            progress["current_bag_number"] = int(item["bag_number"])
-            progress["current_page"] = int(item["start_page"])
-            break
-
-        bag_number = int(item["bag_number"])
-        start_page = int(item["start_page"])
         next_start_page = (
-            int(bag_truth[index + 1]["start_page"])
-            if index + 1 < len(bag_truth)
+            int(all_bag_truth[index + 1].get("start_page", 0) or 0)
+            if index + 1 < len(all_bag_truth)
             else None
         )
-        end_page = int(next_start_page) - 1 if next_start_page is not None else None
-        scan_end_page = end_page if end_page is not None else last_page
+        end_page = (
+            int(next_start_page) - 1
+            if next_start_page is not None and int(next_start_page) > 0
+            else int(last_page) if last_page is not None else start_page
+        )
+        if int(end_page) < start_page:
+            end_page = start_page
 
         main_step_values = []
-        if scan_end_page is not None and int(scan_end_page) >= start_page:
-            for page in pages:
-                if int(page) < start_page:
-                    continue
-                if int(page) > int(scan_end_page):
-                    break
-                if pages_scanned >= int(max_pages):
-                    stopped_early = True
-                    next_bag_number = bag_number
-                    progress["current_bag_number"] = bag_number
-                    progress["current_page"] = int(page)
-                    break
-                progress["current_bag_number"] = bag_number
-                progress["current_page"] = int(page)
-                pages_scanned += 1
-                main_step_values.extend(_load_page_main_steps(set_num, int(page)))
+        pages_in_range = [
+            int(page)
+            for page in pages
+            if start_page <= int(page) <= int(end_page)
+        ]
+        pages_to_scan = pages_in_range[: int(max_pages)]
+        for page in pages_to_scan:
+            main_step_values.extend(_load_page_main_steps(set_num, int(page)))
 
-        result_end_page = end_page
-        if stopped_early and progress.get("current_page") is not None:
-            result_end_page = int(progress["current_page"]) - 1
-
-        bag_ranges.append(
+        bag_step_ranges.append(
             {
                 "bag_number": bag_number,
                 "start_page": start_page,
-                "end_page": result_end_page,
+                "end_page": int(end_page),
                 "start_step": (
                     int(min(main_step_values)) if main_step_values else None
                 ),
                 "end_step": int(max(main_step_values)) if main_step_values else None,
+                "pages_scanned": len(pages_to_scan),
             }
         )
-        if stopped_early:
-            break
 
     return {
         "set_num": str(set_num),
-        "bag_ranges": bag_ranges,
-        "pages_scanned": int(pages_scanned),
-        "max_pages": int(max_pages),
-        "stopped_early": bool(stopped_early),
-        "next_bag_number": next_bag_number,
-        "progress": progress,
+        "bag_step_ranges": bag_step_ranges,
     }
 
 
