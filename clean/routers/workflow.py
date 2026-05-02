@@ -13,6 +13,7 @@ from clean.services import (
     bag_truth_store,
     workflow_service,
     debug_service,
+    inventory_scan_service,
     step_detector_service,
     step_sequence_bag_service,
 )
@@ -1294,6 +1295,25 @@ def api_bag_truth(
         "saved_truth": bag_truth_store.get_bag_truth(set_num),
         "conflicts": bag_truth_store.get_conflicts(set_num),
     }
+
+
+@router.get("/api/instruction-inventory-scan")
+def api_instruction_inventory_scan(
+    set_num: str = Query(...),
+    start: int = Query(..., ge=1),
+    end: int = Query(..., ge=1),
+):
+    if int(end) < int(start):
+        raise HTTPException(status_code=400, detail="end must be >= start")
+
+    try:
+        return inventory_scan_service.scan_instruction_inventory(
+            set_num=set_num,
+            start=int(start),
+            end=int(end),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/api/bag-candidate-report")
