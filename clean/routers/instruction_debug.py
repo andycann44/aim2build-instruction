@@ -39,6 +39,13 @@ def _label_store_path(set_num: str, bag: int) -> Path:
     )
 
 
+def _training_export_path(set_num: str, bag: int) -> Path:
+    return Path("/Users/olly/aim2build-instruction/debug/training_data") / _coerce_label_filename(
+        set_num,
+        bag,
+    )
+
+
 def _catalog_db_path() -> Path:
     return Path("/Users/olly/aim2build-instruction/debug/server_catalog/lego_catalog.db")
 
@@ -817,6 +824,13 @@ def _build_export_training_payload(set_num: str, bag: int) -> Dict[str, Any]:
     }
 
 
+def _write_export_training_payload(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
 @router.post("/debug/save-label")
 async def save_label(req: Request):
     data = await req.json()
@@ -1154,6 +1168,11 @@ def export_training_data(
 ):
     bag_number = int(bag or 1)
     payload = _build_export_training_payload(set_num, bag_number)
+    export_path = _training_export_path(
+        str(payload.get("set_num") or set_num),
+        int(payload.get("bag", bag_number) or bag_number),
+    )
+    _write_export_training_payload(export_path, payload)
     filename = _coerce_label_filename(str(payload.get("set_num") or set_num), int(payload.get("bag", bag_number)))
     export_name = filename.replace(".json", "_export.json")
     return JSONResponse(
