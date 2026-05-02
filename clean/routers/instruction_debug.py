@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from clean.routers.debug import (
     _build_material_crop_candidates,
@@ -770,6 +770,53 @@ def _build_crop_image_html(crop: Dict[str, Any]) -> str:
     )
 
 
+def _build_export_training_payload(set_num: str, bag: int) -> Dict[str, Any]:
+    path = _label_store_path(set_num, bag)
+    existing = _load_existing_labels(path)
+    examples: List[Dict[str, Any]] = []
+
+    for crop_id, crop_data in sorted(
+        dict(existing.get("crops") or {}).items(),
+        key=lambda item: (
+            int((item[1] or {}).get("page", 0) or 0),
+            int((item[1] or {}).get("step", 0) or 0),
+            str(item[0] or ""),
+        ),
+    ):
+        crop_record = crop_data if isinstance(crop_data, dict) else {}
+        for part_data in list(crop_record.get("parts", []) or []):
+            part_entry = _normalize_part_entry(part_data if isinstance(part_data, dict) else {})
+            if not part_entry["part_num"]:
+                continue
+            examples.append(
+                {
+                    "crop_id": str(crop_id or ""),
+                    "page": int(crop_record.get("page", 0) or 0),
+                    "step": int(crop_record.get("step", 0) or 0),
+                    "crop_image_path": str(crop_record.get("crop_image_path") or ""),
+                    "part_num": str(part_entry.get("part_num") or ""),
+                    "color_id": int(part_entry.get("color_id", 0) or 0),
+                    "color_name": str(part_entry.get("color_name") or "n/a"),
+                    "qty": _coerce_int(part_entry.get("qty")) or 1,
+                    "qty_text": str(part_entry.get("qty_text") or ""),
+                    "metallic_mode": bool(
+                        crop_record.get("metallic_mode")
+                        or crop_record.get("manual_metallic_mode")
+                    ),
+                }
+            )
+
+    for example in examples:
+        if not example["qty_text"]:
+            example["qty_text"] = f"{int(example['qty'])}x"
+
+    return {
+        "set_num": str(existing.get("set_num") or str(set_num or "").strip() or "70618"),
+        "bag": max(1, int(existing.get("bag", bag) or bag or 1)),
+        "examples": examples,
+    }
+
+
 @router.post("/debug/save-label")
 async def save_label(req: Request):
     data = await req.json()
@@ -1098,6 +1145,21 @@ async def update_crop_qty(req: Request):
     crop_record["annotated_at"] = _iso_now()
     _write_labels(path, existing)
     return {"ok": True, "path": str(path), "crop": existing["crops"].get(crop_id)}
+
+
+@router.get("/debug/export-training-data")
+def export_training_data(
+    set_num: str = Query(...),
+    bag: Optional[int] = Query(None, ge=1),
+):
+    bag_number = int(bag or 1)
+    payload = _build_export_training_payload(set_num, bag_number)
+    filename = _coerce_label_filename(str(payload.get("set_num") or set_num), int(payload.get("bag", bag_number)))
+    export_name = filename.replace(".json", "_export.json")
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'inline; filename="{export_name}"'},
+    )
 
 
 @router.get("/debug/instruction-buildability", response_class=HTMLResponse)
@@ -1568,6 +1630,12 @@ def instruction_buildability(
           align-items: center;
           gap: 10px;
           flex-wrap: wrap;
+        }}
+        .toolbar-link {{
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          text-decoration: none;
         }}
         .parts-grid {{
           display: grid;
@@ -2199,6 +2267,12 @@ def instruction_buildability(
           <div class="crop-panel-head">
             <h2>Detected Callout Crops</h2>
             <div class="crop-toolbar">
+              <a
+                class="remove-btn toolbar-link"
+                href="/debug/export-training-data?set_num={escape(str(set_num))}&bag={int(bag_number)}"
+                target="_blank"
+                rel="noopener noreferrer"
+              >Export Training Data</a>
               <button type="button" class="remove-btn" onclick="goToNextCrop()">Next crop</button>
               <label class="hidden-toggle" for="show-hidden-crops">
                 <input id="show-hidden-crops" type="checkbox" onchange="setShowHiddenCrops(this.checked)" />
