@@ -1614,17 +1614,28 @@ def _extract_detected_qty_details_from_crop(crop_img) -> Dict[str, Any]:
         for match in raw_matches:
             normalized_texts.append(re.sub(r"\s+", "", str(match).lower()))
 
-    seen_texts: set[str] = set()
+    # Count occurrences per unique text using bounding-box tokens only.
+    # The raw-text regex can match the same label multiple times from a single
+    # OCR string (e.g. "8x 8x" → 2 regex hits from one label), so using it for
+    # counting would inflate duplicates. Positional tokens are the ground truth.
+    from collections import Counter as _Counter
+    full_texts: List[str] = []
+    for token in (_extract_qty_tokens_from_image(crop_img) or []):
+        t = re.sub(r"\s+", "", str(token.get("text", "") or "").lower())
+        if re.match(r"^\d+x$", t) or re.match(r"^x\d+$", t):
+            full_texts.append(t)
+    full_counts = _Counter(full_texts)
+
     detected_qty_text: List[str] = []
     detected_qty_numbers: List[int] = []
-    for text in normalized_texts:
-        if text in seen_texts:
-            continue
-        seen_texts.add(text)
-        detected_qty_text.append(text)
+    # Use only positional tokens detected by OCR on the full crop image.
+    # Each entry in full_texts corresponds to one visually detected label.
+    for text in full_texts:
         number_match = re.search(r"(\d{1,2})", text)
-        if number_match is not None:
-            detected_qty_numbers.append(int(number_match.group(1)))
+        qty_val = int(number_match.group(1)) if number_match else None
+        detected_qty_text.append(text)
+        if qty_val is not None:
+            detected_qty_numbers.append(qty_val)
 
     return {
         "detected_qty_text": detected_qty_text,

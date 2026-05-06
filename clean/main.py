@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from clean.routers import home, analyzer_scan, instruction_debug, sequence, debug, load_set, set_scan, workflow, debug_truth, step_debug, step_bag_scan, step_bag_openai_scan, gap_scan
 from clean.routers import gap_review
+from clean.routers import callout_crop_lab
 
 app = FastAPI()
 
@@ -19,6 +20,7 @@ app.include_router(step_debug.router)
 app.include_router(step_bag_scan.router)
 app.include_router(step_bag_openai_scan.router)
 app.include_router(instruction_debug.router)
+app.include_router(callout_crop_lab.router)
 
 @app.get("/health")
 def health():

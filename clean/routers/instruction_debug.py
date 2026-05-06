@@ -1,5 +1,7 @@
+import base64
 from html import escape
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +9,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import cv2
+import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -16,7 +19,9 @@ from clean.routers.debug import (
     _encode_contact_sheet_crop,
     _encode_debug_image_data_uri,
     _extract_detected_qty_details_from_crop,
+    _require_openai_vision_client_debug,
     _resolve_bag_page_range,
+    _response_text_to_json_debug,
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.instruction_buildability_source import load_instruction_set_parts
@@ -195,6 +200,327 @@ def _extract_qty_from_text(value: Any) -> Optional[int]:
         return None
     digits = "".join(ch for ch in text if ch.isdigit())
     return _coerce_int(digits)
+
+
+def _safe_crop_bounds(x1: int, y1: int, x2: int, y2: int, width: int, height: int) -> Optional[List[int]]:
+    x1 = max(0, min(int(x1), int(width)))
+    y1 = max(0, min(int(y1), int(height)))
+    x2 = max(0, min(int(x2), int(width)))
+    y2 = max(0, min(int(y2), int(height)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _yellow_ratio_bgr(crop_img: Any) -> float:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return 0.0
+        hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+        mask = (
+            (hsv[:, :, 0] >= 15)
+            & (hsv[:, :, 0] <= 45)
+            & (hsv[:, :, 1] > 35)
+            & (hsv[:, :, 2] > 120)
+        )
+        return float(mask.mean())
+    except Exception:
+        return 0.0
+
+
+def _detect_callout_rect_by_edges(
+    img: Any,
+    search_box: List[int],
+    step_y: int,
+    page_width: int,
+    page_height: int,
+) -> Optional[List[int]]:
+    """Find a blue callout rectangle in a local search box using horizontal border lines.
+
+    Returns [x, y, w, h] in page coordinates. This is debug-only and deliberately
+    conservative: if unsure it returns None so the existing fallback can run.
+    """
+    try:
+        bounds = _safe_crop_bounds(search_box[0], search_box[1], search_box[2], search_box[3], page_width, page_height)
+        if bounds is None:
+            return None
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return None
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 35, 110)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180.0,
+            threshold=35,
+            minLineLength=70,
+            maxLineGap=14,
+        )
+        if lines is None:
+            return None
+
+        groups: List[Dict[str, int]] = []
+        for raw in lines:
+            x1, y1, x2, y2 = [int(v) for v in raw[0]]
+            if abs(y1 - y2) > 5:
+                continue
+            length = abs(x2 - x1)
+            if length < 70:
+                continue
+            y = int(round((y1 + y2) / 2.0))
+            lx = min(x1, x2)
+            rx = max(x1, x2)
+            matched = False
+            for group in groups:
+                if abs(group["y"] - y) <= 7:
+                    group["y"] = int(round((group["y"] + y) / 2.0))
+                    group["x1"] = min(group["x1"], lx)
+                    group["x2"] = max(group["x2"], rx)
+                    matched = True
+                    break
+            if not matched:
+                groups.append({"y": y, "x1": lx, "x2": rx})
+
+        groups.sort(key=lambda item: item["y"])
+        best: Optional[List[int]] = None
+        best_score = 10**9
+        for top_idx, top in enumerate(groups):
+            for bottom in groups[top_idx + 1 :]:
+                box_h = int(bottom["y"] - top["y"])
+                if box_h < 38 or box_h > 210:
+                    continue
+                left = max(0, min(top["x1"], bottom["x1"]) - 8)
+                right = min(roi.shape[1], max(top["x2"], bottom["x2"]) + 8)
+                box_w = int(right - left)
+                if box_w < 110 or box_w > 620:
+                    continue
+                top_y = max(0, int(top["y"]) - 20)
+                bottom_y = min(roi.shape[0], int(bottom["y"]) + 8)
+                ax = int(sx1 + left)
+                ay = int(sy1 + top_y)
+                bx = int(sx1 + right)
+                by = int(sy1 + bottom_y)
+                if by > int(step_y) - 5:
+                    by = int(step_y) - 5
+                if bx <= ax or by <= ay:
+                    continue
+                crop = img[ay:by, ax:bx]
+                if crop is None or crop.size == 0:
+                    continue
+                if _yellow_ratio_bgr(crop) > 0.18:
+                    continue
+                score = abs(int(step_y) - by) + abs((ax + bx) // 2 - (search_box[0] + search_box[2]) // 2) // 5
+                if score < best_score:
+                    best_score = score
+                    best = [ax, ay, bx - ax, by - ay]
+        return best
+    except Exception:
+        return None
+
+
+def _estimate_visible_part_count_from_crop(crop_img: Any) -> int:
+    """Estimate visible part count from contrast against callout background.
+
+    This is intentionally conservative. It is used only to create slots when OCR
+    found no qty labels at all, avoiding the previous bad behaviour of inventing
+    repeated qtys from crop width.
+    """
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return 0
+        h, w = crop_img.shape[:2]
+        if h <= 0 or w <= 0:
+            return 0
+        # Estimate pale callout background from border pixels, then find pixels far from it.
+        border = np.concatenate([
+            crop_img[: max(1, h // 12), :, :].reshape(-1, 3),
+            crop_img[max(0, h - max(1, h // 12)) :, :, :].reshape(-1, 3),
+            crop_img[:, : max(1, w // 12), :].reshape(-1, 3),
+            crop_img[:, max(0, w - max(1, w // 12)) :, :].reshape(-1, 3),
+        ], axis=0)
+        bg = np.median(border.astype(np.float32), axis=0)
+        diff = np.linalg.norm(crop_img.astype(np.float32) - bg.reshape(1, 1, 3), axis=2)
+        mask = (diff > 30).astype(np.uint8) * 255
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        roi_area = float(max(1, h * w))
+        count = 0
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < 55 or area > roi_area * 0.22:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw < 7 or bh < 7:
+                continue
+            if bw > w * 0.80 and bh < 18:
+                continue
+            if bh > h * 0.80 and bw < 18:
+                continue
+            count += 1
+        return max(0, min(count, 12))
+    except Exception:
+        return 0
+
+
+def _auto_qty_payload_for_crop(crop_img: Any, step_number: int) -> Dict[str, List[Any]]:
+    """Extract qty text for auto crops and filter step-number contamination.
+
+    If OCR completely fails, create a conservative default slot per visible part.
+    """
+    payload = _extract_detected_qty_details_from_crop(crop_img)
+    texts = _coerce_str_list(payload.get("detected_qty_text", []))
+    nums = _coerce_int_list(payload.get("detected_qty_numbers", []))
+    clean_texts: List[str] = []
+    clean_nums: List[int] = []
+    for text, num in zip(texts, nums):
+        if step_number and int(num) == int(step_number):
+            continue
+        clean_texts.append(str(text))
+        clean_nums.append(int(num))
+
+    if clean_nums:
+        return {"detected_qty_text": clean_texts, "detected_qty_numbers": clean_nums}
+
+    count = _estimate_visible_part_count_from_crop(crop_img)
+    if count <= 0:
+        return {"detected_qty_text": [], "detected_qty_numbers": []}
+    return {
+        "detected_qty_text": ["1x"] * count,
+        "detected_qty_numbers": [1] * count,
+    }
+
+
+def _ai_qty_payload_for_crop(
+    crop_img: Any,
+    set_num: str,
+    page: int,
+    step_number: int,
+) -> Optional[Dict[str, List[Any]]]:
+    try:
+        trim_issue = ""
+        trimmed_crop = None
+        if crop_img is not None and getattr(crop_img, "size", 0) != 0:
+            height, width = crop_img.shape[:2]
+            if height > 0 and width > 0:
+                hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+                yellow_mask = (
+                    (hsv[:, :, 0] >= 15)
+                    & (hsv[:, :, 0] <= 45)
+                    & (hsv[:, :, 1] > 25)
+                    & (hsv[:, :, 2] > 120)
+                )
+                col_ratio = yellow_mask.mean(axis=0)
+                band_cols = np.where(col_ratio > 0.20)[0]
+                if len(band_cols) > 0:
+                    band_start = int(band_cols[0])
+                    if band_start >= int(width * 0.40):
+                        trim_x = max(1, band_start - 4)
+                        if trim_x < width:
+                            trimmed_crop = crop_img[:, :trim_x]
+                            trim_issue = "includes yellow substep panel"
+    except Exception:
+        trimmed_crop = None
+        trim_issue = ""
+
+    try:
+        client = _require_openai_vision_client_debug()
+    except Exception as exc:
+        return {
+            "detected_qty_text": [],
+            "detected_qty_numbers": [],
+            "qty_source": "needs_adjust",
+            "ai_part_count": None,
+            "ai_issues": [f"OpenAI unavailable: {str(exc)}"],
+        }
+
+    def _issue_list(result: Any) -> List[str]:
+        return [str(value) for value in list((result or {}).get("issues", []) or []) if str(value or "").strip()]
+
+    def _needs_adjust_result(result: Any) -> bool:
+        issues_text = " ".join(_issue_list(result)).lower()
+        return (
+            bool(result is None)
+            or result.get("box_ok") is not True
+            or "yellow" in issues_text
+            or "substep" in issues_text
+            or "too loose" in issues_text
+        )
+
+    ai_result: Optional[Dict[str, Any]] = None
+    try:
+        ok, buf = cv2.imencode(".png", crop_img)
+        if not ok:
+            raise RuntimeError("Could not encode crop image")
+        response = client.responses.create(
+            model=os.getenv("OPENAI_VISION_MODEL", "gpt-4.1"),
+            input=[{"role": "user", "content": [{"type": "input_text", "text": ("Check this LEGO callout crop. Return JSON only with box_ok, part_count, qty_labels, crop_box, issues. If the crop is too loose, crop_box must be the correct blue callout box inside this image, normalized 0..1, excluding yellow substep panels and the big step number. Set number: %s. Page: %d. Step: %d.") % (set_num, int(page), int(step_number))}, {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii"), "detail": "high"}]}],
+            text={"format": {"type": "json_schema", "name": "lego_callout_crop_debug", "strict": True, "schema": {"type": "object", "additionalProperties": False, "properties": {"box_ok": {"type": "boolean"}, "part_count": {"type": "integer"}, "qty_labels": {"type": "array", "items": {"type": "string"}}, "crop_box": {"type": ["object", "null"], "additionalProperties": False, "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"}}, "required": ["x", "y", "w", "h"]}, "issues": {"type": "array", "items": {"type": "string"}}}, "required": ["box_ok", "part_count", "qty_labels", "crop_box", "issues"]}}},
+        )
+        ai_result = _response_text_to_json_debug(response)
+    except Exception as exc:
+        ai_result = {
+            "box_ok": False,
+            "part_count": None,
+            "qty_labels": [],
+            "crop_box": None,
+            "issues": [f"OpenAI failed: {str(exc)}"],
+        }
+
+    if trimmed_crop is not None and _needs_adjust_result(ai_result):
+        try:
+            ok, buf = cv2.imencode(".png", trimmed_crop)
+            if not ok:
+                raise RuntimeError("Could not encode crop image")
+            response = client.responses.create(
+                model=os.getenv("OPENAI_VISION_MODEL", "gpt-4.1"),
+                input=[{"role": "user", "content": [{"type": "input_text", "text": ("Check this LEGO callout crop. Return JSON only with box_ok, part_count, qty_labels, crop_box, issues. If the crop is too loose, crop_box must be the correct blue callout box inside this image, normalized 0..1, excluding yellow substep panels and the big step number. Set number: %s. Page: %d. Step: %d.") % (set_num, int(page), int(step_number))}, {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii"), "detail": "high"}]}],
+                text={"format": {"type": "json_schema", "name": "lego_callout_crop_debug", "strict": True, "schema": {"type": "object", "additionalProperties": False, "properties": {"box_ok": {"type": "boolean"}, "part_count": {"type": "integer"}, "qty_labels": {"type": "array", "items": {"type": "string"}}, "crop_box": {"type": ["object", "null"], "additionalProperties": False, "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"}}, "required": ["x", "y", "w", "h"]}, "issues": {"type": "array", "items": {"type": "string"}}}, "required": ["box_ok", "part_count", "qty_labels", "crop_box", "issues"]}}},
+            )
+            ai_result = _response_text_to_json_debug(response)
+        except Exception as exc:
+            ai_result = {
+                "box_ok": False,
+                "part_count": None,
+                "qty_labels": [],
+                "crop_box": None,
+                "issues": [trim_issue or "includes yellow substep panel", f"OpenAI failed: {str(exc)}"],
+            }
+
+    if _needs_adjust_result(ai_result):
+        issues = _issue_list(ai_result)
+        if trim_issue and not any(trim_issue.lower() in issue.lower() for issue in issues):
+            issues.append(trim_issue)
+        return {
+            "detected_qty_text": [],
+            "detected_qty_numbers": [],
+            "qty_source": "needs_adjust",
+            "ai_part_count": ai_result.get("part_count"),
+            "ai_issues": issues or ["needs_adjust"],
+            "ai_crop_box": ai_result.get("crop_box"),
+            "ai_suggested_fix": bool(ai_result.get("crop_box")),
+        }
+
+    qty_labels = [str(value) for value in list(ai_result.get("qty_labels", []) or []) if str(value or "").strip()]
+    qty_numbers: List[int] = []
+    for label in qty_labels:
+        match = re.match(r"^\s*(\d+)\s*x\s*$", str(label), flags=re.IGNORECASE)
+        if match:
+            qty_numbers.append(int(match.group(1)))
+
+    return {
+        "detected_qty_text": qty_labels,
+        "detected_qty_numbers": qty_numbers,
+        "qty_source": "openai",
+        "ai_part_count": int(ai_result.get("part_count", 0) or 0),
+        "ai_issues": _issue_list(ai_result),
+        "ai_crop_box": ai_result.get("crop_box"),
+        "ai_suggested_fix": False,
+    }
 
 
 def _build_qty_sequence(qty_values: Any, qty_text_values: Any) -> List[Dict[str, Any]]:
@@ -663,7 +989,7 @@ def _write_labels(path: Path, payload: Dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
-def _build_instruction_callout_crops(set_num: str, bag: int) -> List[Dict[str, Any]]:
+def _build_instruction_callout_crops(set_num: str, bag: int, ai_enabled: bool = False) -> List[Dict[str, Any]]:
     rendered_pages, start_page, end_page = _resolve_bag_page_range(str(set_num), int(bag))
     crops: List[Dict[str, Any]] = []
 
@@ -697,18 +1023,138 @@ def _build_instruction_callout_crops(set_num: str, bag: int) -> List[Dict[str, A
             and bool(item.get("match_enabled"))
         ]
 
+        # Robust debug fallback: when the existing material crop pipeline finds
+        # no strict callout boxes, detect the blue callout rectangle directly
+        # above each detected step number.  This keeps the step number out of
+        # the crop and gives the OCR/slot code a much cleaner image.
+        if not callout_candidates:
+            for sb_idx, step_box in enumerate(step_boxes or [], start=1):
+                try:
+                    sx = int(step_box.get("x", 0) or 0)
+                    sy = int(step_box.get("y", 0) or 0)
+                    sw = int(step_box.get("w", 0) or 0)
+                    sh = int(step_box.get("h", 0) or 0)
+                except Exception:
+                    continue
+                if sw <= 0 or sh <= 0:
+                    continue
+                step_number = int(step_box.get("step_number", 0) or 0)
+                search_x1 = max(0, sx - 35)
+                search_y1 = max(0, sy - 290)
+                search_x2 = min(page_width, sx + sw + 690)
+                search_y2 = max(0, min(page_height, sy - 5))
+                if search_y2 <= search_y1 or search_x2 <= search_x1:
+                    continue
+
+                rect = _detect_callout_rect_by_edges(
+                    img,
+                    [search_x1, search_y1, search_x2, search_y2],
+                    step_y=sy,
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+
+                if rect is not None:
+                    rx, ry, rw, rh = [int(v) for v in rect]
+                    crop_img = img[ry : ry + rh, rx : rx + rw]
+                    if crop_img is None or crop_img.size == 0:
+                        continue
+                    try:
+                        data_uri = _encode_debug_image_data_uri(crop_img, max_width=420)
+                    except Exception:
+                        continue
+                    qty_payload = _auto_qty_payload_for_crop(crop_img, step_number)
+                    callout_candidates.append(
+                        {
+                            "candidate_origin": "callout_box_candidate",
+                            "match_enabled": True,
+                            "data_uri": data_uri,
+                            "coords_xywh": [rx, ry, rw, rh],
+                            "coords_label": "edge detected callout",
+                            "confidence": 0.45,
+                            "step_number": step_number,
+                            "detected_qty_text": qty_payload.get("detected_qty_text", []),
+                            "detected_qty_numbers": qty_payload.get("detected_qty_numbers", []),
+                        }
+                    )
+                    continue
+
+                # Last resort: show a conservative region above the step number
+                # so the debug workflow never goes completely empty.
+                bounds = _safe_crop_bounds(search_x1, search_y1, search_x2, search_y2, page_width, page_height)
+                if bounds is None:
+                    continue
+                fx1, fy1, fx2, fy2 = bounds
+                crop_img = img[fy1:fy2, fx1:fx2]
+                if crop_img is None or crop_img.size == 0:
+                    continue
+                if _yellow_ratio_bgr(crop_img) > 0.18:
+                    continue
+                try:
+                    data_uri = _encode_debug_image_data_uri(crop_img, max_width=420)
+                except Exception:
+                    continue
+                qty_payload = _auto_qty_payload_for_crop(crop_img, step_number)
+                callout_candidates.append(
+                    {
+                        "candidate_origin": "step_box_fallback",
+                        "match_enabled": True,
+                        "data_uri": data_uri,
+                        "coords_xywh": [fx1, fy1, fx2 - fx1, fy2 - fy1],
+                        "coords_label": "step box fallback",
+                        "confidence": 0.25,
+                        "step_number": step_number,
+                        "detected_qty_text": qty_payload.get("detected_qty_text", []),
+                        "detected_qty_numbers": qty_payload.get("detected_qty_numbers", []),
+                    }
+                )
+
         for idx, candidate in enumerate(callout_candidates, start=1):
             step_number = int(candidate.get("step_number", 0) or 0)
+            qty_payload: Dict[str, Any] = {
+                "detected_qty_text": list(candidate.get("detected_qty_text", []) or []),
+                "detected_qty_numbers": list(candidate.get("detected_qty_numbers", []) or []),
+                "qty_source": "local",
+                "ai_part_count": None,
+                "ai_issues": [],
+                "ai_crop_box": None,
+                "ai_suggested_fix": False,
+            }
+            if ai_enabled:
+                crop_box = _coerce_box_list(candidate.get("coords_xywh"))
+                if crop_box is not None:
+                    x = int(crop_box[0] or 0)
+                    y = int(crop_box[1] or 0)
+                    w = int(crop_box[2] or 0)
+                    h = int(crop_box[3] or 0)
+                    if w > 0 and h > 0:
+                        ai_qty_payload = _ai_qty_payload_for_crop(
+                            img[y : y + h, x : x + w],
+                            str(set_num),
+                            int(page),
+                            int(step_number),
+                        )
+                        if ai_qty_payload is not None:
+                            qty_payload = ai_qty_payload
             detected_qty_text = [
                 str(value)
-                for value in list(candidate.get("detected_qty_text", []) or [])
+                for value in list(qty_payload.get("detected_qty_text", []) or [])
                 if str(value or "").strip()
             ]
             detected_qty_numbers = [
                 int(value)
-                for value in list(candidate.get("detected_qty_numbers", []) or [])
+                for value in list(qty_payload.get("detected_qty_numbers", []) or [])
                 if str(value).strip()
             ]
+            # Final safety: do not allow OCR to turn the step number into a qty.
+            if step_number and str(qty_payload.get("qty_source") or "local") != "openai":
+                clean_pairs = [
+                    (text, number)
+                    for text, number in zip(detected_qty_text, detected_qty_numbers)
+                    if int(number) != int(step_number)
+                ]
+                detected_qty_text = [text for text, _ in clean_pairs]
+                detected_qty_numbers = [number for _, number in clean_pairs]
             crop_id = f"p{int(page)}_s{max(step_number, 0)}_c{idx}"
             crops.append(
                 {
@@ -718,8 +1164,13 @@ def _build_instruction_callout_crops(set_num: str, bag: int) -> List[Dict[str, A
                     "qty_text": detected_qty_text,
                     "qty_numbers": detected_qty_numbers,
                     "qty_label": ", ".join(detected_qty_text) if detected_qty_text else "none",
+                    "qty_source": str(qty_payload.get("qty_source") or "local"),
+                    "ai_part_count": qty_payload.get("ai_part_count"),
+                    "ai_issues": list(qty_payload.get("ai_issues", []) or []),
+                    "ai_crop_box": qty_payload.get("ai_crop_box"),
+                    "ai_suggested_fix": bool(qty_payload.get("ai_suggested_fix")),
                     "data_uri": str(candidate.get("data_uri") or ""),
-                    "coords_label": str(candidate.get("coords_label") or ""),
+                    "coords_label": str(candidate.get("coords_label") or candidate.get("candidate_origin") or "fallback crop"),
                     "crop_box": list(candidate.get("coords_xywh", []) or []),
                     "crop_box_format": "xywh",
                     "crop_image_path": str(image_path),
@@ -728,7 +1179,6 @@ def _build_instruction_callout_crops(set_num: str, bag: int) -> List[Dict[str, A
             )
 
     return crops
-
 
 def _build_manual_crop_pages(set_num: str, bag: int) -> List[Dict[str, Any]]:
     rendered_pages, start_page, end_page = _resolve_bag_page_range(str(set_num), int(bag))
@@ -829,6 +1279,50 @@ def _write_export_training_payload(path: Path, payload: Dict[str, Any]) -> None:
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temp_path.replace(path)
+
+
+def _load_saved_training_examples(set_num: str, bag: int) -> List[Dict[str, Any]]:
+    path = _training_export_path(set_num, bag)
+    if not path.exists():
+        return []
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(loaded, dict):
+        return []
+
+    examples = loaded.get("examples")
+    if not isinstance(examples, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in examples:
+        if not isinstance(item, dict):
+            continue
+        part_num = str(item.get("part_num") or "").strip()
+        color_id = _coerce_int(item.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        normalized.append(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "crop_id": str(item.get("crop_id") or "").strip(),
+                "page": _coerce_int(item.get("page")),
+                "step": _coerce_int(item.get("step")),
+                "qty": _coerce_int(item.get("qty")),
+                "qty_text": str(item.get("qty_text") or "").strip(),
+                "metallic_mode": bool(item.get("metallic_mode")),
+            }
+        )
+    return normalized
 
 
 @router.post("/debug/save-label")
@@ -1185,6 +1679,7 @@ def export_training_data(
 def instruction_buildability(
     set_num: str = Query(...),
     bag: Optional[int] = Query(None, ge=1),
+    ai: Optional[int] = Query(0),
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
@@ -1206,9 +1701,10 @@ def instruction_buildability(
     )
     print(f"[debug] legoColors count: {len(lego_colors)}")
     lego_colors_warning = "No colors loaded from set part library" if not lego_colors else ""
+    training_examples = _load_saved_training_examples(str(set_num), bag_number)
     labels_path = _label_store_path(str(set_num), bag_number)
     labels_payload = _load_existing_labels(labels_path)
-    crops = _build_instruction_callout_crops(str(set_num), bag_number)
+    crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=int(ai or 0) == 1)
     manual_pages = _build_manual_crop_pages(str(set_num), bag_number)
     parts_by_key = {
         f"{str(part.get('part_num') or '').strip()}::{int(part.get('color_id', 0) or 0)}": part
@@ -1303,6 +1799,9 @@ def instruction_buildability(
             "qty_text": _coerce_str_list(crop_dict.get("qty_text", [])),
             "qty_numbers": _coerce_int_list(crop_dict.get("qty", [])),
             "qty_label": ", ".join(_coerce_str_list(crop_dict.get("qty_text", []))) or "none",
+            "qty_source": "local",
+            "ai_part_count": None,
+            "ai_issues": [],
             "data_uri": data_uri,
             "coords_label": coords_label,
             "crop_box": crop_box or [],
@@ -1390,6 +1889,9 @@ def instruction_buildability(
                 <strong>{escape(crop['crop_id'])}</strong><br/>
                 page {int(crop['page'])} | step {int(crop['step']) if int(crop['step']) > 0 else "?"}<br/>
                 qty: <span id="qty-label-{escape(crop['crop_id'])}">{escape(str(crop['qty_label']))}</span><br/>
+                qty source: {escape(str(crop.get('qty_source') or 'local'))}<br/>
+                ai part_count: {escape('—' if crop.get('ai_part_count') is None else str(crop.get('ai_part_count')))}<br/>
+                ai issues: {escape(', '.join(list(crop.get('ai_issues', []) or [])) or '—')}<br/>
                 slots: <span id="slots-label-{escape(crop['crop_id'])}">{int(crop.get('slot_filled', 0) or 0)} / {int(crop.get('slot_total', 0) or 0)} filled</span><br/>
                 next qty: <span id="next-qty-label-{escape(crop['crop_id'])}">{escape(str(crop.get('next_qty_label') or '1x'))}</span><br/>
                 status: <span id="status-label-{escape(crop['crop_id'])}" class="crop-status-label">{escape(str(crop.get('status') or 'needs_adjust'))}</span><br/>
@@ -1507,6 +2009,7 @@ def instruction_buildability(
     crops_json = json.dumps(crops)
     parts_json = json.dumps(parts)
     lego_colors_json = json.dumps(lego_colors)
+    training_examples_json = json.dumps(training_examples)
     html = f"""
     <!doctype html>
     <html>
@@ -2398,6 +2901,7 @@ def instruction_buildability(
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
+        window.trainingExamples = {training_examples_json};
         const colors = window.legoColors || [];
         const colorNameById = new Map();
         let activeCropId = null;
@@ -2409,6 +2913,15 @@ def instruction_buildability(
         function partKey(partNum, colorId) {{
           return String(partNum || "") + "::" + Number(colorId || 0);
         }}
+
+        const trainingExamplesByKey = new Map();
+        (window.trainingExamples || []).forEach((example) => {{
+          const key = partKey(example && example.part_num, example && example.color_id);
+          if (!trainingExamplesByKey.has(key)) {{
+            trainingExamplesByKey.set(key, []);
+          }}
+          trainingExamplesByKey.get(key).push(example);
+        }});
 
         function parseRgbHex(hex) {{
           if (!hex) {{
@@ -2445,6 +2958,44 @@ def instruction_buildability(
           const dg = leftG - rightG;
           const db = leftB - rightB;
           return Math.sqrt((dr * dr) + (dg * dg) + (db * db));
+        }}
+
+        function candidateSuggestionDistance(crop, colorId) {{
+          if (!crop || !crop.picked_rgb) {{
+            return Number.POSITIVE_INFINITY;
+          }}
+          const candidate = normalizedLegoColors.find((item) => Number(item && item.color_id) === Number(colorId || 0));
+          if (!candidate) {{
+            return Number.POSITIVE_INFINITY;
+          }}
+          return colorDistance(crop.picked_rgb, candidate);
+        }}
+
+        function trainingBoostMultiplier(crop, partNum, colorId, distanceScore) {{
+          const key = partKey(partNum, colorId);
+          const examples = trainingExamplesByKey.get(key) || [];
+          if (!examples.length) {{
+            return 1;
+          }}
+          if (!Number.isFinite(distanceScore) || distanceScore > 45) {{
+            return 1;
+          }}
+          const cropMetallicMode = metallicModeEnabled(crop);
+          const hasMatchingExample = examples.some((example) => {{
+            if (example && typeof example.metallic_mode === "boolean") {{
+              return example.metallic_mode === cropMetallicMode;
+            }}
+            return true;
+          }});
+          if (!hasMatchingExample) {{
+            return 1;
+          }}
+          console.log("training boost applied", {{
+            part_num: partNum,
+            color_id: colorId,
+            distance: distanceScore
+          }});
+          return 0.6;
         }}
 
         function closestLegoColorId(rgb) {{
@@ -3406,6 +3957,17 @@ def instruction_buildability(
               const key = partKey(part.part_num, colorId);
               const assignedQty = Number(assignedTotals.get(key) || 0);
               const remainingQty = setQty - assignedQty;
+              const distanceScore = candidateSuggestionDistance(crop, colorId);
+              let suggestionScore = Number.isFinite(distanceScore)
+                ? distanceScore
+                : (Number(colorOrder.get(colorId) || 0) + 1) * 1000;
+              if (metallicMode && metallicColourRank(part.color_name) === 0) {{
+                suggestionScore *= 0.7;
+              }}
+              if (remainingQty > 0) {{
+                suggestionScore *= 0.9;
+              }}
+              suggestionScore *= trainingBoostMultiplier(crop, part.part_num, colorId, distanceScore);
               return {{
                 part_num: String(part.part_num || ""),
                 color_id: colorId,
@@ -3421,11 +3983,14 @@ def instruction_buildability(
                 qty_rank: targetQty !== null && setQty >= targetQty ? 0 : 1,
                 image_rank: part.img_url ? 0 : 1,
                 used_rank: assignedKeys.has(key) ? 1 : 0,
+                distance_score: distanceScore,
+                suggestion_score: suggestionScore,
               }};
             }})
             .sort((left, right) => {{
               return (
                 left.remaining_rank - right.remaining_rank ||
+                left.suggestion_score - right.suggestion_score ||
                 left.metallic_rank - right.metallic_rank ||
                 left.color_rank - right.color_rank ||
                 left.qty_rank - right.qty_rank ||
@@ -4509,6 +5074,7 @@ def instruction_buildability(
           loadedColorsCount.textContent = String(colors.length);
         }}
         console.log("legoColors loaded", window.legoColors);
+        console.log("training examples loaded", window.trainingExamples);
 
         colors.forEach((candidate) => {{
           if (!colorNameById.has(candidate.color_id)) {{
