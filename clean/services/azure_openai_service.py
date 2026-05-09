@@ -1,0 +1,416 @@
+import base64
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import cv2
+
+from clean.routers.debug import _require_openai_vision_client_debug, _response_text_to_json_debug
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_box_list(value: Any) -> Optional[List[int]]:
+    if not isinstance(value, (list, tuple)):
+        return None
+    out: List[int] = []
+    for item in list(value)[:4]:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            return None
+    return out if len(out) == 4 else None
+
+
+def _encode_debug_image_data_uri(img: Any) -> Optional[str]:
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        return None
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _require_crop_ai_client() -> Any:
+    if os.getenv("AZURE_OPENAI_ENDPOINT"):
+        from openai import AzureOpenAI
+
+        return AzureOpenAI(
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_key=os.environ["AZURE_OPENAI_API_KEY"],
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-03-01-preview"),
+        )
+    return _require_openai_vision_client_debug()
+
+
+def _crop_ai_model_name() -> str:
+    if os.getenv("AZURE_OPENAI_ENDPOINT"):
+        return os.environ["AZURE_OPENAI_DEPLOYMENT"]
+    return os.getenv("OPENAI_VISION_MODEL", "gpt-4.1")
+
+
+def _azure_ai_rank_available() -> bool:
+    return bool(
+        os.getenv("AZURE_OPENAI_ENDPOINT")
+        and os.getenv("AZURE_OPENAI_API_KEY")
+        and os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    )
+
+
+def _ai_rank_is_ambiguous(candidates: List[Dict[str, Any]]) -> bool:
+    rows = list(candidates or [])
+    if len(rows) < 2:
+        return False
+    first = _coerce_float(rows[0].get("score"))
+    second = _coerce_float(rows[1].get("score"))
+    if first is None or second is None:
+        return False
+    return abs(first - second) <= 5.0
+
+
+def _ai_rank_is_low_confidence(candidates: List[Dict[str, Any]]) -> bool:
+    rows = list(candidates or [])
+    if not rows:
+        return False
+    top_score = _coerce_float(rows[0].get("score"))
+    return top_score is not None and top_score >= 25.0
+
+
+def _ai_rank_skip_reason(crop: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Optional[str]:
+    status = str(crop.get("status") or "").strip().lower()
+    review_status = str(crop.get("review_status") or "").strip().lower()
+    slot_filled = int(crop.get("slot_filled", 0) or 0)
+    slot_total = int(crop.get("slot_total", 0) or 0)
+    reviewed_good = status == "good" and review_status == "reviewed"
+    if reviewed_good and slot_total > 0 and slot_filled >= slot_total:
+        return "reviewed_good_complete"
+    if status == "needs_adjust":
+        return None
+    if slot_total > 0 and slot_filled < slot_total:
+        return None
+    if _ai_rank_is_ambiguous(candidates):
+        return None
+    if _ai_rank_is_low_confidence(candidates):
+        return None
+    return "ai_not_needed"
+
+
+def _input_image_url_for_debug_ref(image_ref: Any) -> Optional[str]:
+    text = str(image_ref or "").strip()
+    if not text:
+        return None
+    if text.startswith(("http://", "https://", "data:image/")):
+        return text
+    path = Path(text)
+    if not path.exists():
+        return None
+    img = cv2.imread(str(path))
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        return None
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _response_output_text_debug(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return str(output_text)
+    try:
+        response_dict = response.model_dump()
+    except Exception:
+        response_dict = None
+    if isinstance(response_dict, dict):
+        for item in response_dict.get("output", []):
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if content.get("type") == "output_text" and content.get("text"):
+                    return str(content.get("text") or "")
+    return ""
+
+
+def _dedupe_candidate_rows(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for candidate in list(candidates or []):
+        key = (
+            str(candidate.get("part_num") or "").strip(),
+            int(candidate.get("color_id", 0) or 0),
+            str(candidate.get("element_id") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _resolve_crop_image_for_ai_rank(crop: Dict[str, Any]) -> Dict[str, Any]:
+    data_uri = str(crop.get("data_uri") or "").strip()
+    if data_uri.startswith("data:image/"):
+        return {
+            "image_url": data_uri,
+            "source": "crop_data_uri",
+            "exists": True,
+        }
+    crop_image_path = str(crop.get("crop_image_path") or "").strip()
+    crop_box = _coerce_box_list(crop.get("crop_box"))
+    if not crop_image_path:
+        return {
+            "image_url": None,
+            "source": "missing",
+            "exists": False,
+        }
+    path = Path(crop_image_path)
+    if not path.exists():
+        return {
+            "image_url": None,
+            "source": "crop_image_path_missing",
+            "exists": False,
+        }
+    img = cv2.imread(str(path))
+    if img is None or getattr(img, "size", 0) == 0:
+        return {
+            "image_url": None,
+            "source": "crop_image_path_unreadable",
+            "exists": False,
+        }
+    cropped = img
+    source = "crop_image_path_full"
+    if crop_box is not None:
+        x, y, w, h = crop_box
+        x = max(0, int(x))
+        y = max(0, int(y))
+        w = max(1, int(w))
+        h = max(1, int(h))
+        x2 = min(img.shape[1], x + w)
+        y2 = min(img.shape[0], y + h)
+        if x < x2 and y < y2:
+            cropped = img[y:y2, x:x2]
+            source = "crop_image_path_xywh"
+    encoded = _encode_debug_image_data_uri(cropped)
+    return {
+        "image_url": str(encoded or "") or None,
+        "source": source,
+        "exists": bool(encoded),
+    }
+
+
+def rank_crop_candidates(
+    crop: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if stats is None:
+        stats = {
+            "enabled": True,
+            "calls": 0,
+            "images_sent": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "failures": 0,
+            "disabled": 0,
+        }
+    deduped_candidates = _dedupe_candidate_rows(list(candidates or []))
+    crop_image_info = _resolve_crop_image_for_ai_rank(crop)
+    candidate_img_urls = [
+        str(candidate.get("img_url") or "").strip()
+        for candidate in deduped_candidates
+        if str(candidate.get("img_url") or "").strip()
+    ]
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    azure_api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-03-01-preview")
+    skip_reason = _ai_rank_skip_reason(crop, deduped_candidates)
+    result: Dict[str, Any] = {
+        "enabled": False,
+        "best_part_num": None,
+        "best_color_id": None,
+        "best_element_id": None,
+        "confidence": None,
+        "reason": "",
+        "matched_index": None,
+        "raw_response_text": "",
+        "parsed_response_json": None,
+        "crop_image_included": False,
+        "candidate_images_included_count": 0,
+        "candidate_rows_preview": [],
+        "prompt_text": "",
+        "crop_image_source": str(crop_image_info.get("source") or "missing"),
+        "crop_image_exists": bool(crop_image_info.get("exists")),
+        "candidate_img_urls_count": len(candidate_img_urls),
+        "first_candidate_img_url": candidate_img_urls[0] if candidate_img_urls else "",
+        "provider_selected": "azure" if azure_endpoint else "none",
+        "azure_endpoint_present": bool(azure_endpoint),
+        "azure_api_key_present": bool(azure_api_key),
+        "azure_deployment_present": bool(azure_deployment),
+        "azure_api_version": str(azure_api_version),
+        "client_created": False,
+        "exception_type": "",
+        "exception_message": "",
+        "ai_skipped_reason": str(skip_reason or ""),
+    }
+    if skip_reason:
+        result["reason"] = f"AI skipped: {skip_reason}"
+        return result
+    crop_image_url = _input_image_url_for_debug_ref(crop_image_info.get("image_url"))
+    if not crop_image_url:
+        stats["failures"] = int(stats.get("failures", 0) or 0) + 1
+        result["reason"] = "Crop image missing."
+        return result
+    result["crop_image_included"] = True
+
+    candidate_rows: List[Dict[str, Any]] = []
+    prompt_text = (
+        "Choose the best LEGO part candidate for this callout crop. "
+        "Use only the provided crop image and up to 5 candidate element images. "
+        "Return JSON only with best_part_num, best_color_id, best_element_id, confidence, reason. "
+        "Do not invent candidates outside the provided list."
+    )
+    content: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": prompt_text},
+        {"type": "input_image", "image_url": crop_image_url, "detail": "high"},
+    ]
+    result["prompt_text"] = prompt_text
+    for idx, candidate in enumerate(deduped_candidates[:5], start=1):
+        image_url = _input_image_url_for_debug_ref(candidate.get("img_url"))
+        if not image_url:
+            continue
+        row = {
+            "index": idx,
+            "part_num": str(candidate.get("part_num") or "").strip(),
+            "color_id": int(candidate.get("color_id", 0) or 0),
+            "element_id": str(candidate.get("element_id") or "").strip() or None,
+            "candidate_source": str(candidate.get("candidate_source") or ""),
+            "score": float(candidate.get("score", 0.0) or 0.0),
+            "img_url": str(candidate.get("img_url") or ""),
+        }
+        candidate_rows.append(row)
+        content.append({"type": "input_text", "text": f"Candidate {idx}: {json.dumps(row)}"})
+        content.append({"type": "input_image", "image_url": image_url, "detail": "high"})
+    result["candidate_rows_preview"] = list(candidate_rows)
+    result["candidate_images_included_count"] = len(candidate_rows)
+    result["candidate_img_urls_count"] = len(candidate_rows)
+    result["first_candidate_img_url"] = str(candidate_rows[0].get("img_url") or "") if candidate_rows else ""
+    if not candidate_rows:
+        stats["failures"] = int(stats.get("failures", 0) or 0) + 1
+        result["reason"] = "No candidate images available."
+        return result
+    if not _azure_ai_rank_available():
+        stats["disabled"] = int(stats.get("disabled", 0) or 0) + 1
+        missing_bits: List[str] = []
+        if not azure_endpoint:
+            missing_bits.append("AZURE_OPENAI_ENDPOINT missing")
+        if not azure_api_key:
+            missing_bits.append("AZURE_OPENAI_API_KEY missing")
+        if not azure_deployment:
+            missing_bits.append("AZURE_OPENAI_DEPLOYMENT missing")
+        result["reason"] = "; ".join(missing_bits) or "Azure AI rank unavailable."
+        return result
+
+    try:
+        client = _require_crop_ai_client()
+        result["client_created"] = True
+        stats["calls"] = int(stats.get("calls", 0) or 0) + 1
+        stats["images_sent"] = int(stats.get("images_sent", 0) or 0) + 1 + len(candidate_rows)
+        response = client.responses.create(
+            model=_crop_ai_model_name(),
+            input=[{"role": "user", "content": content}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "lego_candidate_rank",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "best_part_num": {"type": "string"},
+                            "best_color_id": {"type": "integer"},
+                            "best_element_id": {"type": ["string", "null"]},
+                            "confidence": {"type": "number"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["best_part_num", "best_color_id", "best_element_id", "confidence", "reason"],
+                    },
+                }
+            },
+        )
+        usage = getattr(response, "usage", None)
+        stats["input_tokens"] = int(stats.get("input_tokens", 0) or 0) + int(getattr(usage, "input_tokens", 0) or 0)
+        stats["output_tokens"] = int(stats.get("output_tokens", 0) or 0) + int(getattr(usage, "output_tokens", 0) or 0)
+        raw_text = _response_output_text_debug(response)
+        result["raw_response_text"] = raw_text
+        payload: Dict[str, Any] = {}
+        try:
+            payload = _response_text_to_json_debug(response) or {}
+        except Exception:
+            payload = {}
+        result["parsed_response_json"] = payload or None
+        if not payload and raw_text:
+            lowered_raw = raw_text.lower()
+            for row in candidate_rows:
+                part_num = str(row.get("part_num") or "").strip()
+                if part_num and part_num.lower() in lowered_raw:
+                    payload = {
+                        "best_part_num": part_num,
+                        "best_color_id": int(row.get("color_id", 0) or 0),
+                        "best_element_id": row.get("element_id"),
+                        "confidence": 0.5,
+                        "reason": "Parsed from raw AI text.",
+                    }
+                    result["parsed_response_json"] = dict(payload)
+                    break
+        result.update(
+            {
+                "enabled": True,
+                "best_part_num": str(payload.get("best_part_num") or "").strip() or None,
+                "best_color_id": _coerce_int(payload.get("best_color_id")),
+                "best_element_id": str(payload.get("best_element_id") or "").strip() or None,
+                "confidence": _coerce_float(payload.get("confidence")),
+                "reason": str(payload.get("reason") or "").strip() or (raw_text[:300] if raw_text else ""),
+            }
+        )
+        if result["best_part_num"] and result["confidence"] is None:
+            result["confidence"] = 0.5
+        for idx, candidate in enumerate(deduped_candidates):
+            if str(candidate.get("part_num") or "").strip() != str(result.get("best_part_num") or "").strip():
+                continue
+            if int(candidate.get("color_id", 0) or 0) != int(result.get("best_color_id", 0) or 0):
+                continue
+            best_element_id = str(result.get("best_element_id") or "").strip()
+            candidate_element_id = str(candidate.get("element_id") or "").strip()
+            if best_element_id and candidate_element_id and best_element_id != candidate_element_id:
+                continue
+            result["matched_index"] = idx
+            break
+        if not result.get("best_part_num") and raw_text and not result.get("reason"):
+            result["reason"] = raw_text[:300]
+        return result
+    except Exception as exc:
+        stats["failures"] = int(stats.get("failures", 0) or 0) + 1
+        result["exception_type"] = exc.__class__.__name__
+        result["exception_message"] = str(exc)
+        result["reason"] = f"Azure rank failed: {str(exc)}"
+        return result
+
