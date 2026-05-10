@@ -1147,6 +1147,47 @@ def _build_instruction_callout_crops(
     rendered_pages, start_page, end_page = _resolve_bag_page_range(str(set_num), int(bag))
     crops: List[Dict[str, Any]] = []
 
+    def _recover_right_half_missing_steps(
+        img: Any,
+        page_width: int,
+        page_height: int,
+        step_boxes: List[Dict[str, Any]],
+        missing_steps: List[int],
+    ) -> List[Dict[str, Any]]:
+        import pytesseract
+
+        missing = {
+            int(value)
+            for value in (missing_steps or [])
+            if int(value) > 0 and int(value) not in {int(item.get("step_number", 0) or 0) for item in (step_boxes or [])}
+        }
+        recovered: List[Dict[str, Any]] = []
+        for y0 in range(0, max(220, int(page_height * 0.60)), 120):
+            for x0 in range(int(page_width * 0.45), max(int(page_width * 0.45) + 1, page_width - 180), 160):
+                if not missing:
+                    return recovered
+                roi = img[y0 : min(page_height, y0 + 220), x0 : min(page_width, x0 + 260)]
+                if roi is None or roi.size == 0:
+                    continue
+                try:
+                    data = pytesseract.image_to_data(roi, config="--psm 11 -c tessedit_char_whitelist=0123456789", output_type=pytesseract.Output.DICT)
+                except Exception:
+                    continue
+                for idx in range(len(data.get("text", []) or [])):
+                    text = str((data.get("text", [""])[idx] or "")).strip()
+                    value = int(text) if text.isdigit() else 0
+                    if value not in missing:
+                        continue
+                    try:
+                        conf = float((data.get("conf", ["-1"])[idx] or -1))
+                    except Exception:
+                        conf = -1.0
+                    if conf <= 30:
+                        continue
+                    recovered.append({"x": x0 + int(data.get("left", [0])[idx] or 0), "y": y0 + int(data.get("top", [0])[idx] or 0), "w": int(data.get("width", [0])[idx] or 0), "h": int(data.get("height", [0])[idx] or 0), "step_number": value, "source": "gap_recovery_ocr", "label": str(value)})
+                    missing.discard(value)
+        return recovered
+
     for page in rendered_pages:
         if int(page) < int(start_page) or int(page) > int(end_page):
             continue
@@ -1162,6 +1203,19 @@ def _build_instruction_callout_crops(
         page_height, page_width = img.shape[:2]
         detected = step_detector_service.detect_steps(str(set_num), int(page))
         step_boxes = _contact_sheet_step_boxes_from_detected(detected)
+        current_steps = sorted({int(item.get("step_number", 0) or 0) for item in (step_boxes or []) if int(item.get("step_number", 0) or 0) > 0})
+        next_page = next((int(candidate) for candidate in rendered_pages if int(candidate) > int(page) and int(candidate) >= int(start_page) and int(candidate) <= int(end_page)), None)
+        if current_steps and next_page is not None:
+            try:
+                next_detected = step_detector_service.detect_steps(str(set_num), int(next_page))
+                next_step_boxes = _contact_sheet_step_boxes_from_detected(next_detected)
+            except Exception:
+                next_step_boxes = []
+            next_steps = sorted({int(item.get("step_number", 0) or 0) for item in (next_step_boxes or []) if int(item.get("step_number", 0) or 0) > 0})
+            if next_steps and int(min(next_steps)) - int(max(current_steps)) >= 3:
+                recovered = _recover_right_half_missing_steps(img, page_width, page_height, step_boxes, list(range(int(max(current_steps)) + 1, int(min(next_steps)))))
+                if recovered:
+                    step_boxes = sorted(list(step_boxes or []) + recovered, key=lambda item: (int(item.get("y", 0) or 0), int(item.get("x", 0) or 0), int(item.get("step_number", 0) or 0)))
         edge_callout_candidates: List[Dict[str, Any]] = []
         for step_box in step_boxes or []:
             try:

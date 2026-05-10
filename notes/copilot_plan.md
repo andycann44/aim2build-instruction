@@ -349,3 +349,218 @@ because page 23 already shows:
 - separable connected components
 - strong border evidence
 - a clear gap before the unrelated right-side image
+
+---
+
+## 2026-05-10 - Set 70618 bag 3 page 39 missing steps 42 and 43
+
+### What instruction-buildability uses
+
+`/debug/instruction-buildability` gets step boxes here:
+- `clean/routers/instruction_debug.py`
+- `_build_instruction_callout_crops(...)`
+- lines around:
+  - `detected = step_detector_service.detect_steps(str(set_num), int(page))`
+  - `step_boxes = _contact_sheet_step_boxes_from_detected(detected)`
+
+`_contact_sheet_step_boxes_from_detected(...)` lives in:
+- `clean/routers/debug.py`
+
+Important behavior:
+- it returns only `classified_step_boxes` whose `step_group == "main_steps"`
+- so anything classified as `sub_steps` or filtered out before classification never reaches instruction-buildability
+
+### Does the detector scan the full page?
+
+Partly, but not consistently.
+
+Full-page scan:
+- `_extract_numeric_tokens(...)` in `clean/services/step_detector_service.py`
+- runs `pytesseract.image_to_data(img, config="--psm 6")` on the full page
+- so OCR numeric tokens are collected from the whole page
+
+Restricted scans / restricted acceptance:
+- `_visual_candidates_from_image(...)`
+  - only scans `roi = img[0:top_limit, 0:left_limit]`
+  - `left_limit = int(page_width * 0.22)`
+  - so visual number detection is left-side only
+- `_is_valid_step_region(...)`
+  - rejects any candidate with `x >= page_width * 0.45`
+  - so right-half OCR hits are discarded even if OCR found them
+- `_classify_main_and_sub_steps(...)`
+  - builds `left_band` from candidates near the leftmost x only
+  - sub-step collection also ignores candidates with `x > page_width * 0.35`
+
+Net result:
+- the detector is effectively biased to left-side step numbers
+- full-page OCR sees some right-side numbers, but the validity/classification logic throws them away
+
+### What actually happens on page 39
+
+Observed detection for page 39:
+- `detect_steps('70618', 39)` returns only one main step:
+  - `41`
+
+Observed page sequence around it:
+- page 38 main steps: `[40]`
+- page 39 main steps: `[41]`
+- page 40 main steps: `[44, 45]`
+
+So the visible sequence jumps:
+- `41 -> 44`
+- missing on page 39: `42`, `43`
+
+### Exact evidence
+
+From `detect_steps('70618', 39)`:
+
+`numeric_tokens`:
+- `41` at `x=114 y=644 w=42 h=36`
+- `43` at `x=913 y=634 w=56 h=37`
+
+`visual_candidates`:
+- only `41`
+
+`step_candidates`:
+- only `41`
+
+`classified_step_boxes`:
+- only `41` as `main_steps`
+
+So:
+- step `43` is actually found by full-page OCR
+- but it is dropped before `step_candidates`
+
+The reason is explicit in `_is_valid_step_region(...)`:
+```python
+    if x >= page_width * 0.45:
+        return False
+```
+
+For page 39:
+- page width is `1565`
+- `page_width * 0.45 = 704.25`
+- step `43` is at `x=913`
+- therefore it is rejected even though OCR found it with confidence `96`
+
+### Why step 42 is missed
+
+Step `42` is not present in the full-page `numeric_tokens` output.
+
+However, it is OCR-readable in a local crop around the visible label:
+- crop around the 42 area returns:
+  - text: `42`
+  - confidence: about `95-96`
+
+This means:
+- the full-page OCR pass misses `42`
+- but the number itself is visually clear and recoverable if we run a focused local search
+
+Likely reasons the full-page pass misses it:
+- page-level `--psm 6` OCR is sensitive to large structured layouts
+- the right-half step area contains nearby callout boxes and part images
+- `42` is not rescued by visual detection because `_visual_candidates_from_image(...)` only scans the left-side ROI
+
+### Root cause summary
+
+There are two separate failure modes:
+
+1. Step `43` is detected by OCR but rejected by left-side validity rules
+2. Step `42` is missed by the coarse full-page OCR pass and is never recovered because:
+   - visual scanning is left-side only
+   - there is no sequence-gap recovery pass
+
+### Smallest safe place to add a sequence-gap recovery pass
+
+Best place for a tiny recovery pass:
+- `clean/services/step_detector_service.py`
+- inside `detect_steps(...)`
+- after:
+  - `step_candidates = _dedupe_candidates(candidates)`
+- before:
+  - `_classify_main_and_sub_steps(...)`
+
+Why this is the smallest safe place:
+- it keeps all downstream consumers unchanged:
+  - instruction-buildability
+  - callout crop lab
+  - workflow
+  - step sequence services
+- it can repair the candidate list once, centrally
+- classification can then treat recovered steps normally
+
+### Proposed tiny recovery patch
+
+Add a focused recovery pass inside `detect_steps(...)`:
+
+1. Build initial `step_candidates` as today
+2. Look at detected numeric values in ascending order
+3. If there is a gap where values jump by 3 or more:
+   - for example `41 -> 44`
+   - missing values are `42`, `43`
+4. For each missing value:
+   - search the current page for that exact number in a targeted region, not full-page OCR only
+
+Recommended targeted search rule:
+- use the page area around existing and neighboring detected steps
+- for page 39 specifically:
+  - search to the right of step `41`
+  - within the upper/middle band where step numbers normally sit
+
+Minimal deterministic search box heuristic:
+- if we have a lower detected step `N` and an upper detected step `N+3` on the next page or in nearby sequence context:
+  - search current page in the band:
+    - `x` from `last_detected_step_x - 60` to `page_width - margin`
+    - `y` from `last_detected_step_y - 220` to `last_detected_step_y + 80`
+- for each candidate crop window:
+  - run OCR restricted to digits
+  - accept only exact missing values
+
+Even smaller/safer variant:
+- do not use next-page context inside `detect_steps(...)`
+- instead recover any OCR numeric token that was filtered only by the left-side rule if:
+  - its value is within a small forward range of the current detected page sequence
+- plus add a local right-half OCR probe only when detected main steps are sparse
+
+But for the requested explicit gap rule, the best consumer-level place is:
+- `clean/routers/instruction_debug.py`
+- in `_build_instruction_callout_crops(...)`
+- after collecting `step_boxes` for all pages in the bag/page range
+- compare page-to-page sequence:
+  - page 38 = 40
+  - page 39 = 41
+  - page 40 = 44,45
+- then run a current-page recovery scan on page 39 for 42 and 43
+
+### Best tiny-patch recommendation
+
+If the goal is to fix instruction-buildability only with minimal blast radius:
+- add the gap-recovery pass in:
+  - `clean/routers/instruction_debug.py`
+  - inside `_build_instruction_callout_crops(...)`
+
+Reason:
+- the user asked specifically about instruction-buildability
+- this avoids changing global step-detection behavior for all routes
+- it can use cross-page context naturally because `_build_instruction_callout_crops(...)` iterates the rendered page range
+
+Recovery flow there:
+1. collect normal `step_boxes` per page as today
+2. track detected step values across consecutive pages
+3. if sequence jumps from `N` to `N+3`:
+   - run a focused OCR recovery search on the current page for `N+1` and `N+2`
+4. append recovered boxes to that page’s `step_boxes`
+5. continue unchanged
+
+### Best long-term fix
+
+The more correct root fix is still in `step_detector_service.py`:
+- stop assuming main steps live only on the left side
+- remove or relax:
+  - `x >= page_width * 0.45` hard reject
+  - left-only visual ROI
+  - left-band-only main-step classification
+
+But that is broader.
+
+For a tiny safe patch, use a sequence-gap recovery pass first.
