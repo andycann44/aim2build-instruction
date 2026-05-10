@@ -3,6 +3,7 @@ from html import escape
 import json
 import os
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -24,6 +25,7 @@ from clean.routers.debug import (
     _response_text_to_json_debug,
 )
 from clean.services import debug_service, step_detector_service
+from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.instruction_buildability_source import load_instruction_set_parts
 
 router = APIRouter()
@@ -1411,6 +1413,37 @@ def _build_crop_image_html(crop: Dict[str, Any]) -> str:
         f'data-crop-id="{escape(crop_id)}" alt="{escape(crop_id)}" loading="lazy" '
         'onclick="openCropZoomFromEl(event, this)" />'
     )
+
+
+def _debug_write_crop_temp_png(crop: Dict[str, Any]) -> Optional[str]:
+    data_uri = str(crop.get("data_uri") or "").strip()
+    if data_uri.startswith("data:image/") and "," in data_uri:
+        try:
+            encoded = data_uri.split(",", 1)[1]
+            raw = base64.b64decode(encoded)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png", prefix="manual_match_crop_") as handle:
+                handle.write(raw)
+                return str(handle.name)
+        except Exception:
+            pass
+
+    crop_box = _coerce_box_list(crop.get("crop_box"))
+    crop_image_path = str(crop.get("crop_image_path") or "").strip()
+    if crop_box is None or not crop_image_path:
+        return None
+    img = cv2.imread(crop_image_path)
+    if img is None:
+        return None
+    encoded = _encode_contact_sheet_crop(img, crop_box, max_edge=420)
+    if not encoded or "," not in encoded:
+        return None
+    try:
+        raw = base64.b64decode(encoded.split(",", 1)[1])
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png", prefix="manual_match_crop_") as handle:
+            handle.write(raw)
+            return str(handle.name)
+    except Exception:
+        return None
 
 
 def _build_export_training_payload(set_num: str, bag: int) -> Dict[str, Any]:
@@ -5438,6 +5471,67 @@ def instruction_buildability(
           }}
         }});
       </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@router.get("/debug/manual-match-review", response_class=HTMLResponse)
+def manual_match_review(
+    set_num: str = Query(...),
+    bag: Optional[int] = Query(None, ge=1),
+):
+    bag_number = int(bag or 1)
+    labels_payload = _load_existing_labels(_label_store_path(str(set_num), bag_number))
+    crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=False)
+    crop_tiles: List[str] = []
+    for crop in crops:
+        saved_crop = dict(labels_payload.get("crops", {}).get(crop["crop_id"]) or {})
+        status = str(saved_crop.get("status") or "needs_adjust").strip().lower()
+        if status == "hidden":
+            continue
+        saved_qty_text = _coerce_str_list(saved_crop.get("qty_text", []))
+        if saved_qty_text:
+            crop["qty_label"] = ", ".join(saved_qty_text) if saved_qty_text else "none"
+        thumb = _build_crop_image_html(crop)
+        crop_tiles.append(
+            f"""
+            <div class="crop-tile">
+              <div class="crop-thumb">{thumb}</div>
+              <div class="crop-meta">
+                <strong>{escape(str(crop.get("crop_id") or ""))}</strong><br/>
+                page {int(crop.get("page", 0) or 0)} | step {int(crop.get("step", 0) or 0) if int(crop.get("step", 0) or 0) > 0 else "?"}<br/>
+                qty: {escape(str(crop.get("qty_label") or "none"))}
+              </div>
+            </div>
+            """
+        )
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>manual match review</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; margin: 24px; background: #f4f7fb; color: #1f2d3d; }}
+        .card {{ background: #fff; border: 1px solid #d6dee8; border-radius: 14px; padding: 18px; }}
+        .crop-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }}
+        .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; }}
+        .crop-thumb {{ min-height: 110px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
+        .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; }}
+        .crop-meta {{ margin-top: 8px; font-size: 12px; line-height: 1.35; }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Manual Match Review</h1>
+        <p>set_num: {escape(str(set_num))}</p>
+        <p>bag: {bag_number}</p>
+        <div class="crop-grid">
+          {"".join(crop_tiles) if crop_tiles else "<div>No crops found.</div>"}
+        </div>
+      </div>
     </body>
     </html>
     """
