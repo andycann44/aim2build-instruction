@@ -5483,6 +5483,8 @@ def manual_match_review(
     bag: Optional[int] = Query(None, ge=1),
 ):
     bag_number = int(bag or 1)
+    parts_payload = load_instruction_set_parts(set_num)
+    parts = list(parts_payload.get("parts", []) or [])
     labels_payload = _load_existing_labels(_label_store_path(str(set_num), bag_number))
     crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=False)
     crop_tiles: List[str] = []
@@ -5507,6 +5509,33 @@ def manual_match_review(
             </div>
             """
         )
+    assigned_qty_by_key: Dict[str, int] = {}
+    for crop_data in dict(labels_payload.get("crops") or {}).values():
+        for part_data in list((crop_data or {}).get("parts", []) or []):
+            part_entry = _normalize_part_entry(part_data if isinstance(part_data, dict) else {})
+            if not part_entry["part_num"]:
+                continue
+            key = f"{part_entry['part_num']}::{int(part_entry['color_id'] or 0)}"
+            assigned_qty_by_key[key] = assigned_qty_by_key.get(key, 0) + int(part_entry.get("qty") or 1)
+    candidate_tiles: List[str] = []
+    for part in sorted(parts, key=lambda item: (str(item.get("part_num") or ""), int(item.get("color_id", 0) or 0))):
+        key = f"{str(part.get('part_num') or '').strip()}::{int(part.get('color_id', 0) or 0)}"
+        required_qty = int(part.get("qty", 0) or 0)
+        assigned_qty = int(assigned_qty_by_key.get(key, 0) or 0)
+        remaining_qty = required_qty - assigned_qty
+        candidate_tiles.append(
+            f"""
+            <div class="part-tile-review">
+              <div class="part-thumb-review">{f'<img src="{escape(str(part.get("img_url") or ""))}" alt="{escape(str(part.get("part_num") or ""))}" />' if str(part.get("img_url") or "").strip() else 'No image'}</div>
+              <div class="crop-meta">
+                <strong>{escape(str(part.get("part_num") or "unknown"))}</strong><br/>
+                color: {int(part.get("color_id", 0) or 0)} / {escape(str(part.get("color_name") or "n/a"))}<br/>
+                element: {escape(str(part.get("element_id") or "n/a"))}<br/>
+                remaining qty: {remaining_qty}
+              </div>
+            </div>
+            """
+        )
     html = f"""
     <!doctype html>
     <html>
@@ -5516,20 +5545,35 @@ def manual_match_review(
       <style>
         body {{ font-family: Arial, sans-serif; margin: 24px; background: #f4f7fb; color: #1f2d3d; }}
         .card {{ background: #fff; border: 1px solid #d6dee8; border-radius: 14px; padding: 18px; }}
+        .layout {{ display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr); gap: 16px; align-items: start; }}
         .crop-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }}
         .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; }}
         .crop-thumb {{ min-height: 110px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
         .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; }}
+        .part-grid-review {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }}
+        .part-tile-review {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; }}
+        .part-thumb-review {{ min-height: 96px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
+        .part-thumb-review img {{ max-width: 100%; max-height: 96px; display: block; }}
         .crop-meta {{ margin-top: 8px; font-size: 12px; line-height: 1.35; }}
+        @media (max-width: 980px) {{ .layout {{ grid-template-columns: 1fr; }} }}
       </style>
     </head>
     <body>
-      <div class="card">
-        <h1>Manual Match Review</h1>
-        <p>set_num: {escape(str(set_num))}</p>
-        <p>bag: {bag_number}</p>
-        <div class="crop-grid">
-          {"".join(crop_tiles) if crop_tiles else "<div>No crops found.</div>"}
+      <div class="layout">
+        <div class="card">
+          <h1>Manual Match Review</h1>
+          <p>set_num: {escape(str(set_num))}</p>
+          <p>bag: {bag_number}</p>
+          <div class="crop-grid">
+            {"".join(crop_tiles) if crop_tiles else "<div>No crops found.</div>"}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Candidate Parts</h2>
+          <p>Full remaining part library for set {escape(str(set_num))} / bag {bag_number}</p>
+          <div class="part-grid-review">
+            {"".join(candidate_tiles) if candidate_tiles else "<div>No candidates available.</div>"}
+          </div>
         </div>
       </div>
     </body>
