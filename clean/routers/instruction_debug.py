@@ -680,16 +680,13 @@ def _build_qty_sequence(qty_values: Any, qty_text_values: Any) -> List[Dict[str,
     sequence: List[Dict[str, Any]] = []
 
     if qty_text_list:
-        for index, qty_text in enumerate(qty_text_list):
-            parsed_qty = _extract_qty_from_text(qty_text)
-            fallback_qty = qty_list[index] if index < len(qty_list) else None
-            sequence.append(
-                {
-                    "qty": parsed_qty if parsed_qty is not None else fallback_qty,
-                    "qty_text": qty_text,
-                }
-            )
-        return sequence
+        explicit_slots: List[Dict[str, Any]] = []
+        for qty_text in qty_text_list:
+            for match in re.finditer(r"(\d+)\s*x", str(qty_text), flags=re.IGNORECASE):
+                qty = int(match.group(1))
+                explicit_slots.append({"qty": qty, "qty_text": f"{qty}x"})
+        if explicit_slots:
+            return explicit_slots
 
     for qty in qty_list:
         sequence.append({"qty": qty, "qty_text": f"{qty}x"})
@@ -1348,6 +1345,8 @@ def _build_instruction_callout_crops(
                     "step": step_number,
                     "qty_text": detected_qty_text,
                     "qty_numbers": detected_qty_numbers,
+                "candidate_detected_qty_text": list(candidate.get("detected_qty_text", []) or []),
+                "candidate_detected_qty_numbers": list(candidate.get("detected_qty_numbers", []) or []),
                     "qty_label": ", ".join(detected_qty_text) if detected_qty_text else "none",
                     "qty_source": str(qty_payload.get("qty_source") or "local"),
                     "ai_part_count": qty_payload.get("ai_part_count"),
@@ -5494,21 +5493,35 @@ def manual_match_review(
         status = str(saved_crop.get("status") or "needs_adjust").strip().lower()
         if status == "hidden":
             continue
-        saved_qty_text = _coerce_str_list(saved_crop.get("qty_text", []))
+        saved_qty_text = _coerce_str_list(saved_crop.get("qty_text", []) or saved_crop.get("crop_qty_text", []))
         if saved_qty_text:
             crop["qty_text"] = saved_qty_text
             crop["qty_numbers"] = _coerce_int_list(saved_crop.get("qty", []))
             crop["qty_label"] = ", ".join(saved_qty_text) if saved_qty_text else "none"
+        crop_qty_text = (
+            _coerce_str_list(crop.get("candidate_detected_qty_text", []))
+            or _coerce_str_list(crop.get("detected_qty_text", []))
+            or saved_qty_text
+            or _coerce_str_list(crop.get("qty_text", []))
+        )
+        crop_qty = (
+            _coerce_int_list(crop.get("candidate_detected_qty_numbers", []))
+            if crop_qty_text
+            else (
+                _coerce_int_list(saved_crop.get("qty", []) or saved_crop.get("crop_qty", []))
+                or _coerce_int_list(crop.get("qty_numbers", []))
+            )
+        )
         saved_parts = list(saved_crop.get("parts", []) or [])
-        slot_state = _crop_qty_slot_state({"parts": saved_parts}, crop.get("qty_numbers", []), crop.get("qty_text", []))
-        slot_sequence = _build_qty_sequence(crop.get("qty_numbers", []), crop.get("qty_text", []))
+        slot_state = _crop_qty_slot_state({"parts": saved_parts}, crop_qty, crop_qty_text)
+        slot_sequence = _build_qty_sequence(crop_qty, crop_qty_text)
         review_crops.append(
             {
                 "crop_id": str(crop.get("crop_id") or ""),
                 "page": int(crop.get("page", 0) or 0),
                 "step": int(crop.get("step", 0) or 0),
-                "crop_qty": list(crop.get("qty_numbers", []) or []),
-                "crop_qty_text": list(crop.get("qty_text", []) or []),
+            "crop_qty": list(crop_qty),
+            "crop_qty_text": list(crop_qty_text),
                 "crop_box": list(crop.get("crop_box", []) or []),
                 "crop_box_format": str(crop.get("crop_box_format") or "xywh"),
                 "crop_image_path": str(crop.get("crop_image_path") or ""),
