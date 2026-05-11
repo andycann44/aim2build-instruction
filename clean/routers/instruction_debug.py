@@ -5501,6 +5501,7 @@ def manual_match_review(
             crop["qty_label"] = ", ".join(saved_qty_text) if saved_qty_text else "none"
         saved_parts = list(saved_crop.get("parts", []) or [])
         slot_state = _crop_qty_slot_state({"parts": saved_parts}, crop.get("qty_numbers", []), crop.get("qty_text", []))
+        slot_sequence = _build_qty_sequence(crop.get("qty_numbers", []), crop.get("qty_text", []))
         review_crops.append(
             {
                 "crop_id": str(crop.get("crop_id") or ""),
@@ -5512,19 +5513,26 @@ def manual_match_review(
                 "crop_box_format": str(crop.get("crop_box_format") or "xywh"),
                 "crop_image_path": str(crop.get("crop_image_path") or ""),
                 "next_qty": slot_state.get("next_slot", {}),
+                "slot_sequence": slot_sequence,
+                "filled_slots": int(slot_state.get("filled_slots", 0) or 0),
             }
         )
+        slot_buttons = "".join(
+            f'<button type="button" class="slot-btn{" assigned" if idx < int(slot_state.get("filled_slots", 0) or 0) else ""}" data-crop-slot data-crop-id="{escape(str(crop.get("crop_id") or ""))}" data-slot-index="{idx}" data-slot-assigned="{str(idx < int(slot_state.get("filled_slots", 0) or 0)).lower()}">Slot {idx + 1}: {escape(str(slot.get("qty_text") or slot.get("qty") or "none"))}</button>'
+            for idx, slot in enumerate(slot_sequence)
+        ) or '<div class="slot-empty">No qty slots</div>'
         thumb = _build_crop_image_html(crop)
         crop_tiles.append(
             f"""
-            <button type="button" class="crop-tile" data-crop-tile data-crop-id="{escape(str(crop.get('crop_id') or ''))}">
+            <div class="crop-tile" data-crop-tile data-crop-id="{escape(str(crop.get('crop_id') or ''))}">
               <div class="crop-thumb">{thumb}</div>
               <div class="crop-meta">
                 <strong>{escape(str(crop.get("crop_id") or ""))}</strong><br/>
                 page {int(crop.get("page", 0) or 0)} | step {int(crop.get("step", 0) or 0) if int(crop.get("step", 0) or 0) > 0 else "?"}<br/>
                 qty: {escape(str(crop.get("qty_label") or "none"))}
               </div>
-            </button>
+              <div class="slot-list" id="slot-list-{escape(str(crop.get('crop_id') or ''))}">{slot_buttons}</div>
+            </div>
             """
         )
     assigned_qty_by_key: Dict[str, int] = {}
@@ -5575,7 +5583,7 @@ def manual_match_review(
         .card {{ background: #fff; border: 1px solid #d6dee8; border-radius: 14px; padding: 18px; }}
         .layout {{ display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr); gap: 16px; align-items: start; }}
         .crop-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }}
-        .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; cursor: pointer; }}
+        .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; }}
         .crop-tile.selected, .part-tile-review.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
         .crop-thumb {{ min-height: 110px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
         .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; }}
@@ -5584,6 +5592,11 @@ def manual_match_review(
         .part-thumb-review {{ min-height: 96px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
         .part-thumb-review img {{ max-width: 100%; max-height: 96px; display: block; }}
         .crop-meta {{ margin-top: 8px; font-size: 12px; line-height: 1.35; }}
+        .slot-list {{ margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
+        .slot-btn {{ border: 1px solid #d6dee8; border-radius: 8px; background: #f8fbff; padding: 6px 8px; text-align: left; cursor: pointer; font-size: 12px; }}
+        .slot-btn.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
+        .slot-btn.assigned {{ background: #eef6ef; border-color: #7db28a; color: #2f6c41; cursor: default; }}
+        .slot-empty {{ color: #6c7c8d; font-size: 12px; }}
         .status-bar {{ margin-top: 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 13px; }}
         .assign-btn {{ border: 0; border-radius: 10px; background: #cf1f1f; color: #fff; padding: 10px 14px; font-weight: 700; cursor: pointer; }}
         .assign-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
@@ -5618,20 +5631,64 @@ def manual_match_review(
         const cropReviewMap = new Map(reviewCrops.map((item) => [String(item.crop_id || ""), item]));
         let selectedCropId = "";
         let selectedPartKey = "";
+        let selectedSlotIndex = null;
         function updateManualMatchStatus() {{
           const status = document.getElementById("manual-match-status");
           const button = document.getElementById("manual-assign-btn");
           if (status) {{
-            status.textContent = "Selected crop: " + (selectedCropId || "none") + " | Selected part: " + (selectedPartKey || "none");
+            const slotText = selectedSlotIndex === null ? "none" : String(Number(selectedSlotIndex) + 1);
+            status.textContent = "Selected crop: " + (selectedCropId || "none") + " | Selected slot: " + slotText + " | Selected part: " + (selectedPartKey || "none");
           }}
           if (button) {{
-            button.disabled = !(selectedCropId && selectedPartKey);
+            button.disabled = !(selectedCropId && selectedPartKey && selectedSlotIndex !== null);
           }}
         }}
-        document.querySelectorAll("[data-crop-tile]").forEach((el) => {{
+        function refreshSlotUI() {{
+          reviewCrops.forEach((crop) => {{
+            const filled = Number(crop.filled_slots || 0);
+            document.querySelectorAll('[data-crop-slot][data-crop-id="' + crop.crop_id + '"]').forEach((node) => {{
+              const idx = Number(node.dataset.slotIndex || -1);
+              const assigned = idx > -1 && idx < filled;
+              node.dataset.slotAssigned = assigned ? "true" : "false";
+              node.classList.toggle("assigned", assigned);
+              node.classList.toggle("selected", crop.crop_id === selectedCropId && idx === selectedSlotIndex);
+            }});
+            const cropTile = document.querySelector('[data-crop-tile][data-crop-id="' + crop.crop_id + '"]');
+            if (cropTile) {{
+              cropTile.classList.toggle("selected", crop.crop_id === selectedCropId);
+            }}
+          }});
+        }}
+        function selectNextOpenSlot(fromCropId) {{
+          const startIndex = Math.max(0, reviewCrops.findIndex((item) => String(item.crop_id || "") === String(fromCropId || "")));
+          for (let offset = 0; offset < reviewCrops.length; offset += 1) {{
+            const crop = reviewCrops[startIndex + offset];
+            if (!crop) {{
+              continue;
+            }}
+            const filled = Number(crop.filled_slots || 0);
+            const sequence = Array.isArray(crop.slot_sequence) ? crop.slot_sequence : [];
+            if (filled < sequence.length) {{
+              selectedCropId = String(crop.crop_id || "");
+              selectedSlotIndex = filled;
+              refreshSlotUI();
+              updateManualMatchStatus();
+              return;
+            }}
+          }}
+          selectedCropId = "";
+          selectedSlotIndex = null;
+          refreshSlotUI();
+          updateManualMatchStatus();
+        }}
+        document.querySelectorAll("[data-crop-slot]").forEach((el) => {{
           el.addEventListener("click", () => {{
+            if (String(el.dataset.slotAssigned || "") === "true") {{
+              return;
+            }}
             selectedCropId = String(el.dataset.cropId || "");
-            document.querySelectorAll("[data-crop-tile]").forEach((node) => node.classList.toggle("selected", node === el));
+            selectedSlotIndex = Number(el.dataset.slotIndex || 0);
+            refreshSlotUI();
             updateManualMatchStatus();
           }});
         }});
@@ -5645,7 +5702,9 @@ def manual_match_review(
         document.getElementById("manual-assign-btn")?.addEventListener("click", async () => {{
           const crop = cropReviewMap.get(selectedCropId);
           const part = reviewParts[selectedPartKey];
-          if (!crop || !part) {{
+          const sequence = crop && Array.isArray(crop.slot_sequence) ? crop.slot_sequence : [];
+          const slot = selectedSlotIndex !== null ? sequence[Number(selectedSlotIndex)] : null;
+          if (!crop || !part || selectedSlotIndex === null || !slot) {{
             return;
           }}
           const payload = {{
@@ -5659,12 +5718,14 @@ def manual_match_review(
             crop_box: crop.crop_box || [],
             crop_box_format: crop.crop_box_format || "xywh",
             crop_image_path: crop.crop_image_path || "",
-            qty: crop.next_qty && crop.next_qty.qty != null ? crop.next_qty.qty : null,
-            qty_text: crop.next_qty && crop.next_qty.qty_text ? crop.next_qty.qty_text : null,
+            qty: slot.qty != null ? slot.qty : null,
+            qty_text: slot.qty_text ? slot.qty_text : null,
             part_num: part.part_num,
             color_id: part.color_id,
             color_name: part.color_name || null,
             element_id: part.element_id || null,
+            selected_slot_index: selectedSlotIndex,
+            adjustments: [{{ type: "manual_match_slot", slot_index: selectedSlotIndex }}],
           }};
           const res = await fetch("/debug/save-label", {{
             method: "POST",
@@ -5680,9 +5741,10 @@ def manual_match_review(
             document.getElementById("manual-match-status").textContent = detail;
             return;
           }}
-          document.getElementById("manual-match-status").textContent = "Assigned: " + selectedCropId + " -> " + selectedPartKey;
+          crop.filled_slots = Math.max(Number(crop.filled_slots || 0), Number(selectedSlotIndex) + 1);
+          document.getElementById("manual-match-status").textContent = "Assigned: " + selectedCropId + " slot " + String(Number(selectedSlotIndex) + 1) + " -> " + selectedPartKey;
           if (Number.isFinite(Number(part.remaining_qty))) {{
-            part.remaining_qty = Number(part.remaining_qty) - 1;
+            part.remaining_qty = Number(part.remaining_qty) - Number(slot.qty || 1);
           }}
           const selectedTile = document.querySelector('[data-part-tile].selected');
           if (selectedTile) {{
@@ -5695,8 +5757,10 @@ def manual_match_review(
               selectedTile.style.opacity = "0.45";
             }}
           }}
+          selectNextOpenSlot(selectedCropId);
           console.log("Assigned", payload);
         }});
+        refreshSlotUI();
         updateManualMatchStatus();
       </script>
     </body>
