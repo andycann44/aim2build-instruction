@@ -19,7 +19,8 @@ from clean.routers.debug import (
     _contact_sheet_step_boxes_from_detected,
     _encode_contact_sheet_crop,
     _encode_debug_image_data_uri,
-    _extract_detected_qty_details_from_crop,
+    _extract_detected_qty_details_from_crop as _debug_extract_detected_qty_details_from_crop,
+    _extract_qty_tokens_from_image,
     _require_openai_vision_client_debug,
     _resolve_bag_page_range,
     _response_text_to_json_debug,
@@ -53,6 +54,12 @@ def _training_export_path(set_num: str, bag: int) -> Path:
     )
 
 
+def _manual_color_calibration_path(set_num: str) -> Path:
+    normalized = str(set_num or "").strip() or "70618"
+    safe_name = re.sub(r"[^0-9A-Za-z._-]+", "_", normalized)
+    return Path("/Users/olly/aim2build-instruction/debug/training_labels") / f"{safe_name}_manual_color_calibration.json"
+
+
 def _catalog_db_path() -> Path:
     return Path("/Users/olly/aim2build-instruction/debug/server_catalog/lego_catalog.db")
 
@@ -73,6 +80,15 @@ def _empty_label_store(set_num: str, bag: int) -> Dict[str, Any]:
             "crop_image_path_kind": "page_image_with_crop_box",
         },
         "crops": {},
+    }
+
+
+def _empty_manual_color_calibration(set_num: str) -> Dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "set_num": str(set_num or "").strip() or "70618",
+        "updated_at": _iso_now(),
+        "samples": [],
     }
 
 
@@ -502,6 +518,159 @@ def _estimate_visible_part_count_from_crop(crop_img: Any) -> int:
         return max(0, min(count, 12))
     except Exception:
         return 0
+
+
+def _normalize_qty_token_text(value: Any) -> str:
+    text = re.sub(r"\s+", "", str(value or "").lower())
+    if re.match(r"^\d+x$", text) or re.match(r"^x\d+$", text):
+        return text
+    return ""
+
+
+def _token_overlap_ratio(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    ax1 = int(a.get("x", 0) or 0)
+    ay1 = int(a.get("y", 0) or 0)
+    ax2 = ax1 + max(0, int(a.get("w", 0) or 0))
+    ay2 = ay1 + max(0, int(a.get("h", 0) or 0))
+    bx1 = int(b.get("x", 0) or 0)
+    by1 = int(b.get("y", 0) or 0)
+    bx2 = bx1 + max(0, int(b.get("w", 0) or 0))
+    by2 = by1 + max(0, int(b.get("h", 0) or 0))
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    a_area = max(1, max(0, ax2 - ax1) * max(0, ay2 - ay1))
+    b_area = max(1, max(0, bx2 - bx1) * max(0, by2 - by1))
+    return float(inter_area) / float(max(1, min(a_area, b_area)))
+
+
+def _tokens_are_same_qty_label(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    if _normalize_qty_token_text(a.get("text")) != _normalize_qty_token_text(b.get("text")):
+        return False
+    if _token_overlap_ratio(a, b) >= 0.55:
+        return True
+    return (
+        abs(int(a.get("cx", 0) or 0) - int(b.get("cx", 0) or 0)) <= 14
+        and abs(int(a.get("cy", 0) or 0) - int(b.get("cy", 0) or 0)) <= 10
+    )
+
+
+def _dedupe_qty_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    for token in sorted(
+        list(tokens or []),
+        key=lambda item: (
+            int(item.get("cy", 0) or 0),
+            int(item.get("cx", 0) or 0),
+            int(item.get("w", 0) or 0) * int(item.get("h", 0) or 0),
+        ),
+    ):
+        normalized = _normalize_qty_token_text(token.get("text"))
+        if not normalized:
+            continue
+        normalized_token = {
+            "text": normalized,
+            "x": int(token.get("x", 0) or 0),
+            "y": int(token.get("y", 0) or 0),
+            "w": int(token.get("w", 0) or 0),
+            "h": int(token.get("h", 0) or 0),
+            "cx": int(token.get("cx", 0) or 0),
+            "cy": int(token.get("cy", 0) or 0),
+        }
+        if any(_tokens_are_same_qty_label(existing, normalized_token) for existing in deduped):
+            continue
+        deduped.append(normalized_token)
+    return deduped
+
+
+def _extract_detected_qty_details_from_crop(crop_img) -> Dict[str, Any]:
+    payload = _debug_extract_detected_qty_details_from_crop(crop_img)
+    full_crop_tokens = _dedupe_qty_tokens(_extract_qty_tokens_from_image(crop_img) or [])
+    if full_crop_tokens:
+        detected_qty_text: List[str] = []
+        detected_qty_numbers: List[int] = []
+        for token in sorted(full_crop_tokens, key=lambda item: (int(item.get("cy", 0) or 0), int(item.get("x", 0) or 0))):
+            text = str(token.get("text") or "")
+            number_match = re.search(r"(\d{1,2})", text)
+            qty_val = int(number_match.group(1)) if number_match else None
+            detected_qty_text.append(text)
+            if qty_val is not None:
+                detected_qty_numbers.append(qty_val)
+        payload["detected_qty_text"] = detected_qty_text
+        payload["detected_qty_numbers"] = detected_qty_numbers
+        payload["qty_token_boxes"] = full_crop_tokens
+        return payload
+    if _coerce_str_list(payload.get("detected_qty_text", [])):
+        return payload
+    if crop_img is None or getattr(crop_img, "size", 0) == 0:
+        return payload
+
+    height, width = crop_img.shape[:2]
+    region_specs = [
+        ("lower_half", crop_img[max(0, height // 2) : height, :], 0, max(0, height // 2)),
+        (
+            "lower_right",
+            crop_img[max(0, height // 3) : height, max(0, width // 2) : width],
+            max(0, width // 2),
+            max(0, height // 3),
+        ),
+        ("right_half", crop_img[:, max(0, width // 2) : width], max(0, width // 2), 0),
+        ("right_band", crop_img[:, max(0, int(width * 0.65)) : width], max(0, int(width * 0.65)), 0),
+    ]
+
+    best_tokens: List[Dict[str, Any]] = []
+    best_priority = len(region_specs)
+    for priority, (_, region_img, offset_x, offset_y) in enumerate(region_specs):
+        if region_img is None or region_img.size == 0:
+            continue
+        region_tokens: List[Dict[str, Any]] = []
+        for token in _extract_qty_tokens_from_image(region_img) or []:
+            normalized = _normalize_qty_token_text(token.get("text"))
+            if not normalized:
+                continue
+            x = int(token.get("x", 0) or 0) + int(offset_x)
+            y = int(token.get("y", 0) or 0) + int(offset_y)
+            w = int(token.get("w", 0) or 0)
+            h = int(token.get("h", 0) or 0)
+            region_tokens.append(
+                {
+                    "text": normalized,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "cx": x + (w // 2),
+                    "cy": y + (h // 2),
+                }
+            )
+        deduped_tokens = _dedupe_qty_tokens(region_tokens)
+        if not deduped_tokens:
+            continue
+        if len(deduped_tokens) > len(best_tokens) or (
+            len(deduped_tokens) == len(best_tokens) and priority < best_priority
+        ):
+            best_tokens = deduped_tokens
+            best_priority = priority
+
+    if not best_tokens:
+        return payload
+
+    detected_qty_text: List[str] = []
+    detected_qty_numbers: List[int] = []
+    for token in sorted(best_tokens, key=lambda item: (int(item.get("cy", 0) or 0), int(item.get("x", 0) or 0))):
+        text = str(token.get("text") or "")
+        number_match = re.search(r"(\d{1,2})", text)
+        qty_val = int(number_match.group(1)) if number_match else None
+        detected_qty_text.append(text)
+        if qty_val is not None:
+            detected_qty_numbers.append(qty_val)
+
+    payload["detected_qty_text"] = detected_qty_text
+    payload["detected_qty_numbers"] = detected_qty_numbers
+    payload["qty_token_boxes"] = best_tokens
+    return payload
 
 
 def _auto_qty_payload_for_crop(crop_img: Any, step_number: int) -> Dict[str, List[Any]]:
@@ -1078,6 +1247,76 @@ def _load_existing_labels(path: Path) -> Dict[str, Any]:
     return existing
 
 
+def _load_manual_color_calibration(set_num: str) -> Dict[str, Any]:
+    path = _manual_color_calibration_path(set_num)
+    existing = _empty_manual_color_calibration(set_num)
+    if not path.exists():
+        return existing
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return existing
+
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return existing
+
+    if not isinstance(loaded, dict):
+        return existing
+
+    existing["schema_version"] = "1.0"
+    existing["set_num"] = str(loaded.get("set_num") or existing["set_num"]).strip() or existing["set_num"]
+    existing["updated_at"] = str(loaded.get("updated_at") or existing["updated_at"]).strip() or existing["updated_at"]
+
+    samples: List[Dict[str, Any]] = []
+    for item in list(loaded.get("samples", []) or []):
+        if not isinstance(item, dict):
+            continue
+        sample_rgb = item.get("sample_rgb") if isinstance(item.get("sample_rgb"), dict) else {}
+        sample_xy = item.get("sample_xy") if isinstance(item.get("sample_xy"), dict) else {}
+        color_id = _coerce_int(item.get("color_id"))
+        if color_id is None:
+            continue
+        rgb_r = _coerce_int(sample_rgb.get("r"))
+        rgb_g = _coerce_int(sample_rgb.get("g"))
+        rgb_b = _coerce_int(sample_rgb.get("b"))
+        sample_x = _coerce_int(sample_xy.get("x"))
+        sample_y = _coerce_int(sample_xy.get("y"))
+        if rgb_r is None or rgb_g is None or rgb_b is None:
+            continue
+        normalized_sample = {
+            "sample_id": str(item.get("sample_id") or "").strip(),
+            "page": _coerce_int(item.get("page")),
+            "step": _coerce_int(item.get("step")),
+            "crop_id": str(item.get("crop_id") or "").strip(),
+            "crop_image_path": str(item.get("crop_image_path") or "").strip(),
+            "sample_xy": {
+                "x": sample_x if sample_x is not None else 0,
+                "y": sample_y if sample_y is not None else 0,
+            },
+            "sample_radius": max(0, int(_coerce_int(item.get("sample_radius")) or 0)),
+            "sample_rgb": {
+                "r": int(rgb_r),
+                "g": int(rgb_g),
+                "b": int(rgb_b),
+            },
+            "color_id": int(color_id),
+            "color_name": str(item.get("color_name") or "").strip(),
+            "source": str(item.get("source") or "manual_picker").strip() or "manual_picker",
+            "saved_at": str(item.get("saved_at") or "").strip(),
+        }
+        if not normalized_sample["sample_id"]:
+            page_part = normalized_sample["page"] if normalized_sample["page"] is not None else "na"
+            step_part = normalized_sample["step"] if normalized_sample["step"] is not None else "na"
+            normalized_sample["sample_id"] = (
+                f"{normalized_sample['crop_id'] or 'manual'}_p{page_part}_s{step_part}_{len(samples) + 1}"
+            )
+        samples.append(normalized_sample)
+    existing["samples"] = samples
+    return existing
+
+
 def _write_labels(path: Path, payload: Dict[str, Any]) -> None:
     try:
         bag = int(payload.get("bag", 1) or 1)
@@ -1131,6 +1370,19 @@ def _write_labels(path: Path, payload: Dict[str, Any]) -> None:
         crop_record["parts"] = clean_parts
         _refresh_crop_next_qty_index(crop_record)
 
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def _write_manual_color_calibration(set_num: str, payload: Dict[str, Any]) -> None:
+    path = _manual_color_calibration_path(set_num)
+    normalized = _empty_manual_color_calibration(set_num)
+    if isinstance(payload, dict):
+        normalized["set_num"] = str(payload.get("set_num") or normalized["set_num"]).strip() or normalized["set_num"]
+        normalized["updated_at"] = str(payload.get("updated_at") or normalized["updated_at"]).strip() or normalized["updated_at"]
+        normalized["samples"] = list(payload.get("samples", []) or [])
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
@@ -1599,6 +1851,73 @@ async def save_label(req: Request):
     crop_record["annotated_at"] = _iso_now()
     _write_labels(path, existing)
     return {"ok": True, "path": str(path), "crop": existing["crops"].get(crop_id)}
+
+
+@router.post("/debug/save-manual-color-calibration")
+async def save_manual_color_calibration(req: Request):
+    data = await req.json()
+
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    color_id = _coerce_int(data.get("color_id"))
+    sample_rgb = data.get("sample_rgb") if isinstance(data.get("sample_rgb"), dict) else {}
+    sample_xy = data.get("sample_xy") if isinstance(data.get("sample_xy"), dict) else {}
+    rgb_r = _coerce_int(sample_rgb.get("r"))
+    rgb_g = _coerce_int(sample_rgb.get("g"))
+    rgb_b = _coerce_int(sample_rgb.get("b"))
+    sample_x = _coerce_int(sample_xy.get("x"))
+    sample_y = _coerce_int(sample_xy.get("y"))
+
+    if color_id is None:
+        raise HTTPException(status_code=400, detail="color_id is required")
+    if rgb_r is None or rgb_g is None or rgb_b is None:
+        raise HTTPException(status_code=400, detail="sample_rgb with r,g,b is required")
+    if sample_x is None or sample_y is None:
+        raise HTTPException(status_code=400, detail="sample_xy with x,y is required")
+
+    page = _coerce_int(data.get("page"))
+    step = _coerce_int(data.get("step"))
+    saved_at = _iso_now()
+    existing = _load_manual_color_calibration(set_num)
+    samples = list(existing.get("samples", []) or [])
+    sample_id = (
+        str(data.get("crop_id") or "").strip()
+        or f"manual_p{page if page is not None else 'na'}_s{step if step is not None else 'na'}"
+    )
+    sample_id = f"{sample_id}_{saved_at}"
+    sample_entry = {
+        "sample_id": sample_id,
+        "page": page,
+        "step": step,
+        "crop_id": str(data.get("crop_id") or "").strip(),
+        "crop_image_path": str(data.get("crop_image_path") or "").strip(),
+        "sample_xy": {
+            "x": int(sample_x),
+            "y": int(sample_y),
+        },
+        "sample_radius": max(0, int(_coerce_int(data.get("sample_radius")) or 0)),
+        "sample_rgb": {
+            "r": int(rgb_r),
+            "g": int(rgb_g),
+            "b": int(rgb_b),
+        },
+        "color_id": int(color_id),
+        "color_name": str(data.get("color_name") or "").strip(),
+        "source": "manual_picker",
+        "saved_at": saved_at,
+    }
+    samples.append(sample_entry)
+    existing["schema_version"] = "1.0"
+    existing["set_num"] = set_num
+    existing["updated_at"] = saved_at
+    existing["samples"] = samples
+    _write_manual_color_calibration(set_num, existing)
+    return {
+        "ok": True,
+        "path": str(_manual_color_calibration_path(set_num)),
+        "sample": sample_entry,
+        "sample_count": len(samples),
+        "updated_at": saved_at,
+    }
 
 
 @router.post("/debug/remove-label")
@@ -3056,8 +3375,10 @@ def instruction_buildability(
                 <div id="picked-rgb-row" class="picked-rgb-row">
                   <span class="colour-swatch" id="picked-rgb-swatch" style="background: transparent;"></span>
                   <span id="picked-rgb-text" class="save-note">No colour sampled yet.</span>
+                  <button type="button" class="remove-btn" id="save-manual-calibration-btn" onclick="saveManualColorCalibration()" disabled>Save calibration</button>
                   <button type="button" class="remove-btn" onclick="clearManualColorFilter()">Clear colour filter</button>
                 </div>
+                <div id="manual-calibration-status" class="save-note"></div>
                 <div class="colour-picker-actions">
                   <strong>Manual colour filter</strong>
                   <button id="manual-colours-toggle" type="button" class="remove-btn" onclick="toggleShowAllManualColours()">Show all colours</button>
@@ -4337,6 +4658,7 @@ def instruction_buildability(
             pickedText.textContent = "No colour sampled yet.";
             pickedSwatch.style.background = "transparent";
             renderPickerDiagnostics(crop);
+            updateSaveCalibrationUI(crop);
             return;
           }}
 
@@ -4346,6 +4668,7 @@ def instruction_buildability(
             empty.style.display = "block";
             list.innerHTML = '<div class="suggested-empty">Pick a colour from the crop to see the closest LEGO colours.</div>';
             renderPickerDiagnostics(crop);
+            updateSaveCalibrationUI(crop);
             return;
           }}
 
@@ -4383,6 +4706,28 @@ def instruction_buildability(
 
           renderColourMatches(crop);
           renderPickerDiagnostics(crop);
+          updateSaveCalibrationUI(crop);
+        }}
+
+        function updateSaveCalibrationUI(crop) {{
+          const button = document.getElementById("save-manual-calibration-btn");
+          const status = document.getElementById("manual-calibration-status");
+          if (!button || !status) {{
+            return;
+          }}
+          const colorId = crop ? Number(crop.manual_color_filter_id) : NaN;
+          const canSave = !!(
+            crop
+            && crop.picked_rgb
+            && Number.isFinite(colorId)
+          );
+          button.disabled = !canSave;
+          button.title = canSave
+            ? "Save this sampled instruction colour as a manual LEGO colour calibration"
+            : "Pick a crop colour and choose a LEGO colour first.";
+          status.textContent = crop && crop.manual_calibration_status
+            ? String(crop.manual_calibration_status)
+            : "";
         }}
 
         function renderColourMatches(crop) {{
@@ -4507,6 +4852,7 @@ def instruction_buildability(
             return;
           }}
           crop.manual_color_filter_id = Number(colorId);
+          crop.manual_calibration_status = "";
           updatePickerDiagnostics(crop, {{ errorMessage: "" }});
           const pickedText = document.getElementById("picked-rgb-text");
           const colorName = colorNameById.get(Number(colorId)) || ("color " + colorId);
@@ -4542,6 +4888,9 @@ def instruction_buildability(
           delete crop.manual_color_filter_id;
           delete crop.closest_color_matches;
           delete crop.picked_rgb;
+          delete crop.picked_sample_xy;
+          delete crop.picked_sample_radius;
+          crop.manual_calibration_status = "";
           updatePickerDiagnostics(crop, {{
             sampledRgb: "n/a",
             closestCount: 0,
@@ -4551,6 +4900,67 @@ def instruction_buildability(
           applyPartFilter();
           renderSuggestedParts(crop.crop_id);
           renderColourPicker(crop.crop_id);
+        }}
+
+        async function saveManualColorCalibration() {{
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop || !crop.picked_rgb) {{
+            return;
+          }}
+          const colorId = Number(crop.manual_color_filter_id);
+          if (!Number.isFinite(colorId)) {{
+            crop.manual_calibration_status = "Choose a LEGO colour match first.";
+            updateSaveCalibrationUI(crop);
+            return;
+          }}
+          const button = document.getElementById("save-manual-calibration-btn");
+          if (button) {{
+            button.disabled = true;
+          }}
+          crop.manual_calibration_status = "Saving calibration...";
+          updateSaveCalibrationUI(crop);
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            page: crop.page,
+            step: crop.step,
+            crop_id: crop.crop_id,
+            crop_image_path: crop.crop_image_path,
+            sample_xy: crop.picked_sample_xy || {{ x: 0, y: 0 }},
+            sample_radius: Number(crop.picked_sample_radius || 2),
+            sample_rgb: {{
+              r: Number(crop.picked_rgb.r || 0),
+              g: Number(crop.picked_rgb.g || 0),
+              b: Number(crop.picked_rgb.b || 0),
+            }},
+            color_id: colorId,
+            color_name: colorNameById.get(colorId) || ("color " + colorId),
+          }};
+          try {{
+            const res = await fetch("/debug/save-manual-color-calibration", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify(payload)
+            }});
+            if (!res.ok) {{
+              let detail = "Calibration save failed";
+              try {{
+                const errorPayload = await res.json();
+                detail = errorPayload.detail || detail;
+              }} catch (_error) {{
+                detail = "Calibration save failed";
+              }}
+              crop.manual_calibration_status = detail;
+              updateSaveCalibrationUI(crop);
+              return;
+            }}
+            const result = await res.json();
+            const colorName = payload.color_name || ("color " + colorId);
+            crop.manual_calibration_status = "Saved calibration: " + colorName + " (" + colorId + ")"
+              + (result && Number.isFinite(Number(result.sample_count)) ? " | samples: " + Number(result.sample_count) : "");
+          }} catch (_error) {{
+            crop.manual_calibration_status = "Calibration save failed";
+          }}
+          updateSaveCalibrationUI(crop);
         }}
 
         function setPartFilterMode(showAll) {{
@@ -5384,6 +5794,9 @@ def instruction_buildability(
             if (!rgb) {{
               delete crop.picked_rgb;
               crop.closest_color_matches = [];
+              delete crop.picked_sample_xy;
+              delete crop.picked_sample_radius;
+              crop.manual_calibration_status = "";
               updatePickerDiagnostics(crop, {{
                 sampledRgb: "No valid colour sampled",
                 closestCount: 0,
@@ -5402,6 +5815,12 @@ def instruction_buildability(
               return;
             }}
             crop.picked_rgb = rgb;
+            crop.picked_sample_xy = {{
+              x: Number(canvasX),
+              y: Number(canvasY),
+            }};
+            crop.picked_sample_radius = 2;
+            crop.manual_calibration_status = "";
             crop.closest_color_matches = closestLegoColorMatches(rgb, 6, {{
               metallicMode: metallicModeEnabled(crop),
             }});
@@ -5484,6 +5903,22 @@ def manual_match_review(
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
     parts = list(parts_payload.get("parts", []) or [])
+    color_ids = sorted(
+        {
+            int(part["color_id"])
+            for part in parts
+            if part.get("color_id") is not None and _coerce_int(part.get("color_id")) is not None
+        }
+    )
+    lego_colors = sorted(
+        _load_catalog_colors_for_ids(color_ids),
+        key=lambda item: (
+            1 if int(item.get("color_id", 0)) == 9999 else 0,
+            str(item.get("color_name") or "").lower(),
+            int(item.get("color_id", 0)),
+        ),
+    )
+    lego_colors_json = json.dumps(lego_colors)
     labels_payload = _load_existing_labels(_label_store_path(str(set_num), bag_number))
     crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=False)
     crop_tiles: List[str] = []
@@ -5572,7 +6007,7 @@ def manual_match_review(
         }
         candidate_tiles.append(
             f"""
-            <button type="button" class="part-tile-review" data-part-tile data-part-key="{escape(key)}" data-part-tile-index="{idx}">
+            <button type="button" class="part-tile-review" data-part-tile data-part-key="{escape(key)}" data-part-tile-index="{idx}" data-part-color-id="{int(part.get('color_id', 0) or 0)}" data-part-color-name="{escape(str(part.get('color_name') or 'n/a'))}">
               <div class="part-thumb-review">{f'<img src="{escape(str(part.get("img_url") or ""))}" alt="{escape(str(part.get("part_num") or ""))}" />' if str(part.get("img_url") or "").strip() else 'No image'}</div>
               <div class="crop-meta">
                 <strong>{escape(str(part.get("part_num") or "unknown"))}</strong><br/>
@@ -5595,12 +6030,17 @@ def manual_match_review(
         body {{ font-family: Arial, sans-serif; margin: 24px; background: #f4f7fb; color: #1f2d3d; }}
         .card {{ background: #fff; border: 1px solid #d6dee8; border-radius: 14px; padding: 18px; }}
         .layout {{ display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr); gap: 16px; align-items: start; }}
+        .manual-review-left, .manual-review-right {{ min-height: 0; }}
+        .manual-review-left {{ display: block; }}
+        .manual-review-right {{ display: block; }}
+        .manual-review-panel {{ display: block; }}
         .crop-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }}
-        .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; }}
+        .crop-grid-wrap {{ padding-top: 12px; }}
+        .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; cursor: pointer; }}
         .crop-tile.selected, .part-tile-review.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
         .crop-thumb {{ min-height: 110px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
         .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; }}
-        .part-grid-review {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }}
+        .part-grid-review {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; align-content: start; }}
         .part-tile-review {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; cursor: pointer; }}
         .part-thumb-review {{ min-height: 96px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
         .part-thumb-review img {{ max-width: 100%; max-height: 96px; display: block; }}
@@ -5610,15 +6050,38 @@ def manual_match_review(
         .slot-btn.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
         .slot-btn.assigned {{ background: #eef6ef; border-color: #7db28a; color: #2f6c41; cursor: default; }}
         .slot-empty {{ color: #6c7c8d; font-size: 12px; }}
+        .hidden {{ display: none !important; }}
+        .candidate-filter-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 6px; font-size: 13px; color: #627283; flex-wrap: wrap; }}
+        .candidate-filter-controls {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; overflow: visible; align-content: flex-start; padding: 2px 0 4px; }}
+        .candidate-filter-clear {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; color: #627283; padding: 10px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }}
+        .candidate-filter-controls .colour-match {{ display: inline-flex; align-items: center; gap: 9px; text-align: left; border: 1px solid #cbd6e2; border-radius: 999px; background: #fff; padding: 10px 16px; min-height: 42px; cursor: pointer; font-size: 13px; font-weight: 600; line-height: 1.2; white-space: normal; max-width: 100%; box-shadow: 0 1px 2px rgba(31, 45, 61, 0.06); }}
+        .candidate-filter-controls .colour-match .colour-swatch {{ width: 16px; height: 16px; flex: 0 0 16px; }}
+        .candidate-filter-controls .colour-match.active {{ border-color: #cf1f1f; background: #fff1f1; box-shadow: 0 0 0 2px rgba(207, 31, 31, 0.08); color: #7d1d1d; }}
         .status-bar {{ margin-top: 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 13px; }}
+        .manual-crop-preview {{ position: sticky; top: 12px; z-index: 2; flex: 0 0 auto; margin-top: 16px; border: 1px solid #cf1f1f; border-radius: 14px; background: #fff7f7; box-shadow: 0 14px 28px rgba(31, 45, 61, 0.12); overflow: hidden; max-height: min(56vh, 540px); }}
+        .manual-crop-preview.hidden {{ display: none; }}
+        .manual-crop-preview-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #f0d1d1; }}
+        .manual-crop-preview-title-row {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+        .manual-crop-preview-title {{ font-size: 13px; font-weight: 700; min-width: 0; }}
+        .manual-crop-picker-btn {{ border: 1px solid #d6dee8; border-radius: 999px; background: #fff; color: #4d6175; padding: 7px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }}
+        .manual-crop-picker-btn.active {{ border-color: #cf1f1f; background: #fff1f1; color: #7d1d1d; }}
+        .manual-crop-preview-close {{ border: 0; border-radius: 999px; width: 30px; height: 30px; background: #ffffff; color: #7d1d1d; font-size: 18px; line-height: 1; cursor: pointer; box-shadow: 0 2px 8px rgba(31, 45, 61, 0.12); }}
+        .manual-crop-preview-body {{ display: flex; flex-direction: column; max-height: calc(min(56vh, 540px) - 56px); overflow-y: auto; }}
+        .manual-crop-preview-frame {{ height: clamp(220px, 26vh, 280px); min-height: 220px; max-height: 280px; display: flex; align-items: center; justify-content: center; padding: 12px 14px; background: #f4f7fb; overflow: hidden; }}
+        .manual-crop-preview-frame img {{ width: 100%; height: 100%; max-width: 100%; max-height: 100%; display: block; object-fit: contain; }}
+        .manual-crop-preview-frame.picker-active, .manual-crop-preview-frame.picker-active img {{ cursor: crosshair; }}
+        .manual-crop-preview-meta {{ padding: 10px 14px 12px; font-size: 12px; line-height: 1.45; color: #4d6175; }}
+        .manual-crop-preview-slot-list {{ display: flex; flex-direction: column; gap: 6px; padding: 0 14px 12px; }}
         .assign-btn {{ border: 0; border-radius: 10px; background: #cf1f1f; color: #fff; padding: 10px 14px; font-weight: 700; cursor: pointer; }}
         .assign-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
-        @media (max-width: 980px) {{ .layout {{ grid-template-columns: 1fr; }} }}
+        @media (max-width: 980px) {{
+          .layout {{ grid-template-columns: 1fr; }}
+        }}
       </style>
     </head>
     <body>
       <div class="layout">
-        <div class="card">
+        <div class="card manual-review-panel manual-review-left">
           <h1>Manual Match Review</h1>
           <p>set_num: {escape(str(set_num))}</p>
           <p>bag: {bag_number}</p>
@@ -5626,13 +6089,34 @@ def manual_match_review(
             <span id="manual-match-status">Selected crop: none | Selected part: none</span>
             <button type="button" class="assign-btn" id="manual-assign-btn" disabled>Assign Selected</button>
           </div>
-          <div class="crop-grid">
-            {"".join(crop_tiles) if crop_tiles else "<div>No crops found.</div>"}
+          <div class="manual-crop-preview hidden" id="manual-crop-preview">
+            <div class="manual-crop-preview-head">
+              <div class="manual-crop-preview-title-row">
+                <div class="manual-crop-preview-title" id="manual-crop-preview-title">Selected crop preview</div>
+                <button type="button" class="manual-crop-picker-btn" id="manual-crop-picker-btn">Pick colour from crop</button>
+              </div>
+              <button type="button" class="manual-crop-preview-close" id="manual-crop-preview-close" aria-label="Close crop preview">×</button>
+            </div>
+            <div class="manual-crop-preview-body">
+              <div class="manual-crop-preview-frame" id="manual-crop-preview-frame"></div>
+              <div class="manual-crop-preview-meta" id="manual-crop-preview-meta"></div>
+              <div class="manual-crop-preview-slot-list" id="manual-crop-preview-slots"></div>
+            </div>
+          </div>
+          <div class="crop-grid-wrap" id="manual-crop-grid-wrap">
+            <div class="crop-grid">
+              {"".join(crop_tiles) if crop_tiles else "<div>No crops found.</div>"}
+            </div>
           </div>
         </div>
-        <div class="card">
+        <div class="card manual-review-panel manual-review-right">
           <h2>Candidate Parts</h2>
           <p>Full remaining part library for set {escape(str(set_num))} / bag {bag_number}</p>
+          <div class="candidate-filter-bar">
+            <span id="candidate-filter-status">Colour filter: none</span>
+            <button type="button" class="candidate-filter-clear hidden" id="candidate-filter-clear">Clear filter</button>
+          </div>
+          <div class="candidate-filter-controls" id="candidate-filter-controls"></div>
           <div class="part-grid-review">
             {"".join(candidate_tiles) if candidate_tiles else "<div>No candidates available.</div>"}
           </div>
@@ -5641,10 +6125,247 @@ def manual_match_review(
       <script>
         const reviewCrops = {review_crops_json};
         const reviewParts = {review_parts_json};
+        window.legoColors = {lego_colors_json};
         const cropReviewMap = new Map(reviewCrops.map((item) => [String(item.crop_id || ""), item]));
+        const candidateColorRgbById = new Map(
+          (window.legoColors || [])
+            .map((candidate) => {{
+              const colorId = Number(candidate && candidate.color_id);
+              const rgbHex = String((candidate && candidate.rgb) || "").trim().replace(/^#/, "").replace(/^0x/i, "").toUpperCase();
+              if (!Number.isFinite(colorId) || rgbHex.length !== 6 || !/^[0-9A-F]{{6}}$/.test(rgbHex)) {{
+                return null;
+              }}
+              return [colorId, rgbHex];
+            }})
+            .filter(Boolean)
+        );
+        const availableFilterColors = Array.from(
+          new Map(
+            Object.values(reviewParts || {{}})
+              .map((part) => {{
+                const colorId = Number(part && part.color_id);
+                if (!Number.isFinite(colorId)) {{
+                  return null;
+                }}
+                return [
+                  colorId,
+                  {{
+                    color_id: colorId,
+                    color_name: String((part && part.color_name) || ("Color " + colorId)),
+                    rgb: String(candidateColorRgbById.get(colorId) || ""),
+                  }},
+                ];
+              }})
+              .filter(Boolean)
+          ).values()
+        ).sort((a, b) => Number(a.color_id || 0) - Number(b.color_id || 0));
         let selectedCropId = "";
         let selectedPartKey = "";
         let selectedSlotIndex = null;
+        let colourOverride = null;
+        let activeColourFilter = null;
+        let metallicOnly = false;
+        let cropPickerActive = false;
+        let previewDismissed = false;
+        let previewSelectionKey = "";
+        function isMetallicStyleColorName(colorName) {{
+          const normalized = String(colorName || "").toLowerCase();
+          return [
+            "pearl",
+            "metallic",
+            "chrome",
+            "silver",
+            "gold",
+            "trans",
+            "titanium",
+            "copper",
+          ].some((term) => normalized.includes(term));
+        }}
+        function rgbHexToTuple(rgbHex) {{
+          if (!rgbHex || rgbHex.length !== 6 || !/^[0-9A-F]{{6}}$/.test(rgbHex)) {{
+            return null;
+          }}
+          return [
+            parseInt(rgbHex.slice(0, 2), 16),
+            parseInt(rgbHex.slice(2, 4), 16),
+            parseInt(rgbHex.slice(4, 6), 16),
+          ];
+        }}
+        function squaredRgbDistance(a, b) {{
+          return (
+            Math.pow(Number(a[0] || 0) - Number(b[0] || 0), 2) +
+            Math.pow(Number(a[1] || 0) - Number(b[1] || 0), 2) +
+            Math.pow(Number(a[2] || 0) - Number(b[2] || 0), 2)
+          );
+        }}
+        function activeFilterLabel() {{
+          if (activeColourFilter === null) {{
+            return "none";
+          }}
+          const match = availableFilterColors.find((candidate) => candidate.color_id === Number(activeColourFilter));
+          return match ? (match.color_name + " (" + match.color_id + ")") : String(activeColourFilter);
+        }}
+        function setActiveColourFilter(colorId) {{
+          activeColourFilter = Number.isFinite(Number(colorId)) ? Number(colorId) : null;
+          applyActiveColourFilter();
+          renderCandidateFilterControls();
+        }}
+        function clearActiveColourFilter() {{
+          activeColourFilter = null;
+          applyActiveColourFilter();
+          renderCandidateFilterControls();
+        }}
+        function toggleMetallicOnly() {{
+          metallicOnly = !metallicOnly;
+          applyActiveColourFilter();
+          renderCandidateFilterControls();
+        }}
+        function applyActiveColourFilter() {{
+          document.querySelectorAll("[data-part-tile]").forEach((node) => {{
+            const colorId = Number(node.dataset.partColorId || NaN);
+            const colorName = String(node.dataset.partColorName || "");
+            const matchesColour = activeColourFilter === null || colorId === Number(activeColourFilter);
+            const matchesMetallic = !metallicOnly || isMetallicStyleColorName(colorName);
+            const isVisible = matchesColour && matchesMetallic;
+            node.classList.toggle("hidden", !isVisible);
+          }});
+          const filterStatus = document.getElementById("candidate-filter-status");
+          const clearButton = document.getElementById("candidate-filter-clear");
+          if (filterStatus) {{
+            filterStatus.textContent = "Colour filter: " + activeFilterLabel() + (metallicOnly ? " | Metallic only" : "");
+          }}
+          if (clearButton) {{
+            clearButton.classList.toggle("hidden", activeColourFilter === null);
+          }}
+        }}
+        function renderCandidateFilterControls() {{
+          const list = document.getElementById("candidate-filter-controls");
+          if (!list) {{
+            return;
+          }}
+          if (!availableFilterColors.length) {{
+            list.innerHTML = '<div class="slot-empty">No part colours available.</div>';
+            return;
+          }}
+          list.innerHTML = `
+            <button
+              type="button"
+              class="colour-match${{activeColourFilter === null ? " active" : ""}}"
+              data-candidate-filter-clear="true"
+            >
+              All colours
+            </button>
+            <button
+              type="button"
+              class="colour-match${{metallicOnly ? " active" : ""}}"
+              data-candidate-filter-metallic="true"
+            >
+              Metallic only
+            </button>
+          ` + availableFilterColors.map((candidate) => `
+            <button
+              type="button"
+              class="colour-match${{activeColourFilter === candidate.color_id ? " active" : ""}}"
+              data-candidate-filter-colour="${{candidate.color_id}}"
+            >
+              <span>${{candidate.color_name}} (${{candidate.color_id}})</span>
+            </button>
+          `).join("");
+          list.querySelector('[data-candidate-filter-clear="true"]')?.addEventListener("click", () => {{
+            clearActiveColourFilter();
+          }});
+          list.querySelector('[data-candidate-filter-metallic="true"]')?.addEventListener("click", () => {{
+            toggleMetallicOnly();
+          }});
+          list.querySelectorAll("[data-candidate-filter-colour]").forEach((button) => {{
+            button.addEventListener("click", () => {{
+              setActiveColourFilter(Number(button.dataset.candidateFilterColour || 0));
+            }});
+          }});
+        }}
+        function currentPreviewSelectionKey() {{
+          return String(selectedCropId || "") + "::" + String(selectedSlotIndex === null ? "none" : selectedSlotIndex);
+        }}
+        function syncCropPickerUI() {{
+          const button = document.getElementById("manual-crop-picker-btn");
+          const frame = document.getElementById("manual-crop-preview-frame");
+          if (button) {{
+            button.classList.toggle("active", cropPickerActive);
+            button.textContent = cropPickerActive ? "Click crop to sample" : "Pick colour from crop";
+          }}
+          if (frame) {{
+            frame.classList.toggle("picker-active", cropPickerActive);
+          }}
+        }}
+        function setCropPickerActive(isActive) {{
+          cropPickerActive = !!isActive;
+          syncCropPickerUI();
+        }}
+        function sampleNearestCandidateColourFromPreview(event) {{
+          if (!cropPickerActive) {{
+            return;
+          }}
+          const frame = document.getElementById("manual-crop-preview-frame");
+          const image = frame ? frame.querySelector("img") : null;
+          if (!frame || !image || !image.naturalWidth || !image.naturalHeight) {{
+            return;
+          }}
+          const rect = image.getBoundingClientRect();
+          if (!rect.width || !rect.height) {{
+            return;
+          }}
+          const relX = event.clientX - rect.left;
+          const relY = event.clientY - rect.top;
+          if (relX < 0 || relY < 0 || relX > rect.width || relY > rect.height) {{
+            return;
+          }}
+          const sampleX = Math.max(0, Math.min(image.naturalWidth - 1, Math.round((relX / rect.width) * image.naturalWidth)));
+          const sampleY = Math.max(0, Math.min(image.naturalHeight - 1, Math.round((relY / rect.height) * image.naturalHeight)));
+          const canvas = document.createElement("canvas");
+          canvas.width = image.naturalWidth;
+          canvas.height = image.naturalHeight;
+          const ctx = canvas.getContext("2d", {{ willReadFrequently: true }});
+          if (!ctx) {{
+            return;
+          }}
+          ctx.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight);
+          const radius = 2;
+          let r = 0;
+          let g = 0;
+          let b = 0;
+          let count = 0;
+          for (let dy = -radius; dy <= radius; dy += 1) {{
+            for (let dx = -radius; dx <= radius; dx += 1) {{
+              const px = Math.max(0, Math.min(image.naturalWidth - 1, sampleX + dx));
+              const py = Math.max(0, Math.min(image.naturalHeight - 1, sampleY + dy));
+              const pixel = ctx.getImageData(px, py, 1, 1).data;
+              r += Number(pixel[0] || 0);
+              g += Number(pixel[1] || 0);
+              b += Number(pixel[2] || 0);
+              count += 1;
+            }}
+          }}
+          if (!count) {{
+            return;
+          }}
+          const sampled = [Math.round(r / count), Math.round(g / count), Math.round(b / count)];
+          let bestMatch = null;
+          let bestDistance = Number.POSITIVE_INFINITY;
+          availableFilterColors.forEach((candidate) => {{
+            const rgb = rgbHexToTuple(String(candidate.rgb || ""));
+            if (!rgb) {{
+              return;
+            }}
+            const distance = squaredRgbDistance(sampled, rgb);
+            if (distance < bestDistance) {{
+              bestDistance = distance;
+              bestMatch = candidate;
+            }}
+          }});
+          if (bestMatch) {{
+            setActiveColourFilter(Number(bestMatch.color_id));
+          }}
+        }}
         function updateManualMatchStatus() {{
           const status = document.getElementById("manual-match-status");
           const button = document.getElementById("manual-assign-btn");
@@ -5671,6 +6392,73 @@ def manual_match_review(
               cropTile.classList.toggle("selected", crop.crop_id === selectedCropId);
             }}
           }});
+          syncCropPreview();
+        }}
+        function syncCropPreview() {{
+          const preview = document.getElementById("manual-crop-preview");
+          const frame = document.getElementById("manual-crop-preview-frame");
+          const meta = document.getElementById("manual-crop-preview-meta");
+          const slots = document.getElementById("manual-crop-preview-slots");
+          const title = document.getElementById("manual-crop-preview-title");
+          if (!preview || !frame || !meta || !slots || !title) {{
+            return;
+          }}
+          const crop = selectedCropId ? cropReviewMap.get(selectedCropId) : null;
+          const selectionKey = currentPreviewSelectionKey();
+          if (selectionKey !== previewSelectionKey) {{
+            previewSelectionKey = selectionKey;
+            previewDismissed = false;
+          }}
+          if (!crop || previewDismissed) {{
+            preview.classList.add("hidden");
+            setCropPickerActive(false);
+            return;
+          }}
+          const cropTile = document.querySelector('[data-crop-tile][data-crop-id="' + crop.crop_id + '"]');
+          const sourceImage = cropTile ? cropTile.querySelector(".crop-thumb img") : null;
+          frame.innerHTML = "";
+          if (sourceImage) {{
+            const previewImage = sourceImage.cloneNode(true);
+            previewImage.removeAttribute("onclick");
+            previewImage.removeAttribute("loading");
+            previewImage.removeAttribute("data-src");
+            frame.appendChild(previewImage);
+          }} else {{
+            frame.textContent = "Crop preview unavailable";
+          }}
+          const slotText = selectedSlotIndex === null ? "none" : "Slot " + String(Number(selectedSlotIndex) + 1);
+          title.textContent = "Preview: " + String(crop.crop_id || "selected crop");
+          meta.innerHTML = `
+            <strong>${{String(crop.crop_id || "selected crop")}}</strong><br/>
+            page ${{String(crop.page || "?")}} | step ${{String(crop.step || "?")}} | selected slot: ${{slotText}}
+          `;
+          const sequence = Array.isArray(crop.slot_sequence) ? crop.slot_sequence : [];
+          const filled = Number(crop.filled_slots || 0);
+          slots.innerHTML = sequence.length
+            ? sequence.map((slot, idx) => `
+                <button
+                  type="button"
+                  class="slot-btn${{idx < filled ? " assigned" : ""}}${{idx === Number(selectedSlotIndex) ? " selected" : ""}}"
+                  data-preview-slot-index="${{idx}}"
+                  data-preview-slot-assigned="${{idx < filled ? "true" : "false"}}"
+                >
+                  Slot ${{idx + 1}}: ${{slot && (slot.qty_text || slot.qty || "none")}}
+                </button>
+              `).join("")
+            : '<div class="slot-empty">No qty slots</div>';
+          slots.querySelectorAll("[data-preview-slot-index]").forEach((button) => {{
+            button.addEventListener("click", () => {{
+              if (String(button.dataset.previewSlotAssigned || "") === "true") {{
+                return;
+              }}
+              selectedCropId = String(crop.crop_id || "");
+              selectedSlotIndex = Number(button.dataset.previewSlotIndex || 0);
+              refreshSlotUI();
+              updateManualMatchStatus();
+            }});
+          }});
+          syncCropPickerUI();
+          preview.classList.remove("hidden");
         }}
         function selectNextOpenSlot(fromCropId) {{
           const startIndex = Math.max(0, reviewCrops.findIndex((item) => String(item.crop_id || "") === String(fromCropId || "")));
@@ -5705,6 +6493,31 @@ def manual_match_review(
             updateManualMatchStatus();
           }});
         }});
+        document.querySelectorAll("[data-crop-tile]").forEach((el) => {{
+          el.addEventListener("click", (event) => {{
+            if (event.target.closest("[data-crop-slot]")) {{
+              return;
+            }}
+            selectedCropId = String(el.dataset.cropId || "");
+            selectedSlotIndex = null;
+            refreshSlotUI();
+            updateManualMatchStatus();
+          }});
+        }});
+        document.getElementById("manual-crop-preview-close")?.addEventListener("click", () => {{
+          previewDismissed = true;
+          setCropPickerActive(false);
+          document.getElementById("manual-crop-preview")?.classList.add("hidden");
+        }});
+        document.getElementById("manual-crop-picker-btn")?.addEventListener("click", () => {{
+          setCropPickerActive(!cropPickerActive);
+        }});
+        document.getElementById("manual-crop-preview-frame")?.addEventListener("click", (event) => {{
+          sampleNearestCandidateColourFromPreview(event);
+        }});
+        document.getElementById("candidate-filter-clear")?.addEventListener("click", () => {{
+          clearActiveColourFilter();
+        }});
         document.querySelectorAll("[data-part-tile]").forEach((el) => {{
           el.addEventListener("click", () => {{
             selectedPartKey = String(el.dataset.partKey || "");
@@ -5734,8 +6547,8 @@ def manual_match_review(
             qty: slot.qty != null ? slot.qty : null,
             qty_text: slot.qty_text ? slot.qty_text : null,
             part_num: part.part_num,
-            color_id: part.color_id,
-            color_name: part.color_name || null,
+            color_id: colourOverride !== null ? colourOverride.color_id : part.color_id,
+            color_name: colourOverride !== null ? colourOverride.color_name : (part.color_name || null),
             element_id: part.element_id || null,
             selected_slot_index: selectedSlotIndex,
             adjustments: [{{ type: "manual_match_slot", slot_index: selectedSlotIndex }}],
@@ -5773,6 +6586,8 @@ def manual_match_review(
           selectNextOpenSlot(selectedCropId);
           console.log("Assigned", payload);
         }});
+        renderCandidateFilterControls();
+        applyActiveColourFilter();
         refreshSlotUI();
         updateManualMatchStatus();
       </script>
