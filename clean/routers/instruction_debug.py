@@ -2281,13 +2281,11 @@ async def ai_rank_slot(req: Request):
         if isinstance(item, dict)
     ]
     selected_qty_box: Optional[Dict[str, Any]] = None
-    selected_qty_box_candidates = [int(slot_index)]
-    if int(slot_index) > 0:
-        selected_qty_box_candidates.append(int(slot_index) - 1)
-    for candidate_index in selected_qty_box_candidates:
-        if 0 <= int(candidate_index) < len(qty_token_boxes):
-            selected_qty_box = dict(qty_token_boxes[int(candidate_index)])
-            break
+    selected_qty_box_index = int(slot_index) - 1
+    if 0 <= selected_qty_box_index < len(qty_token_boxes):
+        selected_qty_box = dict(qty_token_boxes[selected_qty_box_index])
+    elif qty_token_boxes:
+        selected_qty_box = dict(qty_token_boxes[0])
     manual_color_sample = _latest_manual_color_sample_for_crop(
         set_num,
         crop_id,
@@ -2319,16 +2317,52 @@ async def ai_rank_slot(req: Request):
     fallback_used = True
     ai_failure_reason = ""
     candidate_count = len(mock_ranked_candidates)
+    ai_snap_input_path = ""
+    normalized_path = ""
+    component_path = ""
+    selected_box: Optional[Dict[str, Any]] = None
+    normalization_fallback_reason = ""
 
     temp_crop_path: Optional[Path] = None
     try:
         temp_crop_path = _write_ai_snap_temp_crop_image(crop)
         if temp_crop_path is None:
             ai_failure_reason = "crop_image_unavailable"
+            normalization_fallback_reason = "temp_crop_unavailable"
         else:
+            rank_input_path = str(temp_crop_path)
+            if selected_qty_box is not None:
+                normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), selected_qty_box)
+                if bool(normalized_result.get("ok")) and str(normalized_result.get("normalized_path") or "").strip():
+                    rank_input_path = str(normalized_result.get("normalized_path") or "").strip()
+                    normalized_path = rank_input_path
+                    component_path = str(normalized_result.get("component_path") or "").strip()
+                    selected_box = normalized_result.get("selected_box")
+                else:
+                    normalization_fallback_reason = str(
+                        ((normalized_result.get("debug") or {}).get("error"))
+                        or "slot_normalization_failed"
+                    ).strip() or "slot_normalization_failed"
+            else:
+                normalization_fallback_reason = "selected_qty_box_unavailable"
+            ai_snap_input_path = rank_input_path
+            if not normalized_path and not normalization_fallback_reason:
+                normalization_fallback_reason = "normalized_path_unavailable"
+            print(
+                "[ai-snap] crop_id=%s slot_index=%s selected_qty_box=%s normalized_path=%s component_path=%s ai_snap_input_path=%s fallback_reason=%s"
+                % (
+                    str(crop_id),
+                    str(slot_index),
+                    json.dumps(selected_qty_box, ensure_ascii=True, sort_keys=True) if selected_qty_box is not None else "null",
+                    str(normalized_path or ""),
+                    str(component_path or ""),
+                    str(ai_snap_input_path or ""),
+                    str(normalization_fallback_reason or ""),
+                )
+            )
             local_color_ids = [int(manual_color_filter_id)] if manual_color_filter_id is not None else None
             local_candidates = get_part_candidates_for_crop(
-                str(temp_crop_path),
+                rank_input_path,
                 max_candidates=8,
                 color_ids=local_color_ids,
                 metallic_mode=bool(crop.get("manual_metallic_mode")),
@@ -2363,6 +2397,14 @@ async def ai_rank_slot(req: Request):
                     }
                 )
                 seen_candidate_keys.add(key)
+            if manual_color_filter_id is not None and filtered_candidates:
+                exact_color_candidates = [
+                    dict(candidate)
+                    for candidate in filtered_candidates
+                    if int(candidate.get("color_id", 0) or 0) == int(manual_color_filter_id)
+                ]
+                if exact_color_candidates:
+                    filtered_candidates = exact_color_candidates
             candidate_count = len(filtered_candidates)
             if not filtered_candidates:
                 ai_failure_reason = "no_preranked_candidates"
@@ -2371,7 +2413,7 @@ async def ai_rank_slot(req: Request):
                     "crop_id": crop_id,
                     "page": int(crop.get("page", 0) or 0),
                     "step": int(crop.get("step", 0) or 0),
-                    "crop_image_path": str(temp_crop_path),
+                    "crop_image_path": rank_input_path,
                     "slot_index": int(slot_index),
                     "slot_qty_text": slot_qty_text,
                     "manual_color_filter_id": manual_color_filter_id,
@@ -2413,7 +2455,11 @@ async def ai_rank_slot(req: Request):
             "slot_qty": slot_qty,
             "slot_qty_text": slot_qty_text,
             "sequence_length": len(sequence),
+            "ai_snap_input_path": ai_snap_input_path,
+            "normalized_path": normalized_path,
+            "component_path": component_path,
             "selected_qty_box": selected_qty_box,
+            "selected_box": selected_box,
             "qty_token_box_count": len(qty_token_boxes),
             "crop_image_path": str(crop.get("crop_image_path") or ""),
             "crop_image_available": bool(str(crop.get("data_uri") or "").strip() or str(crop.get("crop_image_path") or "").strip()),
