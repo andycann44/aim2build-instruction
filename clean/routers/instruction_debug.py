@@ -26,7 +26,9 @@ from clean.routers.debug import (
     _response_text_to_json_debug,
 )
 from clean.services import debug_service, step_detector_service
+from clean.services.azure_openai_service import rank_crop_candidates
 from clean.services.part_candidate_service import get_part_candidates_for_crop
+from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
 
 router = APIRouter()
@@ -1043,6 +1045,323 @@ def _normalize_part_entry(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _base_part_num_for_display_fallback(part_num: Any) -> Optional[str]:
+    text = str(part_num or "").strip()
+    if re.fullmatch(r".+[A-Za-z]", text) and not re.search(r"[A-Za-z]{2,}$", text):
+        return text[:-1]
+    return None
+
+
+def _resolve_display_part_record(
+    raw_parts_by_key: Dict[str, Dict[str, Any]],
+    part_num: Any,
+    color_id: Any,
+) -> Dict[str, Any]:
+    normalized_part_num = str(part_num or "").strip()
+    normalized_color_id = int(color_id or 0)
+    exact = dict(
+        raw_parts_by_key.get(f"{normalized_part_num}::{normalized_color_id}", {}) or {}
+    )
+    resolved = dict(exact)
+    fallback_part_num = _base_part_num_for_display_fallback(normalized_part_num)
+    if not fallback_part_num:
+        return resolved
+    fallback = dict(
+        raw_parts_by_key.get(f"{fallback_part_num}::{normalized_color_id}", {}) or {}
+    )
+    if not fallback:
+        return resolved
+    if not str(resolved.get("img_url") or "").strip() and str(fallback.get("img_url") or "").strip():
+        resolved["img_url"] = str(fallback.get("img_url") or "").strip()
+    if not str(resolved.get("element_id") or "").strip() and str(fallback.get("element_id") or "").strip():
+        resolved["element_id"] = str(fallback.get("element_id") or "").strip()
+    if (
+        (
+            str(resolved.get("img_url") or "").strip()
+            or str(resolved.get("element_id") or "").strip()
+        )
+        and fallback_part_num != normalized_part_num
+    ):
+        resolved["display_part_num"] = fallback_part_num
+    return resolved
+
+
+def _prepare_instruction_parts_for_display(parts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    raw_parts = [dict(part or {}) for part in list(parts or [])]
+    raw_parts_by_key = {
+        f"{str(part.get('part_num') or '').strip()}::{int(part.get('color_id', 0) or 0)}": part
+        for part in raw_parts
+    }
+    prepared: List[Dict[str, Any]] = []
+    for part in raw_parts:
+        part_copy = dict(part)
+        resolved = _resolve_display_part_record(
+            raw_parts_by_key,
+            part_copy.get("part_num"),
+            part_copy.get("color_id"),
+        )
+        if str(resolved.get("img_url") or "").strip():
+            part_copy["img_url"] = str(resolved.get("img_url") or "").strip()
+        if str(resolved.get("element_id") or "").strip():
+            part_copy["element_id"] = str(resolved.get("element_id") or "").strip()
+        if str(resolved.get("display_part_num") or "").strip():
+            part_copy["display_part_num"] = str(resolved.get("display_part_num") or "").strip()
+        prepared.append(part_copy)
+    return prepared
+
+
+def _candidate_part_key(part_num: Any, color_id: Any) -> str:
+    return f"{str(part_num or '').strip()}::{int(color_id or 0)}"
+
+
+def _ai_snap_crop_from_saved_record(crop_id: str, saved_crop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    crop_box = _coerce_box_list(saved_crop.get("crop_box"))
+    crop_image_path = str(saved_crop.get("crop_image_path") or "").strip()
+    data_uri = ""
+    if crop_box is not None and crop_image_path:
+        img = cv2.imread(crop_image_path)
+        if img is not None:
+            data_uri = str(_encode_contact_sheet_crop(img, crop_box, max_edge=420) or "")
+    qty_token_boxes = [
+        dict(item)
+        for item in list(saved_crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    return {
+        "crop_id": str(crop_id or "").strip(),
+        "page": int(saved_crop.get("page", 0) or 0),
+        "step": int(saved_crop.get("step", 0) or 0),
+        "qty_text": _coerce_str_list(saved_crop.get("qty_text", [])),
+        "qty_numbers": _coerce_int_list(saved_crop.get("qty", [])),
+        "qty_label": ", ".join(_coerce_str_list(saved_crop.get("qty_text", []))) or "none",
+        "crop_box": crop_box or [],
+        "crop_box_format": str(saved_crop.get("crop_box_format") or "xywh"),
+        "crop_image_path": crop_image_path,
+        "confidence": _coerce_float(saved_crop.get("confidence")),
+        "data_uri": data_uri,
+        "qty_token_boxes": qty_token_boxes,
+    }
+
+
+def _load_crop_for_ai_snap(set_num: str, bag: int, crop_id: str) -> Optional[Dict[str, Any]]:
+    labels_path = _label_store_path(str(set_num), int(bag))
+    labels_payload = _load_existing_labels(labels_path)
+    saved_crop = dict(labels_payload.get("crops", {}).get(crop_id) or {})
+    built_crops = _build_instruction_callout_crops(str(set_num), int(bag), ai_enabled=False)
+    built_by_id = {
+        str(item.get("crop_id") or "").strip(): dict(item or {})
+        for item in built_crops
+        if str(item.get("crop_id") or "").strip()
+    }
+    crop = dict(built_by_id.get(crop_id) or {})
+    if not crop and saved_crop:
+        crop = _ai_snap_crop_from_saved_record(crop_id, saved_crop) or {}
+    if not crop:
+        return None
+
+    saved_qty_text = _coerce_str_list(saved_crop.get("qty_text", []))
+    saved_qty_numbers = _coerce_int_list(saved_crop.get("qty", []))
+    crop["page"] = int(saved_crop.get("page", crop.get("page", 0)) or crop.get("page", 0) or 0)
+    crop["step"] = int(saved_crop.get("step", crop.get("step", 0)) or crop.get("step", 0) or 0)
+    crop["crop_box"] = _coerce_box_list(saved_crop.get("crop_box")) or _coerce_box_list(crop.get("crop_box")) or []
+    crop["crop_box_format"] = str(saved_crop.get("crop_box_format") or crop.get("crop_box_format") or "xywh")
+    crop["crop_image_path"] = str(saved_crop.get("crop_image_path") or crop.get("crop_image_path") or "")
+    crop["confidence"] = _coerce_float(saved_crop.get("confidence", crop.get("confidence")))
+    built_qty_token_boxes = [
+        dict(item)
+        for item in list(crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    saved_qty_token_boxes = [
+        dict(item)
+        for item in list(saved_crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    crop["qty_token_boxes"] = saved_qty_token_boxes or built_qty_token_boxes
+    if saved_qty_text:
+        crop["qty_text"] = saved_qty_text
+        crop["qty_numbers"] = saved_qty_numbers
+    else:
+        crop["qty_text"] = _coerce_str_list(crop.get("qty_text", []))
+        crop["qty_numbers"] = _coerce_int_list(crop.get("qty_numbers", crop.get("qty", [])))
+    crop["qty_label"] = ", ".join(list(crop.get("qty_text", []) or [])) or "none"
+    if not str(crop.get("data_uri") or "").strip():
+        crop_box = _coerce_box_list(crop.get("crop_box"))
+        crop_image_path = str(crop.get("crop_image_path") or "").strip()
+        if crop_box is not None and crop_image_path:
+            img = cv2.imread(crop_image_path)
+            if img is not None:
+                crop["data_uri"] = str(_encode_contact_sheet_crop(img, crop_box, max_edge=420) or "")
+    return crop
+
+
+def _assigned_part_totals_from_labels(labels_payload: Dict[str, Any]) -> Dict[str, int]:
+    totals: Dict[str, int] = {}
+    for crop_data in dict(labels_payload.get("crops") or {}).values():
+        crop_dict = crop_data if isinstance(crop_data, dict) else {}
+        for raw_part in list(crop_dict.get("parts", []) or []):
+            normalized_part = _normalize_part_entry(raw_part if isinstance(raw_part, dict) else {})
+            if not normalized_part["part_num"]:
+                continue
+            qty_value = _coerce_int(normalized_part.get("qty"))
+            assigned_qty = int(qty_value) if qty_value is not None and int(qty_value) > 0 else 1
+            key = _candidate_part_key(normalized_part["part_num"], normalized_part["color_id"])
+            totals[key] = totals.get(key, 0) + assigned_qty
+    return totals
+
+
+def _latest_manual_color_sample_for_crop(set_num: str, crop_id: str, page: int, step: int) -> Optional[Dict[str, Any]]:
+    samples = list(_load_manual_color_calibration(set_num).get("samples", []) or [])
+    exact_match: Optional[Dict[str, Any]] = None
+    page_step_match: Optional[Dict[str, Any]] = None
+    for sample in reversed(samples):
+        if not isinstance(sample, dict):
+            continue
+        sample_color_id = _coerce_int(sample.get("color_id"))
+        if sample_color_id is None:
+            continue
+        if str(sample.get("crop_id") or "").strip() == str(crop_id or "").strip():
+            exact_match = sample
+            break
+        if (
+            _coerce_int(sample.get("page")) == int(page or 0)
+            and _coerce_int(sample.get("step")) == int(step or 0)
+        ):
+            page_step_match = sample
+    return exact_match or page_step_match
+
+
+def _remaining_part_rows_for_ai_snap(
+    parts: List[Dict[str, Any]],
+    assigned_totals: Dict[str, int],
+) -> Dict[str, Dict[str, Any]]:
+    remaining_rows: Dict[str, Dict[str, Any]] = {}
+    for part in list(parts or []):
+        part_num = str(part.get("part_num") or "").strip()
+        color_id = int(part.get("color_id", 0) or 0)
+        if not part_num:
+            continue
+        key = _candidate_part_key(part_num, color_id)
+        required_qty = int(part.get("qty", 0) or 0)
+        assigned_qty = int(assigned_totals.get(key, 0) or 0)
+        remaining_qty = required_qty - assigned_qty
+        if remaining_qty <= 0:
+            continue
+        remaining_rows[key] = {
+            "part_num": part_num,
+            "color_id": color_id,
+            "remaining_qty": remaining_qty,
+            "required_qty": required_qty,
+            "assigned_qty": assigned_qty,
+        }
+    return remaining_rows
+
+
+def _write_ai_snap_temp_crop_image(crop: Dict[str, Any]) -> Optional[Path]:
+    crop_box = _coerce_box_list(crop.get("crop_box"))
+    crop_image_path = str(crop.get("crop_image_path") or "").strip()
+    if not crop_box or not crop_image_path:
+        return None
+    image_path = Path(crop_image_path)
+    if not image_path.exists():
+        return None
+    img = cv2.imread(str(image_path))
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    x, y, w, h = [int(value) for value in crop_box]
+    crop_img = img[max(0, y) : max(0, y) + max(0, h), max(0, x) : max(0, x) + max(0, w)]
+    if crop_img is None or getattr(crop_img, "size", 0) == 0:
+        return None
+    handle = tempfile.NamedTemporaryFile(prefix="ai_snap_crop_", suffix=".png", delete=False)
+    handle.close()
+    out_path = Path(handle.name)
+    ok = cv2.imwrite(str(out_path), crop_img)
+    if not ok:
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    return out_path
+
+
+def _mock_rank_slot_candidates(
+    parts: List[Dict[str, Any]],
+    assigned_totals: Dict[str, int],
+    slot_qty: Optional[int],
+    manual_color_filter_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    ranked: List[Dict[str, Any]] = []
+    for part in list(parts or []):
+        part_num = str(part.get("part_num") or "").strip()
+        color_id = int(part.get("color_id", 0) or 0)
+        if not part_num:
+            continue
+        key = _candidate_part_key(part_num, color_id)
+        required_qty = int(part.get("qty", 0) or 0)
+        assigned_qty = int(assigned_totals.get(key, 0) or 0)
+        remaining_qty = required_qty - assigned_qty
+        if remaining_qty <= 0:
+            continue
+        score = 0.0
+        reasons: List[str] = ["remaining_candidate"]
+        if manual_color_filter_id is not None:
+            if color_id == int(manual_color_filter_id):
+                score += 500.0
+                reasons.append("manual_color_match")
+            else:
+                score -= 60.0
+        if slot_qty is not None and slot_qty > 0:
+            if remaining_qty >= slot_qty:
+                score += 140.0
+                reasons.append("remaining_qty_fits_slot")
+            else:
+                score -= float((slot_qty - remaining_qty) * 18)
+                reasons.append("remaining_qty_below_slot")
+            if required_qty >= slot_qty:
+                score += 40.0
+                reasons.append("set_qty_fits_slot")
+        if str(part.get("img_url") or "").strip():
+            score += 25.0
+            reasons.append("image_available")
+        if str(part.get("element_id") or "").strip():
+            score += 8.0
+        score += min(remaining_qty, 12) * 2.5
+        score += min(required_qty, 20) * 0.75
+        ranked.append(
+            {
+                "part_num": part_num,
+                "display_part_num": str(part.get("display_part_num") or "").strip() or part_num,
+                "color_id": color_id,
+                "color_name": str(part.get("color_name") or f"color {color_id}"),
+                "element_id": str(part.get("element_id") or "").strip() or None,
+                "img_url": str(part.get("img_url") or "").strip(),
+                "required_qty": required_qty,
+                "assigned_qty": assigned_qty,
+                "remaining_qty": remaining_qty,
+                "mock_score": round(score, 3),
+                "reason": ", ".join(reasons),
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            -float(item.get("mock_score", 0.0) or 0.0),
+            -int(item.get("remaining_qty", 0) or 0),
+            str(item.get("part_num") or ""),
+            int(item.get("color_id", 0) or 0),
+        )
+    )
+    top_score = float(ranked[0].get("mock_score", 0.0) or 0.0) if ranked else 0.0
+    for index, candidate in enumerate(ranked):
+        relative_boost = 0.0
+        if top_score > 0:
+            relative_boost = min(0.08, max(0.0, float(candidate.get("mock_score", 0.0) or 0.0) / top_score * 0.08))
+        confidence = max(0.28, min(0.98, 0.9 - (index * 0.12) + relative_boost))
+        candidate["confidence"] = round(confidence, 2)
+        candidate["rank"] = index + 1
+    return ranked
+
+
 def _same_part_entry(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     return (
         str(left.get("part_num") or "").strip() == str(right.get("part_num") or "").strip()
@@ -1920,6 +2239,203 @@ async def save_manual_color_calibration(req: Request):
     }
 
 
+@router.post("/debug/ai-rank-slot")
+async def ai_rank_slot(req: Request):
+    data = await req.json()
+
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag"))
+    crop_id = str(data.get("crop_id") or "").strip()
+    slot_index = _coerce_int(data.get("slot_index"))
+    request_manual_color_filter_id = _coerce_int(data.get("manual_color_filter_id"))
+    request_picked_rgb = data.get("picked_rgb") if isinstance(data.get("picked_rgb"), dict) else {}
+
+    if bag is None or bag < 1:
+        bag = 1
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+    if slot_index is None or slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+
+    labels_path = _label_store_path(set_num, int(bag))
+    labels_payload = _load_existing_labels(labels_path)
+    crop = _load_crop_for_ai_snap(set_num, int(bag), crop_id)
+    if not crop:
+        raise HTTPException(status_code=404, detail="crop not found")
+
+    slot_state = _crop_qty_slot_state(
+        {"parts": list((dict(labels_payload.get("crops", {}).get(crop_id) or {}).get("parts", []) or []))},
+        crop.get("qty_numbers", []),
+        crop.get("qty_text", []),
+    )
+    sequence = list(slot_state.get("sequence", []) or [])
+    if slot_index >= len(sequence):
+        raise HTTPException(status_code=400, detail="slot_index out of range")
+
+    slot = dict(sequence[slot_index] or {})
+    slot_qty = _coerce_int(slot.get("qty"))
+    slot_qty_text = str(slot.get("qty_text") or (f"{slot_qty}x" if slot_qty is not None else "none"))
+    qty_token_boxes = [
+        dict(item)
+        for item in list(crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    selected_qty_box: Optional[Dict[str, Any]] = None
+    selected_qty_box_candidates = [int(slot_index)]
+    if int(slot_index) > 0:
+        selected_qty_box_candidates.append(int(slot_index) - 1)
+    for candidate_index in selected_qty_box_candidates:
+        if 0 <= int(candidate_index) < len(qty_token_boxes):
+            selected_qty_box = dict(qty_token_boxes[int(candidate_index)])
+            break
+    manual_color_sample = _latest_manual_color_sample_for_crop(
+        set_num,
+        crop_id,
+        int(crop.get("page", 0) or 0),
+        int(crop.get("step", 0) or 0),
+    )
+    manual_color_filter_id = request_manual_color_filter_id
+    manual_color_source = "request"
+    if manual_color_filter_id is None and manual_color_sample is not None:
+        manual_color_filter_id = _coerce_int(manual_color_sample.get("color_id"))
+        manual_color_source = "saved_calibration"
+    if manual_color_filter_id is None:
+        manual_color_source = "none"
+
+    parts_payload = load_instruction_set_parts(set_num)
+    parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
+    assigned_totals = _assigned_part_totals_from_labels(labels_payload)
+    mock_ranked_pool = _mock_rank_slot_candidates(
+        parts,
+        assigned_totals,
+        slot_qty=slot_qty,
+        manual_color_filter_id=manual_color_filter_id,
+    )
+    mock_ranked_candidates = mock_ranked_pool[:5]
+    remaining_part_rows = _remaining_part_rows_for_ai_snap(parts, assigned_totals)
+    ranked_candidates = list(mock_ranked_candidates)
+    model_name = "mock-local-ai-snap-v1"
+    ai_enabled = False
+    fallback_used = True
+    ai_failure_reason = ""
+    candidate_count = len(mock_ranked_candidates)
+
+    temp_crop_path: Optional[Path] = None
+    try:
+        temp_crop_path = _write_ai_snap_temp_crop_image(crop)
+        if temp_crop_path is None:
+            ai_failure_reason = "crop_image_unavailable"
+        else:
+            local_color_ids = [int(manual_color_filter_id)] if manual_color_filter_id is not None else None
+            local_candidates = get_part_candidates_for_crop(
+                str(temp_crop_path),
+                max_candidates=8,
+                color_ids=local_color_ids,
+                metallic_mode=bool(crop.get("manual_metallic_mode")),
+                set_num=set_num,
+                remaining_parts=remaining_part_rows,
+                hide_depleted=True,
+            )
+            parts_by_key = {
+                _candidate_part_key(part.get("part_num"), part.get("color_id")): dict(part or {})
+                for part in parts
+            }
+            filtered_candidates: List[Dict[str, Any]] = []
+            seen_candidate_keys = set()
+            for candidate in list(local_candidates or []):
+                key = _candidate_part_key(candidate.get("part_num"), candidate.get("color_id"))
+                if key in seen_candidate_keys or key not in remaining_part_rows:
+                    continue
+                meta = parts_by_key.get(key, {})
+                filtered_candidates.append(
+                    {
+                        "part_num": str(candidate.get("part_num") or "").strip(),
+                        "display_part_num": str(meta.get("display_part_num") or candidate.get("part_num") or "").strip(),
+                        "color_id": int(candidate.get("color_id", 0) or 0),
+                        "color_name": str(meta.get("color_name") or candidate.get("color_name") or f"color {int(candidate.get('color_id', 0) or 0)}"),
+                        "element_id": str(meta.get("element_id") or candidate.get("element_id") or "").strip() or None,
+                        "img_url": str(meta.get("img_url") or candidate.get("img_url") or "").strip(),
+                        "remaining_qty": int((remaining_part_rows.get(key) or {}).get("remaining_qty", 0) or 0),
+                        "required_qty": int((remaining_part_rows.get(key) or {}).get("required_qty", 0) or 0),
+                        "assigned_qty": int((remaining_part_rows.get(key) or {}).get("assigned_qty", 0) or 0),
+                        "candidate_source": str(candidate.get("candidate_source") or "local_prerank"),
+                        "score": float(candidate.get("score", 0.0) or 0.0),
+                    }
+                )
+                seen_candidate_keys.add(key)
+            candidate_count = len(filtered_candidates)
+            if not filtered_candidates:
+                ai_failure_reason = "no_preranked_candidates"
+            else:
+                ai_crop_payload = {
+                    "crop_id": crop_id,
+                    "page": int(crop.get("page", 0) or 0),
+                    "step": int(crop.get("step", 0) or 0),
+                    "crop_image_path": str(temp_crop_path),
+                    "slot_index": int(slot_index),
+                    "slot_qty_text": slot_qty_text,
+                    "manual_color_filter_id": manual_color_filter_id,
+                    "manual_color_name": (
+                        str((manual_color_sample or {}).get("color_name") or "").strip()
+                        if manual_color_filter_id is not None
+                        else ""
+                    ),
+                }
+                ai_result = rank_crop_candidates(ai_crop_payload, filtered_candidates[:8])
+                ai_enabled = bool(ai_result.get("enabled"))
+                if ai_enabled and list(ai_result.get("ranked_candidates") or []):
+                    ranked_candidates = list(ai_result.get("ranked_candidates") or [])[:5]
+                    model_name = str(ai_result.get("model") or model_name)
+                    fallback_used = False
+                    ai_failure_reason = ""
+                    candidate_count = len(filtered_candidates[:8])
+                else:
+                    ai_failure_reason = str(ai_result.get("reason") or "azure_ai_rank_unavailable").strip() or "azure_ai_rank_unavailable"
+                    model_name = str(ai_result.get("model") or model_name)
+    finally:
+        if temp_crop_path is not None:
+            try:
+                temp_crop_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    return {
+        "ok": True,
+        "crop_id": crop_id,
+        "slot_index": int(slot_index),
+        "ranked_candidates": ranked_candidates,
+        "model": model_name,
+        "debug": {
+            "set_num": set_num,
+            "bag": int(bag),
+            "crop_page": int(crop.get("page", 0) or 0),
+            "crop_step": int(crop.get("step", 0) or 0),
+            "slot_qty": slot_qty,
+            "slot_qty_text": slot_qty_text,
+            "sequence_length": len(sequence),
+            "selected_qty_box": selected_qty_box,
+            "qty_token_box_count": len(qty_token_boxes),
+            "crop_image_path": str(crop.get("crop_image_path") or ""),
+            "crop_image_available": bool(str(crop.get("data_uri") or "").strip() or str(crop.get("crop_image_path") or "").strip()),
+            "manual_color_filter_id": manual_color_filter_id,
+            "manual_color_filter_source": manual_color_source,
+            "manual_color_sample_id": str((manual_color_sample or {}).get("sample_id") or ""),
+            "picked_rgb_present": bool(
+                _coerce_int(request_picked_rgb.get("r")) is not None
+                and _coerce_int(request_picked_rgb.get("g")) is not None
+                and _coerce_int(request_picked_rgb.get("b")) is not None
+            ),
+            "remaining_candidate_count": len(mock_ranked_pool),
+            "candidate_count": candidate_count,
+            "ai_enabled": ai_enabled,
+            "fallback_used": fallback_used,
+            "ai_failure_reason": ai_failure_reason,
+            "model": model_name,
+            "labels_path": str(labels_path),
+        },
+    }
+
+
 @router.post("/debug/remove-label")
 async def remove_label(req: Request):
     data = await req.json()
@@ -2212,6 +2728,126 @@ def export_training_data(
     )
 
 
+@router.get("/debug/normalize-part-crop", response_class=HTMLResponse)
+def normalize_part_crop_debug(image_path: str = Query(...)):
+    result = normalize_part_crop(image_path)
+
+    def _file_to_data_uri(path_text: str) -> str:
+        path = Path(str(path_text or "").strip())
+        if not path.exists() or not path.is_file():
+            return ""
+        suffix = path.suffix.lower()
+        mime_type = "image/png" if suffix == ".png" else ("image/jpeg" if suffix in {".jpg", ".jpeg"} else "application/octet-stream")
+        return "data:%s;base64,%s" % (
+            mime_type,
+            base64.b64encode(path.read_bytes()).decode("ascii"),
+        )
+
+    original_data_uri = _file_to_data_uri(str(result.get("original_path") or ""))
+    mask_data_uri = _file_to_data_uri(str(result.get("mask_path") or ""))
+    normalized_data_uri = _file_to_data_uri(str(result.get("normalized_path") or ""))
+    debug_json = json.dumps(
+        {
+            "ok": bool(result.get("ok")),
+            "original_path": str(result.get("original_path") or ""),
+            "normalized_path": str(result.get("normalized_path") or ""),
+            "mask_path": str(result.get("mask_path") or ""),
+            "box": result.get("box"),
+            "debug": result.get("debug"),
+        },
+        indent=2,
+    )
+
+    html = f"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Normalize Part Crop</title>
+        <style>
+          body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f4f7fb;
+            color: #1d2a36;
+          }}
+          h1 {{
+            margin: 0 0 14px;
+            font-size: 24px;
+          }}
+          .meta {{
+            margin-bottom: 16px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            background: #fff;
+            border: 1px solid #d6dee8;
+          }}
+          .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+          }}
+          .card {{
+            background: #fff;
+            border: 1px solid #d6dee8;
+            border-radius: 14px;
+            padding: 14px;
+          }}
+          .card h2 {{
+            margin: 0 0 10px;
+            font-size: 16px;
+          }}
+          img {{
+            width: 100%;
+            height: auto;
+            display: block;
+            background: #fff;
+            border: 1px solid #d6dee8;
+            border-radius: 10px;
+          }}
+          pre {{
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 12px;
+            line-height: 1.45;
+          }}
+        </style>
+      </head>
+      <body>
+        <h1>Normalize Part Crop</h1>
+        <div class="meta">
+          <div><strong>ok:</strong> {escape(str(bool(result.get("ok"))).lower())}</div>
+          <div><strong>original:</strong> {escape(str(result.get("original_path") or ""))}</div>
+          <div><strong>normalized:</strong> {escape(str(result.get("normalized_path") or ""))}</div>
+          <div><strong>mask:</strong> {escape(str(result.get("mask_path") or ""))}</div>
+        </div>
+        <div class="grid">
+          <div class="card">
+            <h2>Original</h2>
+            {f'<img src="{original_data_uri}" alt="Original crop" />' if original_data_uri else '<div>Original image unavailable</div>'}
+          </div>
+          <div class="card">
+            <h2>Mask</h2>
+            {f'<img src="{mask_data_uri}" alt="Foreground mask" />' if mask_data_uri else '<div>Mask image unavailable</div>'}
+          </div>
+          <div class="card">
+            <h2>Normalized</h2>
+            {f'<img src="{normalized_data_uri}" alt="Normalized crop" />' if normalized_data_uri else '<div>Normalized image unavailable</div>'}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Box / Debug</h2>
+          <pre>{escape(debug_json)}</pre>
+        </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
 @router.get("/debug/instruction-buildability", response_class=HTMLResponse)
 def instruction_buildability(
     set_num: str = Query(...),
@@ -2221,7 +2857,7 @@ def instruction_buildability(
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
-    parts = list(parts_payload.get("parts", []) or [])
+    parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
     color_ids = sorted(
         {
             int(part["color_id"])
@@ -2747,27 +3383,66 @@ def instruction_buildability(
           font-size: 13px;
         }}
         .picker-layout {{
-          display: grid;
-          grid-template-columns: minmax(260px, 420px) 1fr;
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+          align-items: stretch;
+        }}
+        .picker-main {{
+          display: flex;
+          flex-direction: column;
           gap: 14px;
-          align-items: start;
+          width: 100%;
+        }}
+        .picker-controls {{
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+          width: 100%;
         }}
         .picker-canvas-wrap {{
-          border: 1px solid #d6dee8;
-          border-radius: 12px;
+          width: 100%;
+          border: 1px solid #c9d9e8;
+          border-radius: 18px;
           overflow: hidden;
-          background: #f4f7fb;
-          min-height: 180px;
+          background: linear-gradient(180deg, #d9eefc 0%, #c5e4fa 100%);
+          min-height: 260px;
           display: flex;
           align-items: center;
           justify-content: center;
+          padding: 16px;
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
         }}
         .picker-canvas {{
           display: block;
-          max-width: 100%;
+          width: 100%;
+          max-width: 760px;
           height: auto;
+          border-radius: 16px;
+          background: #cfe7f8;
           cursor: crosshair;
           pointer-events: auto;
+        }}
+        .picker-slots-panel {{
+          width: 100%;
+          border: 1px solid #d6dee8;
+          border-radius: 16px;
+          background: #fff;
+          padding: 14px;
+          box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
+        }}
+        .picker-slot-header {{
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          margin-bottom: 10px;
+        }}
+        .picker-slot-title {{
+          font-size: 16px;
+          font-weight: 800;
+          color: #17212b;
         }}
         .picker-empty {{
           padding: 16px;
@@ -2868,9 +3543,30 @@ def instruction_buildability(
           padding: 12px;
           background: #fff;
         }}
+        .suggested-part.ai-snap-hit {{
+          border-color: #b7791f;
+          background: #fff8e7;
+          box-shadow: 0 0 0 2px rgba(183, 121, 31, 0.12);
+        }}
         .suggested-part .part-thumb {{
           margin-top: 0;
           min-height: 120px;
+        }}
+        .ai-snap-badge {{
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          margin-bottom: 8px;
+          padding: 4px 9px;
+          border-radius: 999px;
+          background: #f6e7bd;
+          color: #7a4a08;
+          font-size: 12px;
+          font-weight: 700;
+        }}
+        .ai-snap-confidence {{
+          color: #9b5b09;
+          font-weight: 800;
         }}
         .suggested-part-actions {{
           margin-top: 10px;
@@ -2888,6 +3584,63 @@ def instruction_buildability(
           color: #536576;
           font-size: 13px;
           font-weight: 700;
+        }}
+        .picker-slot-list {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          align-items: stretch;
+        }}
+        .picker-slot-toolbar {{
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 10px;
+          justify-content: flex-end;
+        }}
+        .picker-slot-btn {{
+          border: 1px solid #d6dee8;
+          border-radius: 14px;
+          background: #f8fbff;
+          padding: 12px 16px;
+          text-align: center;
+          font-size: 13px;
+          font-weight: 600;
+          line-height: 1.25;
+          color: #2f4153;
+          cursor: default;
+          min-width: 112px;
+          min-height: 72px;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          gap: 6px;
+        }}
+        .picker-slot-btn.selected {{
+          border-color: #2f6fed;
+          background: #eef4ff;
+          color: #1947a6;
+          box-shadow: 0 0 0 2px rgba(47, 111, 237, 0.12);
+        }}
+        .picker-slot-btn.assigned {{
+          background: #eef6ef;
+          border-color: #7db28a;
+          color: #2f6c41;
+        }}
+        .picker-slot-name {{
+          font-size: 12px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.02em;
+        }}
+        .picker-slot-qty {{
+          font-size: 22px;
+          font-weight: 900;
+          line-height: 1;
+        }}
+        .picker-slot-empty {{
+          color: #6c7c8d;
+          font-size: 12px;
         }}
         .parts-filter-toggle {{
           display: inline-flex;
@@ -3367,11 +4120,28 @@ def instruction_buildability(
             <h3>Colour Picker</h3>
             <p class="colour-picker-help">Click the selected crop image to sample RGB and override the automatic colour filter.</p>
             <div class="picker-layout">
-              <div class="picker-canvas-wrap">
-                <canvas id="colour-picker-canvas" class="picker-canvas"></canvas>
-                <div id="colour-picker-empty" class="picker-empty">Select a crop with an image to start sampling colours.</div>
+              <div class="picker-main">
+                <div class="picker-canvas-wrap">
+                  <canvas id="colour-picker-canvas" class="picker-canvas"></canvas>
+                  <div id="colour-picker-empty" class="picker-empty">Select a crop with an image to start sampling colours.</div>
+                </div>
+                <div class="picker-slots-panel">
+                  <div class="picker-slot-header">
+                    <div>
+                      <div class="picker-slot-title">Detected slots in crop</div>
+                      <div class="save-note">Select the slot you are filling. AI Snap ranks candidates for the current open slot.</div>
+                    </div>
+                    <div class="picker-slot-toolbar">
+                      <button type="button" class="remove-btn" id="ai-snap-btn" onclick="runAiSnap()">AI Snap</button>
+                      <div id="ai-snap-status" class="save-note"></div>
+                    </div>
+                  </div>
+                  <div id="picker-slot-list" class="picker-slot-list">
+                    <div class="picker-slot-empty">Select a crop to view qty slots.</div>
+                  </div>
+                </div>
               </div>
-              <div>
+              <div class="picker-controls">
                 <div id="picked-rgb-row" class="picked-rgb-row">
                   <span class="colour-swatch" id="picked-rgb-swatch" style="background: transparent;"></span>
                   <span id="picked-rgb-text" class="save-note">No colour sampled yet.</span>
@@ -3898,6 +4668,98 @@ def instruction_buildability(
           }};
         }}
 
+        function currentBuildabilitySlotIndex(crop) {{
+          const slotState = computeCropSlotState(crop);
+          if (!crop || slotState.noQtyDetected || slotState.totalSlots <= 0 || slotState.slotsFull) {{
+            return null;
+          }}
+          return Math.max(0, Math.min(slotState.filledSlots, slotState.totalSlots - 1));
+        }}
+
+        function activeAiSnapResultForCrop(crop) {{
+          if (!crop || !crop.ai_snap_result) {{
+            return null;
+          }}
+          const currentSlotIndex = currentBuildabilitySlotIndex(crop);
+          if (currentSlotIndex === null) {{
+            return null;
+          }}
+          return Number(crop.ai_snap_result.slot_index) === Number(currentSlotIndex)
+            ? crop.ai_snap_result
+            : null;
+        }}
+
+        function renderAiSnapStatus(crop) {{
+          const button = document.getElementById("ai-snap-btn");
+          const status = document.getElementById("ai-snap-status");
+          if (!button || !status) {{
+            return;
+          }}
+          const slotIndex = currentBuildabilitySlotIndex(crop);
+          const aiSnapResult = activeAiSnapResultForCrop(crop);
+          if (!crop) {{
+            button.disabled = true;
+            button.textContent = "AI Snap";
+            status.textContent = "Select a crop to rank the current open slot.";
+            return;
+          }}
+          if (crop.ai_snap_loading) {{
+            button.disabled = true;
+            button.textContent = "AI Snap...";
+            status.textContent = "Ranking remaining candidates for this slot...";
+            return;
+          }}
+          button.textContent = "AI Snap";
+          button.disabled = slotIndex === null;
+          if (slotIndex === null) {{
+            status.textContent = "No open slot available for AI Snap.";
+            return;
+          }}
+          if (crop.ai_snap_error) {{
+            status.textContent = String(crop.ai_snap_error);
+            return;
+          }}
+          if (aiSnapResult && Array.isArray(aiSnapResult.ranked_candidates)) {{
+            status.textContent = "AI Snap ranked " + aiSnapResult.ranked_candidates.length + " candidates for slot " + (slotIndex + 1)
+              + (aiSnapResult.model ? " using " + aiSnapResult.model : "") + ".";
+            return;
+          }}
+          status.textContent = "Run AI Snap for slot " + (slotIndex + 1) + ".";
+        }}
+
+        function renderBuildabilitySlots(cropId) {{
+          const list = document.getElementById("picker-slot-list");
+          if (!list) {{
+            return;
+          }}
+          const crop = cropId ? cropMap.get(cropId) : null;
+          if (!crop) {{
+            list.innerHTML = '<div class="picker-slot-empty">Select a crop to view qty slots.</div>';
+            renderAiSnapStatus(null);
+            return;
+          }}
+          const sequence = buildClientQtySequence(crop);
+          const slotState = computeCropSlotState(crop);
+          if (!sequence.length) {{
+            list.innerHTML = '<div class="picker-slot-empty">No qty slots detected for this crop.</div>';
+            renderAiSnapStatus(crop);
+            return;
+          }}
+          const selectedIndex = currentBuildabilitySlotIndex(crop);
+          list.innerHTML = sequence.map((slot, idx) => `
+            <button
+              type="button"
+              class="picker-slot-btn${{idx < slotState.filledSlots ? " assigned" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
+              data-picker-slot-index="${{idx}}"
+              title="${{idx < slotState.filledSlots ? "Filled slot" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot")}}"
+            >
+              <span class="picker-slot-name">Slot ${{idx + 1}}</span>
+              <span class="picker-slot-qty">${{escapeHtml(String((slot && (slot.qty_text || slot.qty)) || "none"))}}</span>
+            </button>
+          `).join("");
+          renderAiSnapStatus(crop);
+        }}
+
         function statusClassName(status) {{
           return "crop-status-" + String(status || "needs_adjust").replaceAll(/[^a-z_]/g, "");
         }}
@@ -3991,6 +4853,7 @@ def instruction_buildability(
           if (activeCropId === cropId) {{
             updateSelectedCropStatus(crop);
             updateAddAvailability();
+            renderBuildabilitySlots(cropId);
           }}
           applyHiddenCropVisibility();
         }}
@@ -4016,6 +4879,7 @@ def instruction_buildability(
               updateAddAvailability();
               renderSuggestedParts(null);
               renderColourPicker(null);
+              renderBuildabilitySlots(null);
             }}
           }}
         }}
@@ -4464,7 +5328,8 @@ def instruction_buildability(
 
           if (status) {{
             const colorLabels = filterColorIds.map((colorId) => colorNameById.get(Number(colorId)) || ("color " + colorId));
-            status.textContent = (crop.manual_color_filter_id
+            const hasManualColorFilter = Number.isFinite(Number(crop && crop.manual_color_filter_id));
+            status.textContent = (hasManualColorFilter
               ? "Manual colour filter for "
               : "Filtered ") + crop.crop_id + " to " + visibleCount + " parts matching: " + colorLabels.join(", ");
           }}
@@ -4560,19 +5425,70 @@ def instruction_buildability(
             }})
             .slice(0, 12);
 
-          if (!suggestions.length) {{
+          const aiSnapResult = activeAiSnapResultForCrop(crop);
+          const aiSnapRankByKey = new Map();
+          const aiSnapSuggestions = Array.isArray(aiSnapResult && aiSnapResult.ranked_candidates)
+            ? aiSnapResult.ranked_candidates.map((candidate) => {{
+                const key = partKey(candidate && candidate.part_num, candidate && candidate.color_id);
+                aiSnapRankByKey.set(key, {{
+                  rank: Number(candidate && candidate.rank || 0),
+                  confidence: Number(candidate && candidate.confidence || 0),
+                  model: String(aiSnapResult.model || ""),
+                }});
+                const meta = partMap.get(key) || {{}};
+                return {{
+                  part_num: String(candidate && candidate.part_num || ""),
+                  color_id: Number(candidate && candidate.color_id || 0),
+                  color_name: String(candidate && (candidate.color_name || meta.color_name) || "n/a"),
+                  element_id: String(candidate && (candidate.element_id || meta.element_id) || ""),
+                  img_url: String(candidate && (candidate.img_url || meta.img_url) || ""),
+                  set_qty: Number(candidate && candidate.required_qty || meta.qty || 0),
+                  assigned_qty: Number(candidate && candidate.assigned_qty || 0),
+                  remaining_qty: Number(candidate && candidate.remaining_qty || 0),
+                  ai_snap_rank: Number(candidate && candidate.rank || 0),
+                  ai_snap_confidence: Number(candidate && candidate.confidence || 0),
+                  ai_snap_model: String(aiSnapResult.model || ""),
+                  suggestion_score: Number(candidate && candidate.mock_score || 0),
+                }};
+              }})
+            : [];
+
+          const mergedSuggestions = [];
+          const seenSuggestionKeys = new Set();
+          [...aiSnapSuggestions, ...suggestions].forEach((part) => {{
+            const key = partKey(part && part.part_num, part && part.color_id);
+            if (!key || seenSuggestionKeys.has(key)) {{
+              return;
+            }}
+            const aiSnapMatch = aiSnapRankByKey.get(key);
+            if (aiSnapMatch) {{
+              part.ai_snap_rank = Number(aiSnapMatch.rank || 0);
+              part.ai_snap_confidence = Number(aiSnapMatch.confidence || 0);
+              part.ai_snap_model = String(aiSnapMatch.model || "");
+            }}
+            seenSuggestionKeys.add(key);
+            mergedSuggestions.push(part);
+          }});
+
+          if (!mergedSuggestions.length) {{
             panel.innerHTML = '<div class="suggested-empty">No suggestions - use Show all.</div>';
             return;
           }}
 
-          panel.innerHTML = suggestions.map((part) => {{
+          panel.innerHTML = mergedSuggestions.map((part) => {{
             const thumb = part.img_url
               ? '<img src="' + escapeHtml(part.img_url) + '" alt="' + escapeHtml(part.part_num) + '" loading="lazy" />'
               : '<div class="crop-missing">No image</div>';
+            const hasAiSnap = Number.isFinite(Number(part.ai_snap_rank)) && Number(part.ai_snap_rank) > 0;
+            const aiSnapBadge = hasAiSnap
+              ? '<div class="ai-snap-badge">AI #' + escapeHtml(String(part.ai_snap_rank))
+                + ' <span class="ai-snap-confidence">' + escapeHtml(Number(part.ai_snap_confidence || 0).toFixed(2)) + '</span></div>'
+              : '';
             return `
-              <div class="suggested-part">
+              <div class="suggested-part${{hasAiSnap ? " ai-snap-hit" : ""}}">
                 <div class="part-thumb">${{thumb}}</div>
                 <div class="part-meta">
+                  ${{aiSnapBadge}}
                   <strong>${{escapeHtml(part.part_num)}}</strong><br/>
                   color: ${{escapeHtml(String(part.color_id))}} / ${{escapeHtml(part.color_name)}}<br/>
                   required / assigned / remaining: ${{escapeHtml(String(part.set_qty || 0))}} / ${{escapeHtml(String(part.assigned_qty || 0))}} / ${{escapeHtml(String(part.remaining_qty || 0))}}<br/>
@@ -4658,6 +5574,7 @@ def instruction_buildability(
             pickedText.textContent = "No colour sampled yet.";
             pickedSwatch.style.background = "transparent";
             renderPickerDiagnostics(crop);
+            renderBuildabilitySlots(cropId);
             updateSaveCalibrationUI(crop);
             return;
           }}
@@ -4668,12 +5585,13 @@ def instruction_buildability(
             empty.style.display = "block";
             list.innerHTML = '<div class="suggested-empty">Pick a colour from the crop to see the closest LEGO colours.</div>';
             renderPickerDiagnostics(crop);
+            renderBuildabilitySlots(cropId);
             updateSaveCalibrationUI(crop);
             return;
           }}
 
-          const maxWidth = 420;
-          const scale = Math.min(1, maxWidth / Math.max(1, image.naturalWidth));
+          const maxWidth = 760;
+          const scale = Math.min(2.2, Math.max(1, maxWidth / Math.max(1, image.naturalWidth)));
           canvas.width = image.naturalWidth;
           canvas.height = image.naturalHeight;
           canvas.style.width = Math.max(1, Math.round(image.naturalWidth * scale)) + "px";
@@ -4698,7 +5616,8 @@ def instruction_buildability(
             pickedText.textContent = "Picked RGB: " + crop.picked_rgb.r + ", " + crop.picked_rgb.g + ", " + crop.picked_rgb.b;
             pickedSwatch.style.background = colorSwatchStyle(crop.picked_rgb);
           }} else {{
-            pickedText.textContent = crop.manual_color_filter_id
+            const hasManualColorFilter = Number.isFinite(Number(crop && crop.manual_color_filter_id));
+            pickedText.textContent = hasManualColorFilter
               ? "Manual LEGO colour filter: " + (colorNameById.get(Number(crop.manual_color_filter_id)) || ("color " + crop.manual_color_filter_id))
               : "No colour sampled yet.";
             pickedSwatch.style.background = "transparent";
@@ -4706,6 +5625,7 @@ def instruction_buildability(
 
           renderColourMatches(crop);
           renderPickerDiagnostics(crop);
+          renderBuildabilitySlots(cropId);
           updateSaveCalibrationUI(crop);
         }}
 
@@ -4961,6 +5881,65 @@ def instruction_buildability(
             crop.manual_calibration_status = "Calibration save failed";
           }}
           updateSaveCalibrationUI(crop);
+        }}
+
+        async function runAiSnap() {{
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          const slotIndex = currentBuildabilitySlotIndex(crop);
+          if (slotIndex === null) {{
+            crop.ai_snap_error = "No open slot available for AI Snap.";
+            renderAiSnapStatus(crop);
+            return;
+          }}
+          crop.ai_snap_loading = true;
+          crop.ai_snap_error = "";
+          renderAiSnapStatus(crop);
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            slot_index: slotIndex,
+            manual_color_filter_id: Number.isFinite(Number(crop.manual_color_filter_id))
+              ? Number(crop.manual_color_filter_id)
+              : null,
+            picked_rgb: crop.picked_rgb || null,
+          }};
+          try {{
+            const res = await fetch("/debug/ai-rank-slot", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify(payload)
+            }});
+            if (!res.ok) {{
+              let detail = "AI Snap failed";
+              try {{
+                const errorPayload = await res.json();
+                detail = errorPayload.detail || detail;
+              }} catch (_error) {{
+                detail = "AI Snap failed";
+              }}
+              crop.ai_snap_error = detail;
+              crop.ai_snap_result = null;
+              renderAiSnapStatus(crop);
+              return;
+            }}
+            const result = await res.json();
+            crop.ai_snap_result = result;
+            crop.ai_snap_error = "";
+            renderAiSnapStatus(crop);
+            renderSuggestedParts(crop.crop_id);
+            jumpToSuggestedParts();
+          }} catch (_error) {{
+            crop.ai_snap_error = "AI Snap failed";
+            crop.ai_snap_result = null;
+            renderAiSnapStatus(crop);
+          }} finally {{
+            crop.ai_snap_loading = false;
+            renderAiSnapStatus(crop);
+          }}
         }}
 
         function setPartFilterMode(showAll) {{
@@ -5316,6 +6295,7 @@ def instruction_buildability(
           applyPartFilter();
           renderSuggestedParts(cropId);
           renderColourPicker(cropId);
+          renderAiSnapStatus(crop);
           if (whereUsedState) {{
             renderWhereUsed(whereUsedState.partNum, whereUsedState.colorId);
           }}
@@ -5562,6 +6542,7 @@ def instruction_buildability(
           renderAssignedParts(cropId);
           if (activeCropId === cropId) {{
             renderSuggestedParts(cropId);
+            renderColourPicker(cropId);
           }}
           updatePartTileAssignmentState();
           saveStatus.textContent = "Updated qty sequence for " + cropId;
@@ -5600,6 +6581,7 @@ def instruction_buildability(
           renderAssignedParts(cropId);
           if (activeCropId === cropId) {{
             renderSuggestedParts(cropId);
+            renderColourPicker(cropId);
           }}
           updatePartTileAssignmentState();
           saveStatus.textContent = "Removed " + partNum + " / color " + colorId + " from " + crop.crop_id;
@@ -5655,15 +6637,22 @@ def instruction_buildability(
           if (res.ok) {{
             const result = await res.json();
             syncCropFromResponse(crop, result.crop);
+            crop.ai_snap_result = null;
+            crop.ai_snap_error = "";
             renderAssignedParts(crop.crop_id);
             if (activeCropId === crop.crop_id) {{
               renderSuggestedParts(crop.crop_id);
+              renderColourPicker(crop.crop_id);
+              renderAiSnapStatus(crop);
             }}
             updatePartTileAssignmentState();
             status.textContent = "Saved " + crop.crop_id + " -> " + partNum + " / color " + colorId;
-            const nextCropId = nextVisibleCropId(crop.crop_id);
-            if (nextCropId) {{
-              selectCrop(nextCropId);
+            const updatedSlotState = computeCropSlotState(crop);
+            if (!updatedSlotState.noQtyDetected && updatedSlotState.slotsFull) {{
+              const nextCropId = nextVisibleCropId(crop.crop_id);
+              if (nextCropId) {{
+                selectCrop(nextCropId);
+              }}
             }}
           }} else {{
             let detail = "Save failed";
@@ -5735,6 +6724,7 @@ def instruction_buildability(
         applyPartFilter();
         renderSuggestedParts(activeCropId);
         renderColourPicker(activeCropId);
+        renderAiSnapStatus(activeCropId ? cropMap.get(activeCropId) : null);
 
         document.querySelectorAll(".manual-page-canvas").forEach((canvas) => {{
           setupManualCropCanvas(canvas);
@@ -5895,6 +6885,186 @@ def instruction_buildability(
     return HTMLResponse(content=html)
 
 
+@router.get("/debug/normalize-slot-crop", response_class=HTMLResponse)
+def normalize_slot_crop_debug(
+    image_path: Optional[str] = Query(None),
+    set_num: Optional[str] = Query(None),
+    bag: Optional[int] = Query(None, ge=1),
+    crop_id: Optional[str] = Query(None),
+    x: int = Query(...),
+    y: int = Query(...),
+    w: int = Query(...),
+    h: int = Query(...),
+):
+    resolved_image_path = str(image_path or "").strip()
+    resolved_crop: Optional[Dict[str, Any]] = None
+    temp_crop_path: Optional[Path] = None
+    bag_number = int(bag or 1)
+
+    if not resolved_image_path:
+        resolved_set_num = str(set_num or "").strip()
+        resolved_crop_id = str(crop_id or "").strip()
+        if not resolved_set_num or not resolved_crop_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide image_path or set_num + crop_id",
+            )
+        resolved_crop = _load_crop_for_ai_snap(resolved_set_num, bag_number, resolved_crop_id)
+        if not resolved_crop:
+            raise HTTPException(status_code=404, detail="crop_id not found")
+        temp_crop_path = _write_ai_snap_temp_crop_image(resolved_crop)
+        if temp_crop_path is not None:
+            resolved_image_path = str(temp_crop_path)
+        else:
+            fallback_crop_image_path = str(resolved_crop.get("crop_image_path") or "").strip()
+            if not fallback_crop_image_path:
+                raise HTTPException(status_code=400, detail="Resolved crop image unavailable")
+            resolved_image_path = fallback_crop_image_path
+
+    try:
+        result = normalize_slot_crop_from_qty(
+            resolved_image_path,
+            {
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+            },
+        )
+    finally:
+        if temp_crop_path is not None:
+            try:
+                temp_crop_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _file_to_data_uri(path_text: str) -> str:
+        path = Path(str(path_text or "").strip())
+        if not path.exists() or not path.is_file():
+            return ""
+        suffix = path.suffix.lower()
+        mime_type = "image/png" if suffix == ".png" else ("image/jpeg" if suffix in {".jpg", ".jpeg"} else "application/octet-stream")
+        return "data:%s;base64,%s" % (
+            mime_type,
+            base64.b64encode(path.read_bytes()).decode("ascii"),
+        )
+
+    original_data_uri = _file_to_data_uri(str(result.get("original_path") or ""))
+    mask_data_uri = _file_to_data_uri(str(result.get("mask_path") or ""))
+    component_data_uri = _file_to_data_uri(str(result.get("component_path") or ""))
+    normalized_data_uri = _file_to_data_uri(str(result.get("normalized_path") or ""))
+    debug_json = json.dumps(
+        {
+            "ok": bool(result.get("ok")),
+            "original_path": str(result.get("original_path") or ""),
+            "mask_path": str(result.get("mask_path") or ""),
+            "component_path": str(result.get("component_path") or ""),
+            "normalized_path": str(result.get("normalized_path") or ""),
+            "selected_box": result.get("selected_box"),
+            "qty_box": result.get("qty_box"),
+            "resolved_from_crop_id": str((resolved_crop or {}).get("crop_id") or ""),
+            "resolved_set_num": str(set_num or ""),
+            "resolved_bag": int(bag_number),
+            "resolved_crop_image_path": str((resolved_crop or {}).get("crop_image_path") or ""),
+            "debug": result.get("debug"),
+        },
+        indent=2,
+    )
+
+    html = f"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Normalize Slot Crop</title>
+        <style>
+          body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f4f7fb;
+            color: #1d2a36;
+          }}
+          h1 {{
+            margin: 0 0 14px;
+            font-size: 24px;
+          }}
+          .meta {{
+            margin-bottom: 16px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            background: #fff;
+            border: 1px solid #d6dee8;
+          }}
+          .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+          }}
+          .card {{
+            background: #fff;
+            border: 1px solid #d6dee8;
+            border-radius: 14px;
+            padding: 14px;
+          }}
+          .card h2 {{
+            margin: 0 0 10px;
+            font-size: 16px;
+          }}
+          img {{
+            width: 100%;
+            height: auto;
+            display: block;
+            background: #fff;
+            border: 1px solid #d6dee8;
+            border-radius: 10px;
+          }}
+          pre {{
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 12px;
+            line-height: 1.45;
+          }}
+        </style>
+      </head>
+      <body>
+        <h1>Normalize Slot Crop</h1>
+        <div class="meta">
+          <div><strong>Image:</strong> {escape(str(result.get("original_path") or resolved_image_path))}</div>
+          {f'<div><strong>Resolved crop:</strong> {escape(str((resolved_crop or {}).get("crop_id") or ""))}</div>' if resolved_crop else ''}
+          <div><strong>Qty box:</strong> {escape(json.dumps(result.get("qty_box"), separators=(",", ":")))}</div>
+          <div><strong>Selected box:</strong> {escape(json.dumps(result.get("selected_box"), separators=(",", ":")))}</div>
+        </div>
+        <div class="grid">
+          <div class="card">
+            <h2>Original</h2>
+            {f'<img src="{original_data_uri}" alt="Original crop" />' if original_data_uri else '<p>Original image unavailable.</p>'}
+          </div>
+          <div class="card">
+            <h2>Mask</h2>
+            {f'<img src="{mask_data_uri}" alt="Foreground mask" />' if mask_data_uri else '<p>Mask unavailable.</p>'}
+          </div>
+          <div class="card">
+            <h2>Selected component</h2>
+            {f'<img src="{component_data_uri}" alt="Selected component crop" />' if component_data_uri else '<p>Selected component unavailable.</p>'}
+          </div>
+          <div class="card">
+            <h2>Normalized</h2>
+            {f'<img src="{normalized_data_uri}" alt="Normalized slot crop" />' if normalized_data_uri else '<p>Normalized image unavailable.</p>'}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Debug JSON</h2>
+          <pre>{escape(debug_json)}</pre>
+        </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
 @router.get("/debug/manual-match-review", response_class=HTMLResponse)
 def manual_match_review(
     set_num: str = Query(...),
@@ -5902,7 +7072,7 @@ def manual_match_review(
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
-    parts = list(parts_payload.get("parts", []) or [])
+    parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
     color_ids = sorted(
         {
             int(part["color_id"])
