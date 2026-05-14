@@ -2482,6 +2482,240 @@ async def ai_rank_slot(req: Request):
     }
 
 
+@router.post("/debug/manual-match-clip-suggest")
+async def manual_match_clip_suggest(req: Request):
+    data = await req.json()
+
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag"))
+    crop_id = str(data.get("crop_id") or "").strip()
+    slot_index = _coerce_int(data.get("slot_index"))
+
+    if bag is None or bag < 1:
+        bag = 1
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+    if slot_index is None or slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+
+    return {
+        "ok": True,
+        "set_num": set_num,
+        "bag": int(bag),
+        "crop_id": crop_id,
+        "slot_index": int(slot_index),
+        "suggestions": [],
+        "debug": {
+            "mode": "placeholder",
+        },
+    }
+
+
+@router.post("/debug/buildability-clip-suggest")
+async def buildability_clip_suggest(req: Request):
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag")) or 1
+    crop_id = str(data.get("crop_id") or "").strip()
+    slot_index = _coerce_int(data.get("slot_index"))
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+    if slot_index is None or slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+
+    labels_payload = _load_existing_labels(_label_store_path(set_num, int(bag)))
+    crop = _load_crop_for_ai_snap(set_num, int(bag), crop_id)
+    if not crop:
+        raise HTTPException(status_code=404, detail="crop not found")
+
+    qty_token_boxes = [
+        dict(item)
+        for item in list(crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    selected_qty_box = dict(qty_token_boxes[int(slot_index)]) if 0 <= int(slot_index) < len(qty_token_boxes) else None
+
+    from tools.a2b_clip_match_probe import (
+        _embed_images,
+        _ensure_catalog_image_for_pair,
+        _load_clip_model,
+        _load_rgb_image,
+        _sanitize_embeddings,
+    )
+
+    temp_crop_path: Optional[Path] = None
+    try:
+        temp_crop_path = _write_ai_snap_temp_crop_image(crop)
+        if temp_crop_path is None:
+            raise HTTPException(status_code=400, detail="crop image unavailable")
+
+        rank_input_path = str(temp_crop_path)
+        if selected_qty_box is not None:
+            normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), selected_qty_box)
+            if bool(normalized_result.get("ok")) and str(normalized_result.get("normalized_path") or "").strip():
+                rank_input_path = str(normalized_result.get("normalized_path") or "").strip()
+
+        query_image = _load_rgb_image(Path(rank_input_path))
+        if query_image is None:
+            raise HTTPException(status_code=400, detail="normalized crop unavailable")
+
+        parts_payload = load_instruction_set_parts(set_num)
+        parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
+        assigned_totals = _assigned_part_totals_from_labels(labels_payload)
+        candidate_rows: List[Dict[str, Any]] = []
+        for part in list(parts or []):
+            part_num = str(part.get("part_num") or "").strip()
+            color_id = int(part.get("color_id", 0) or 0)
+            if not part_num:
+                continue
+            key = _candidate_part_key(part_num, color_id)
+            required_qty = int(part.get("qty", 0) or 0)
+            assigned_qty = int(assigned_totals.get(key, 0) or 0)
+            remaining_qty = required_qty - assigned_qty
+            if remaining_qty <= 0:
+                continue
+            image_path = _ensure_catalog_image_for_pair(part_num, color_id)
+            if image_path is None or not image_path.exists():
+                continue
+            clip_image = _load_rgb_image(image_path)
+            if clip_image is None:
+                continue
+            candidate_rows.append(
+                {
+                    "part_num": part_num,
+                    "color_id": color_id,
+                    "required_qty": required_qty,
+                    "assigned_qty": assigned_qty,
+                    "remaining_qty": remaining_qty,
+                    "img_url": str(part.get("img_url") or "").strip(),
+                    "image_path": str(image_path),
+                    "clip_image": clip_image,
+                }
+            )
+
+        if not candidate_rows:
+            return {"ok": True, "mode": "clip-placeholder", "ranked_candidates": []}
+
+        model, processor, device = _load_clip_model()
+        _, query_vectors = _sanitize_embeddings([query_image], _embed_images([query_image], model, processor, device))
+        candidate_rows, candidate_vectors = _sanitize_embeddings(
+            candidate_rows,
+            _embed_images([item["clip_image"] for item in candidate_rows], model, processor, device),
+        )
+        if query_vectors.size == 0 or not candidate_rows or candidate_vectors.size == 0:
+            return {"ok": True, "mode": "clip-placeholder", "ranked_candidates": []}
+
+        query_vectors = np.asarray(query_vectors, dtype=np.float32)
+        candidate_vectors = np.asarray(candidate_vectors, dtype=np.float32)
+        candidate_count_before = int(candidate_vectors.shape[0])
+        finite_mask = np.isfinite(candidate_vectors).all(axis=1)
+        invalid_candidate_vectors_removed = int(candidate_count_before - np.count_nonzero(finite_mask))
+        candidate_rows = [
+            candidate
+            for candidate, keep in zip(candidate_rows, finite_mask.tolist())
+            if bool(keep)
+        ]
+        candidate_vectors = candidate_vectors[finite_mask]
+        candidate_count_before = int(candidate_vectors.shape[0])
+
+        query_vectors = np.nan_to_num(
+            query_vectors, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
+        candidate_vectors = np.nan_to_num(
+            candidate_vectors, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
+        finite_candidate_count = int(np.count_nonzero(np.isfinite(candidate_vectors).all(axis=1)))
+
+        query_norms = np.sqrt(np.sum(query_vectors * query_vectors, axis=1, dtype=np.float32)).astype(
+            np.float32, copy=False
+        )
+        candidate_norms = np.sqrt(
+            np.sum(candidate_vectors * candidate_vectors, axis=1, dtype=np.float32)
+        ).astype(np.float32, copy=False)
+        if query_norms.size == 0 or float(query_norms[0]) <= 1e-8:
+            print(
+                "[buildability-clip-suggest] query_vector_norm=",
+                float(query_norms[0]) if query_norms.size else None,
+                "candidate_count_before=",
+                candidate_count_before,
+                "candidate_count_after=",
+                0,
+                "finite_candidate_count=",
+                finite_candidate_count,
+                "invalid_candidate_vectors_removed=",
+                invalid_candidate_vectors_removed,
+            )
+            return {
+                "ok": False,
+                "mode": "clip-local-v1",
+                "ranked_candidates": [],
+                "error": "query_clip_vector_norm_too_small",
+            }
+
+        valid_candidate_mask = candidate_norms > 1e-8
+        if not np.any(valid_candidate_mask):
+            return {"ok": True, "mode": "clip-placeholder", "ranked_candidates": []}
+
+        candidate_rows = [
+            candidate
+            for candidate, keep in zip(candidate_rows, valid_candidate_mask.tolist())
+            if bool(keep)
+        ]
+        candidate_vectors = candidate_vectors[valid_candidate_mask]
+        candidate_norms = candidate_norms[valid_candidate_mask]
+        candidate_count_after = int(candidate_vectors.shape[0])
+
+        query_vectors = query_vectors / np.maximum(query_norms[:, None], np.float32(1e-8))
+        candidate_vectors = candidate_vectors / np.maximum(
+            candidate_norms[:, None], np.float32(1e-8)
+        )
+        query_vectors = np.nan_to_num(query_vectors, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            np.float32, copy=False
+        )
+        candidate_vectors = np.nan_to_num(
+            candidate_vectors, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
+        print(
+            "[buildability-clip-suggest] query_vector_norm=",
+            float(query_norms[0]),
+            "candidate_count_before=",
+            candidate_count_before,
+            "candidate_count_after=",
+            candidate_count_after,
+            "finite_candidate_count=",
+            finite_candidate_count,
+            "invalid_candidate_vectors_removed=",
+            invalid_candidate_vectors_removed,
+        )
+        similarity = query_vectors @ candidate_vectors.T
+        best_indices = np.argsort(-similarity[0])[: min(10, len(candidate_rows))]
+        ranked_candidates = [
+            {
+                "rank": int(index + 1),
+                "part_num": str(candidate_rows[int(idx)].get("part_num") or ""),
+                "color_id": int(candidate_rows[int(idx)].get("color_id", 0) or 0),
+                "required_qty": int(candidate_rows[int(idx)].get("required_qty", 0) or 0),
+                "assigned_qty": int(candidate_rows[int(idx)].get("assigned_qty", 0) or 0),
+                "remaining_qty": int(candidate_rows[int(idx)].get("remaining_qty", 0) or 0),
+                "score": round(float(similarity[0, int(idx)]), 4),
+                "image_url": str(candidate_rows[int(idx)].get("img_url") or ""),
+                "image_path": str(candidate_rows[int(idx)].get("image_path") or ""),
+            }
+            for index, idx in enumerate(best_indices)
+        ]
+    finally:
+        if temp_crop_path is not None:
+            try:
+                temp_crop_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return {
+        "ok": True,
+        "mode": "clip-local-v1",
+        "ranked_candidates": ranked_candidates,
+    }
+
+
 @router.post("/debug/remove-label")
 async def remove_label(req: Request):
     data = await req.json()
@@ -2900,6 +3134,7 @@ def instruction_buildability(
     bag: Optional[int] = Query(None, ge=1),
     ai: Optional[int] = Query(0),
     step: Optional[int] = Query(None),
+    v: Optional[str] = Query(None),
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
@@ -3246,6 +3481,7 @@ def instruction_buildability(
     parts_json = json.dumps(parts)
     lego_colors_json = json.dumps(lego_colors)
     training_examples_json = json.dumps(training_examples)
+    buildability_variant_json = json.dumps(str(v or "").strip())
     html = f"""
     <!doctype html>
     <html>
@@ -4270,6 +4506,7 @@ def instruction_buildability(
         const partMap = new Map(
           partRecords.map(item => [partKey(item.part_num, item.color_id), item])
         );
+        const buildabilityVariant = {buildability_variant_json};
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
@@ -5953,8 +6190,11 @@ def instruction_buildability(
               : null,
             picked_rgb: crop.picked_rgb || null,
           }};
+          const aiSnapEndpoint = buildabilityVariant === "realaisnap2"
+            ? "/debug/buildability-clip-suggest"
+            : "/debug/ai-rank-slot";
           try {{
-            const res = await fetch("/debug/ai-rank-slot", {{
+            const res = await fetch(aiSnapEndpoint, {{
               method: "POST",
               headers: {{"Content-Type": "application/json"}},
               body: JSON.stringify(payload)
@@ -5973,6 +6213,34 @@ def instruction_buildability(
               return;
             }}
             const result = await res.json();
+            if (buildabilityVariant === "realaisnap2" && Array.isArray(result && result.ranked_candidates)) {{
+              result.model = String(result.model || "local-clip-probe-v1");
+              result.ranked_candidates = result.ranked_candidates.map((candidate, index) => {{
+                const key = partKey(candidate && candidate.part_num, candidate && candidate.color_id);
+                const meta = partMap.get(key) || {{}};
+                const remainingQty = Number(candidate && candidate.remaining_qty);
+                const assignedQty = Number(candidate && candidate.assigned_qty);
+                const requiredQty = Number(candidate && candidate.required_qty);
+                const rawScore = Number(candidate && candidate.score);
+                return {{
+                  rank: Number(candidate && candidate.rank) || (index + 1),
+                  part_num: String(candidate && candidate.part_num || ""),
+                  color_id: Number(candidate && candidate.color_id || 0),
+                  color_name: String(candidate && (candidate.color_name || meta.color_name) || "n/a"),
+                  element_id: String(candidate && (candidate.element_id || meta.element_id) || ""),
+                  img_url: String(candidate && (candidate.image_url || candidate.img_url || meta.img_url) || ""),
+                  required_qty: Number.isFinite(requiredQty) ? requiredQty : Number(meta.qty || 0),
+                  assigned_qty: Number.isFinite(assignedQty) ? assignedQty : 0,
+                  remaining_qty: Number.isFinite(remainingQty)
+                    ? remainingQty
+                    : Math.max(0, Number(meta.qty || 0) - 0),
+                  confidence: Number.isFinite(rawScore)
+                    ? Math.max(0, Math.min(1, (rawScore + 1) / 2))
+                    : 0,
+                  score: rawScore,
+                }};
+              }});
+            }}
             crop.ai_snap_result = result;
             crop.ai_snap_error = "";
             renderAiSnapStatus(crop);

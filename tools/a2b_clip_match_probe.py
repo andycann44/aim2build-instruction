@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 try:
     import torch
@@ -55,6 +55,7 @@ CATALOG_MANIFEST_GLOBS = [
 APP_CATALOG_DB_PATH = Path("~/aim2build-app-v2/backend/app/data/lego_catalog.db").expanduser()
 CLIP_CATALOG_CACHE_DIR = REPO_ROOT / "debug" / "clip_catalog_cache"
 CLIP_PROBE_CROP_DIR = REPO_ROOT / "debug" / "clip_probe_crops"
+CLIP_PROBE_REPORT_DIR = REPO_ROOT / "debug" / "clip_probe_reports"
 MAX_CATALOG_DB_IMAGES = 200
 
 CATALOG_IMAGE_DIR_CANDIDATES = [
@@ -700,6 +701,60 @@ def _sanitize_embeddings(items: list[T], vectors: np.ndarray) -> tuple[list[T], 
     return kept_items, np.stack(kept_rows).astype(np.float32, copy=False)
 
 
+def _fit_preview(image: Image.Image, size: int = 220) -> Image.Image:
+    rgb = image.convert("RGB")
+    canvas = Image.new("RGB", (size, size), (255, 255, 255))
+    scale = min(size / max(1, rgb.width), size / max(1, rgb.height))
+    resized = rgb.resize(
+        (max(1, int(round(rgb.width * scale))), max(1, int(round(rgb.height * scale)))),
+        Image.Resampling.LANCZOS,
+    )
+    offset = ((size - resized.width) // 2, (size - resized.height) // 2)
+    canvas.paste(resized, offset)
+    return canvas
+
+
+def _save_miss_contact_sheet(
+    crop_id: str,
+    query_image: Image.Image,
+    expected_label: str,
+    expected_image: Optional[Image.Image],
+    predicted: list[CatalogImage],
+) -> Optional[Path]:
+    CLIP_PROBE_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    tile_size = 220
+    label_h = 54
+    gap = 16
+    cards: list[tuple[str, Optional[Image.Image]]] = [
+        ("Query", query_image),
+        (f"Expected\n{expected_label}", expected_image),
+    ]
+    for index, candidate in enumerate(predicted[:5], start=1):
+        cards.append((f"Top {index}\n{candidate.part_num}/{candidate.color_id}", candidate.pil_image))
+
+    width = (len(cards) * tile_size) + ((len(cards) + 1) * gap)
+    height = tile_size + label_h + (gap * 2)
+    sheet = Image.new("RGB", (width, height), (245, 247, 250))
+    draw = ImageDraw.Draw(sheet)
+
+    for idx, (label, image) in enumerate(cards):
+        x = gap + idx * (tile_size + gap)
+        y = gap
+        draw.rounded_rectangle((x - 2, y - 2, x + tile_size + 2, y + tile_size + label_h + 2), radius=14, fill=(255, 255, 255), outline=(210, 218, 228), width=2)
+        if image is not None:
+            sheet.paste(_fit_preview(image, tile_size), (x, y))
+        else:
+            draw.rectangle((x, y, x + tile_size, y + tile_size), fill=(250, 250, 250), outline=(220, 220, 220), width=1)
+            draw.text((x + 12, y + (tile_size // 2) - 8), "Image missing", fill=(120, 120, 120))
+        label_y = y + tile_size + 8
+        for line_index, line in enumerate(str(label).splitlines()):
+            draw.text((x + 8, label_y + line_index * 18), line, fill=(25, 35, 45))
+
+    out_path = CLIP_PROBE_REPORT_DIR / f"{str(crop_id or 'miss').strip() or 'miss'}.png"
+    sheet.save(out_path, format="PNG")
+    return out_path
+
+
 def _print_config_summary(crops: list[ProbeImage], catalog_images: list[CatalogImage]) -> None:
     print(f"CLIP model: {CLIP_MODEL_NAME_OR_PATH} (local_files_only={CLIP_LOCAL_FILES_ONLY})")
     print(f"Loaded {len(crops)} crop images and {len(catalog_images)} catalog images")
@@ -821,6 +876,13 @@ def main() -> int:
     catalog_images.sort(key=lambda item: item.sort_key)
     expected_present = [pair for pair in expected_pairs if pair in candidate_keys]
     missing_expected = [pair for pair in expected_pairs if pair not in candidate_keys]
+    catalog_by_pair = {
+        (
+            str(candidate.part_num or "").strip(),
+            int(candidate.color_id) if candidate.color_id is not None else None,
+        ): candidate
+        for candidate in catalog_images
+    }
 
     print(f"expected_total={len(expected_pairs)}")
     print(f"expected_present_count={len(expected_present)}")
@@ -896,6 +958,17 @@ def main() -> int:
             f"top1={predicted_label} in_top1={str(in_top1).lower()} "
             f"in_top5={str(in_top5).lower()} in_top10={str(in_top10).lower()}"
         )
+        if not in_top1:
+            expected_candidate = catalog_by_pair.get(expected_pair)
+            report_path = _save_miss_contact_sheet(
+                str(query["crop_id"]),
+                query["query_image"],
+                f"{query['expected_part_num']}/{query['expected_color_id']}",
+                expected_candidate.pil_image if expected_candidate is not None else None,
+                ranked[:5],
+            )
+            if report_path is not None:
+                print(f"  miss_report={report_path}")
 
     print()
     print(f"total evaluated: {total_evaluated}")
