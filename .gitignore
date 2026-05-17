@@ -49,3 +49,10 @@ debug/
 # Optional: keep specific images if needed
 # !assets/*.png
 
+
+# Large/generated instruction data
+datasets/
+training/accepted/
+*.pt
+*.pdf
+debug/
