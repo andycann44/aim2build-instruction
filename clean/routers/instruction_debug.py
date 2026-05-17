@@ -1,3 +1,21 @@
+def _filter_invalid_step_anchor_boxes(step_boxes):
+  """
+  Filter out impossible OCR step anchors (e.g., 4-digit numbers like 1583) while preserving real steps (e.g., 79).
+  Accepts a list of dicts with a 'step_number' key.
+  """
+  filtered = []
+  for box in step_boxes or []:
+    step_number = box.get("step_number")
+    try:
+      step_number = int(step_number)
+    except Exception:
+      filtered.append(box)
+      continue
+    # Reject step numbers that are 4 digits or more (e.g., 1583)
+    if 0 < step_number < 1000:
+      filtered.append(box)
+  return filtered
+
 import base64
 from html import escape
 import json
@@ -62,6 +80,12 @@ def _manual_color_calibration_path(set_num: str) -> Path:
     return Path("/Users/olly/aim2build-instruction/debug/training_labels") / f"{safe_name}_manual_color_calibration.json"
 
 
+def _clip_memory_path(set_num: str, bag: int) -> Path:
+    return Path("/Users/olly/aim2build-instruction/debug/training_labels") / (
+        f"{Path(_coerce_label_filename(set_num, bag)).stem}_clip_memory.json"
+    )
+
+
 def _catalog_db_path() -> Path:
     return Path("/Users/olly/aim2build-instruction/debug/server_catalog/lego_catalog.db")
 
@@ -91,6 +115,16 @@ def _empty_manual_color_calibration(set_num: str) -> Dict[str, Any]:
         "set_num": str(set_num or "").strip() or "70618",
         "updated_at": _iso_now(),
         "samples": [],
+    }
+
+
+def _empty_clip_memory(set_num: str, bag: int) -> Dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "set_num": str(set_num or "").strip() or "70618",
+        "bag": max(1, int(bag or 1)),
+        "updated_at": _iso_now(),
+        "items": [],
     }
 
 
@@ -1636,6 +1670,66 @@ def _load_manual_color_calibration(set_num: str) -> Dict[str, Any]:
     return existing
 
 
+def _load_clip_memory(set_num: str, bag: int) -> Dict[str, Any]:
+    path = _clip_memory_path(set_num, bag)
+    existing = _empty_clip_memory(set_num, bag)
+    if not path.exists():
+        return existing
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return existing
+
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return existing
+
+    if not isinstance(loaded, dict):
+        return existing
+
+    existing["schema_version"] = "1.0"
+    existing["set_num"] = str(loaded.get("set_num") or existing["set_num"]).strip() or existing["set_num"]
+    existing["bag"] = max(1, int(_coerce_int(loaded.get("bag")) or existing["bag"]))
+    existing["updated_at"] = str(loaded.get("updated_at") or existing["updated_at"]).strip() or existing["updated_at"]
+
+    items: List[Dict[str, Any]] = []
+    for item in list(loaded.get("items", []) or []):
+        if not isinstance(item, dict):
+            continue
+        part_num = str(item.get("part_num") or "").strip()
+        color_id = _coerce_int(item.get("color_id"))
+        slot_idx = _coerce_int(item.get("slot_index"))
+        embedding_raw = item.get("embedding")
+        if not part_num or color_id is None or slot_idx is None or not isinstance(embedding_raw, list):
+            continue
+        embedding: List[float] = []
+        for value in embedding_raw:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                embedding = []
+                break
+            if not np.isfinite(numeric):
+                embedding = []
+                break
+            embedding.append(numeric)
+        if not embedding:
+            continue
+        items.append(
+            {
+                "crop_id": str(item.get("crop_id") or "").strip(),
+                "slot_index": int(slot_idx),
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "embedding": embedding,
+                "updated_at": str(item.get("updated_at") or "").strip(),
+            }
+        )
+    existing["items"] = items
+    return existing
+
+
 def _write_labels(path: Path, payload: Dict[str, Any]) -> None:
     try:
         bag = int(payload.get("bag", 1) or 1)
@@ -1708,6 +1802,20 @@ def _write_manual_color_calibration(set_num: str, payload: Dict[str, Any]) -> No
     temp_path.replace(path)
 
 
+def _write_clip_memory(set_num: str, bag: int, payload: Dict[str, Any]) -> None:
+    path = _clip_memory_path(set_num, bag)
+    normalized = _empty_clip_memory(set_num, bag)
+    if isinstance(payload, dict):
+        normalized["set_num"] = str(payload.get("set_num") or normalized["set_num"]).strip() or normalized["set_num"]
+        normalized["bag"] = max(1, int(_coerce_int(payload.get("bag")) or normalized["bag"]))
+        normalized["updated_at"] = str(payload.get("updated_at") or normalized["updated_at"]).strip() or normalized["updated_at"]
+        normalized["items"] = list(payload.get("items", []) or [])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
 def _build_instruction_callout_crops(
     set_num: str,
     bag: int,
@@ -1772,20 +1880,20 @@ def _build_instruction_callout_crops(
 
         page_height, page_width = img.shape[:2]
         detected = step_detector_service.detect_steps(str(set_num), int(page))
-        step_boxes = _contact_sheet_step_boxes_from_detected(detected)
+        step_boxes = _filter_invalid_step_anchor_boxes(_contact_sheet_step_boxes_from_detected(detected))
         current_steps = sorted({int(item.get("step_number", 0) or 0) for item in (step_boxes or []) if int(item.get("step_number", 0) or 0) > 0})
         next_page = next((int(candidate) for candidate in rendered_pages if int(candidate) > int(page) and int(candidate) >= int(start_page) and int(candidate) <= int(end_page)), None)
         if current_steps and next_page is not None:
             try:
-                next_detected = step_detector_service.detect_steps(str(set_num), int(next_page))
-                next_step_boxes = _contact_sheet_step_boxes_from_detected(next_detected)
+              next_detected = step_detector_service.detect_steps(str(set_num), int(next_page))
+              next_step_boxes = _filter_invalid_step_anchor_boxes(_contact_sheet_step_boxes_from_detected(next_detected))
             except Exception:
-                next_step_boxes = []
+              next_step_boxes = []
             next_steps = sorted({int(item.get("step_number", 0) or 0) for item in (next_step_boxes or []) if int(item.get("step_number", 0) or 0) > 0})
             if next_steps and int(min(next_steps)) - int(max(current_steps)) >= 3:
                 recovered = _recover_right_half_missing_steps(img, page_width, page_height, step_boxes, list(range(int(max(current_steps)) + 1, int(min(next_steps)))))
                 if recovered:
-                    step_boxes = sorted(list(step_boxes or []) + recovered, key=lambda item: (int(item.get("y", 0) or 0), int(item.get("x", 0) or 0), int(item.get("step_number", 0) or 0)))
+                  step_boxes = sorted(_filter_invalid_step_anchor_boxes(list(step_boxes or []) + recovered), key=lambda item: (int(item.get("y", 0) or 0), int(item.get("x", 0) or 0), int(item.get("step_number", 0) or 0)))
         edge_callout_candidates: List[Dict[str, Any]] = []
         for step_box in step_boxes or []:
             try:
@@ -2524,9 +2632,25 @@ async def buildability_clip_suggest(req: Request):
         raise HTTPException(status_code=400, detail="slot_index is required")
 
     labels_payload = _load_existing_labels(_label_store_path(set_num, int(bag)))
+    clip_memory_payload = _load_clip_memory(set_num, int(bag))
     crop = _load_crop_for_ai_snap(set_num, int(bag), crop_id)
     if not crop:
         raise HTTPException(status_code=404, detail="crop not found")
+
+    saved_good_pairs: set[tuple[str, int]] = set()
+    for saved_crop in list((labels_payload.get("crops") or {}).values()):
+        if not isinstance(saved_crop, dict):
+            continue
+        if str(saved_crop.get("status") or "").strip().lower() != "good":
+            continue
+        for saved_part in list(saved_crop.get("parts", []) or []):
+            if not isinstance(saved_part, dict):
+                continue
+            saved_part_num = str(saved_part.get("part_num") or "").strip()
+            saved_color_id = _coerce_int(saved_part.get("color_id"))
+            if not saved_part_num or saved_color_id is None:
+                continue
+            saved_good_pairs.add((saved_part_num, int(saved_color_id)))
 
     qty_token_boxes = [
         dict(item)
@@ -2604,6 +2728,99 @@ async def buildability_clip_suggest(req: Request):
         )
         if query_vectors.size == 0 or not candidate_rows or candidate_vectors.size == 0:
             return {"ok": True, "mode": "clip-placeholder", "ranked_candidates": []}
+
+        clip_memory_items = list(clip_memory_payload.get("items", []) or [])
+        clip_memory_index = {
+            (
+                str(item.get("crop_id") or "").strip(),
+                int(_coerce_int(item.get("slot_index")) or 0),
+                str(item.get("part_num") or "").strip(),
+                int(_coerce_int(item.get("color_id")) or 0),
+            ): item
+            for item in clip_memory_items
+            if isinstance(item, dict)
+        }
+        clip_memory_dirty = False
+        for saved_crop_id, saved_crop in dict(labels_payload.get("crops") or {}).items():
+            if not isinstance(saved_crop, dict):
+                continue
+            if str(saved_crop.get("status") or "").strip().lower() != "good":
+                continue
+            saved_parts = [dict(part) for part in list(saved_crop.get("parts", []) or []) if isinstance(part, dict)]
+            if not saved_parts:
+                continue
+            resolved_saved_crop = _load_crop_for_ai_snap(set_num, int(bag), str(saved_crop_id))
+            if not resolved_saved_crop:
+                continue
+            saved_qty_boxes = [
+                dict(item)
+                for item in list(resolved_saved_crop.get("qty_token_boxes", []) or [])
+                if isinstance(item, dict)
+            ]
+            for saved_slot_index, saved_part in enumerate(saved_parts):
+                saved_part_num = str(saved_part.get("part_num") or "").strip()
+                saved_color_id = _coerce_int(saved_part.get("color_id"))
+                if not saved_part_num or saved_color_id is None:
+                    continue
+                memory_key = (str(saved_crop_id).strip(), int(saved_slot_index), saved_part_num, int(saved_color_id))
+                if memory_key in clip_memory_index:
+                    continue
+                if not (0 <= int(saved_slot_index) < len(saved_qty_boxes)):
+                    continue
+                saved_temp_crop_path = _write_ai_snap_temp_crop_image(resolved_saved_crop)
+                if saved_temp_crop_path is None:
+                    continue
+                try:
+                    with tempfile.TemporaryDirectory(prefix="clip_memory_") as memory_dir:
+                        normalized_saved = normalize_slot_crop_from_qty(
+                            str(saved_temp_crop_path),
+                            saved_qty_boxes[int(saved_slot_index)],
+                            output_dir=memory_dir,
+                        )
+                        normalized_saved_path = str(normalized_saved.get("normalized_path") or "").strip()
+                        if not bool(normalized_saved.get("ok")) or not normalized_saved_path:
+                            continue
+                        memory_image = _load_rgb_image(Path(normalized_saved_path))
+                        if memory_image is None:
+                            continue
+                        _, memory_vector_rows = _sanitize_embeddings(
+                            [memory_key],
+                            _embed_images([memory_image], model, processor, device),
+                        )
+                        if memory_vector_rows.size == 0:
+                            continue
+                        memory_vector = np.asarray(memory_vector_rows, dtype=np.float32).reshape(-1)
+                        memory_vector = np.nan_to_num(
+                            memory_vector,
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        ).astype(np.float32, copy=False)
+                        if memory_vector.size == 0:
+                            continue
+                        memory_norm = float(np.sqrt(np.sum(memory_vector * memory_vector, dtype=np.float32)))
+                        if not np.isfinite(memory_norm) or memory_norm <= 1e-8:
+                            continue
+                        memory_item = {
+                            "crop_id": str(saved_crop_id).strip(),
+                            "slot_index": int(saved_slot_index),
+                            "part_num": saved_part_num,
+                            "color_id": int(saved_color_id),
+                            "embedding": memory_vector.tolist(),
+                            "updated_at": _iso_now(),
+                        }
+                        clip_memory_items.append(memory_item)
+                        clip_memory_index[memory_key] = memory_item
+                        clip_memory_dirty = True
+                finally:
+                    try:
+                        saved_temp_crop_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        if clip_memory_dirty:
+            clip_memory_payload["items"] = clip_memory_items
+            clip_memory_payload["updated_at"] = _iso_now()
+            _write_clip_memory(set_num, int(bag), clip_memory_payload)
 
         query_vectors = np.asarray(query_vectors, dtype=np.float32)
         candidate_vectors = np.asarray(candidate_vectors, dtype=np.float32)
@@ -2688,20 +2905,95 @@ async def buildability_clip_suggest(req: Request):
             invalid_candidate_vectors_removed,
         )
         similarity = query_vectors @ candidate_vectors.T
-        best_indices = np.argsort(-similarity[0])[: min(10, len(candidate_rows))]
+        memory_similarity_by_pair: Dict[tuple[str, int], float] = {}
+        memory_vectors_list: List[np.ndarray] = []
+        memory_rows: List[Dict[str, Any]] = []
+        query_dim = int(query_vectors.shape[1]) if query_vectors.ndim == 2 else 0
+        for item in clip_memory_items:
+            if not isinstance(item, dict):
+                continue
+            embedding = np.asarray(item.get("embedding", []), dtype=np.float32).reshape(-1)
+            if embedding.size != query_dim:
+                continue
+            memory_vectors_list.append(embedding)
+            memory_rows.append(item)
+        if memory_vectors_list and memory_rows:
+            memory_vectors = np.asarray(memory_vectors_list, dtype=np.float32)
+            memory_vectors = np.nan_to_num(memory_vectors, nan=0.0, posinf=0.0, neginf=0.0).astype(
+                np.float32, copy=False
+            )
+            memory_finite_mask = np.isfinite(memory_vectors).all(axis=1)
+            memory_rows = [
+                item
+                for item, keep in zip(memory_rows, memory_finite_mask.tolist())
+                if bool(keep)
+            ]
+            memory_vectors = memory_vectors[memory_finite_mask]
+            if memory_rows and memory_vectors.size:
+                memory_norms = np.sqrt(
+                    np.sum(memory_vectors * memory_vectors, axis=1, dtype=np.float32)
+                ).astype(np.float32, copy=False)
+                valid_memory_mask = memory_norms > 1e-8
+                memory_rows = [
+                    item
+                    for item, keep in zip(memory_rows, valid_memory_mask.tolist())
+                    if bool(keep)
+                ]
+                memory_vectors = memory_vectors[valid_memory_mask]
+                memory_norms = memory_norms[valid_memory_mask]
+                if memory_rows and memory_vectors.size:
+                    memory_vectors = memory_vectors / np.maximum(
+                        memory_norms[:, None], np.float32(1e-8)
+                    )
+                    memory_vectors = np.nan_to_num(
+                        memory_vectors, nan=0.0, posinf=0.0, neginf=0.0
+                    ).astype(np.float32, copy=False)
+                    memory_similarity = query_vectors @ memory_vectors.T
+                    for idx, memory_item in enumerate(memory_rows):
+                        pair = (
+                            str(memory_item.get("part_num") or "").strip(),
+                            int(_coerce_int(memory_item.get("color_id")) or 0),
+                        )
+                        score = float(memory_similarity[0, int(idx)])
+                        if pair not in memory_similarity_by_pair or score > memory_similarity_by_pair[pair]:
+                            memory_similarity_by_pair[pair] = score
+        scored_candidates: List[Dict[str, Any]] = []
+        for idx, candidate in enumerate(candidate_rows):
+            clip_score = float(similarity[0, int(idx)])
+            pair = (
+                str(candidate.get("part_num") or "").strip(),
+                int(candidate.get("color_id", 0) or 0),
+            )
+            good_label_boost = 0.08 if pair in saved_good_pairs else 0.0
+            memory_similarity_score = float(memory_similarity_by_pair.get(pair, 0.0))
+            memory_bank_boost = min(0.12, max(0.0, memory_similarity_score - 0.85) * 0.6)
+            boosted_score = clip_score + good_label_boost + memory_bank_boost
+            scored_candidates.append(
+                {
+                    "candidate": candidate,
+                    "clip_score": clip_score,
+                    "good_label_boost": good_label_boost,
+                    "boosted_score": boosted_score,
+                }
+            )
+        scored_candidates.sort(key=lambda item: item["boosted_score"], reverse=True)
+        top_candidates = scored_candidates[: min(10, len(scored_candidates))]
         ranked_candidates = [
             {
                 "rank": int(index + 1),
-                "part_num": str(candidate_rows[int(idx)].get("part_num") or ""),
-                "color_id": int(candidate_rows[int(idx)].get("color_id", 0) or 0),
-                "required_qty": int(candidate_rows[int(idx)].get("required_qty", 0) or 0),
-                "assigned_qty": int(candidate_rows[int(idx)].get("assigned_qty", 0) or 0),
-                "remaining_qty": int(candidate_rows[int(idx)].get("remaining_qty", 0) or 0),
-                "score": round(float(similarity[0, int(idx)]), 4),
-                "image_url": str(candidate_rows[int(idx)].get("img_url") or ""),
-                "image_path": str(candidate_rows[int(idx)].get("image_path") or ""),
+                "part_num": str(item["candidate"].get("part_num") or ""),
+                "color_id": int(item["candidate"].get("color_id", 0) or 0),
+                "required_qty": int(item["candidate"].get("required_qty", 0) or 0),
+                "assigned_qty": int(item["candidate"].get("assigned_qty", 0) or 0),
+                "remaining_qty": int(item["candidate"].get("remaining_qty", 0) or 0),
+                "score": round(float(item["boosted_score"]), 4),
+                "image_url": str(item["candidate"].get("img_url") or ""),
+                "image_path": str(item["candidate"].get("image_path") or ""),
+                "clip_score": round(float(item["clip_score"]), 4),
+                "good_label_boost": round(float(item["good_label_boost"]), 4),
+                "boosted_score": round(float(item["boosted_score"]), 4),
             }
-            for index, idx in enumerate(best_indices)
+            for index, item in enumerate(top_candidates)
         ]
     finally:
         if temp_crop_path is not None:
