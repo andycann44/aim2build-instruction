@@ -1172,13 +1172,13 @@ def _refine_page_level_panel_with_step_geometry(
                 box_h = int(bottom["y"] - top["y"])
                 if box_h < 38 or box_h > 240:
                     continue
-                left = max(0, min(int(top["x1"]), int(bottom["x1"])) - 8)
-                right = min(roi.shape[1], max(int(top["x2"]), int(bottom["x2"])) + 8)
+                left = max(0, min(int(top["x1"]), int(bottom["x1"])) - 3)
+                right = min(roi.shape[1], max(int(top["x2"]), int(bottom["x2"])) + 3)
                 box_w = int(right - left)
                 if box_w < 110 or box_w > 700:
                     continue
-                top_y = max(0, int(top["y"]) - 20)
-                bottom_y = min(roi.shape[0], int(bottom["y"]) + 8)
+                top_y = max(0, int(top["y"]) - 3)
+                bottom_y = min(roi.shape[0], int(bottom["y"]) + 3)
                 ax = int(sx1 + left)
                 ay = int(sy1 + top_y)
                 bx = int(sx1 + right)
