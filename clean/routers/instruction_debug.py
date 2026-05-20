@@ -1399,7 +1399,7 @@ def _page_level_callout_candidates_for_fallback(
             data_uri = _encode_debug_image_data_uri(crop_img, max_width=420)
         except Exception:
             continue
-        qty_payload = _qty_payload_for_page_level_callout_crop(crop_img, step_number)
+        qty_payload = _qty_payload_for_page_level_callout_crop(crop_img, step_number, "page_level_callout_assignment")
         candidate = {
             "candidate_origin": "callout_box_candidate",
             "source": "page_level_callout_assignment",
@@ -1561,6 +1561,10 @@ def _dedupe_qty_tokens_high_overlap_only(tokens: List[Dict[str, Any]]) -> List[D
             "cx": int(token.get("cx", 0) or 0),
             "cy": int(token.get("cy", 0) or 0),
         }
+        if "source_region" in token:
+            normalized_token["source_region"] = str(token.get("source_region") or "")
+        if "confidence" in token:
+            normalized_token["confidence"] = token.get("confidence")
         if any(
             _normalize_qty_token_text(existing.get("text")) == normalized
             and _token_overlap_ratio(existing, normalized_token) >= 0.75
@@ -1571,7 +1575,7 @@ def _dedupe_qty_tokens_high_overlap_only(tokens: List[Dict[str, Any]]) -> List[D
     return deduped
 
 
-def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int) -> Dict[str, Any]:
+def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int, source_label: str = "page_level_callout_assignment") -> Dict[str, Any]:
     payload = _auto_qty_payload_for_crop(crop_img, step_number)
     debug_regions: List[Dict[str, Any]] = []
     if crop_img is None or getattr(crop_img, "size", 0) == 0:
@@ -1613,8 +1617,62 @@ def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int) ->
                     "cx": tx + (tw // 2),
                     "cy": ty + (th // 2),
                     "source_region": name,
+                    "confidence": None,
                 }
             )
+        try:
+            import pytesseract
+
+            gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
+            for scale, psm_values in ((4.0, (6, 11, 12)), (5.0, (6, 11, 12))):
+                enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                thresholded = cv2.adaptiveThreshold(
+                    enlarged,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    31,
+                    6,
+                )
+                for psm in psm_values:
+                    data = pytesseract.image_to_data(
+                        thresholded,
+                        config=f"--psm {psm} -c tessedit_char_whitelist=0123456789xX",
+                        output_type=pytesseract.Output.DICT,
+                    )
+                    for idx in range(len(data.get("text", []) or [])):
+                        normalized = _normalize_qty_token_text(data.get("text", [""])[idx])
+                        if not normalized:
+                            continue
+                        try:
+                            confidence = float(data.get("conf", ["-1"])[idx] or -1)
+                        except Exception:
+                            confidence = -1.0
+                        if confidence < 25:
+                            continue
+                        tw = max(1, int(float(data.get("width", [0])[idx] or 0) / scale))
+                        th = max(1, int(float(data.get("height", [0])[idx] or 0) / scale))
+                        if tw < 8 or tw > 42 or th < 7 or th > 30:
+                            continue
+                        tx = int(x1 + (float(data.get("left", [0])[idx] or 0) / scale))
+                        ty = int(y1 + (float(data.get("top", [0])[idx] or 0) / scale))
+                        if ty < 0 or tx < 0:
+                            continue
+                        tokens.append(
+                            {
+                                "text": normalized,
+                                "x": tx,
+                                "y": ty,
+                                "w": tw,
+                                "h": th,
+                                "cx": tx + (tw // 2),
+                                "cy": ty + (th // 2),
+                                "source_region": f"{name}:adaptive_s{int(scale)}_psm{psm}",
+                                "confidence": confidence,
+                            }
+                        )
+        except Exception:
+            pass
 
     ordered_tokens = sorted(
         _dedupe_qty_tokens_high_overlap_only(tokens),
@@ -1637,11 +1695,11 @@ def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int) ->
             for token in ordered_tokens
         ]
 
-    payload["qty_source"] = "page_level_callout_assignment"
+    payload["qty_source"] = str(source_label or "page_level_callout_assignment")
     payload["qty_ocr_source_regions"] = debug_regions
     payload["qty_ocr_ordered_qty_list"] = list(payload.get("detected_qty_text", []) or [])
     print(
-        "[qty-ocr] source=page_level_callout_assignment",
+        f"[qty-ocr] source={source_label}",
         "step=",
         int(step_number or 0),
         "regions=",
@@ -3032,6 +3090,20 @@ def _build_instruction_callout_crops(
                 "ai_crop_box": None,
                 "ai_suggested_fix": False,
             }
+            candidate_source = str(candidate.get("source") or candidate.get("candidate_origin") or "")
+            if candidate_source in {"edge_detect", "page_level_callout_assignment"}:
+                crop_box = _coerce_box_list(candidate.get("coords_xywh"))
+                if crop_box is not None:
+                    x = int(crop_box[0] or 0)
+                    y = int(crop_box[1] or 0)
+                    w = int(crop_box[2] or 0)
+                    h = int(crop_box[3] or 0)
+                    if w > 0 and h > 0:
+                        qty_payload = _qty_payload_for_page_level_callout_crop(
+                            img[y : y + h, x : x + w],
+                            int(step_number),
+                            candidate_source,
+                        )
             if ai_enabled:
                 crop_box = _coerce_box_list(candidate.get("coords_xywh"))
                 if crop_box is not None:
@@ -3059,7 +3131,7 @@ def _build_instruction_callout_crops(
                 if str(value).strip()
             ]
             # Final safety: do not allow OCR to turn the step number into a qty.
-            if step_number and str(qty_payload.get("qty_source") or "local") not in {"openai", "page_level_callout_assignment"}:
+            if step_number and str(qty_payload.get("qty_source") or "local") not in {"openai", "page_level_callout_assignment", "edge_detect"}:
                 clean_pairs = [
                     (text, number)
                     for text, number in zip(detected_qty_text, detected_qty_numbers)
