@@ -124,6 +124,29 @@ def create_shape_mask_for_slot_crop(
             "error": "shape_mask_empty",
         }
 
+    ys, xs = np.where(cleaned > 0)
+    if xs.size == 0 or ys.size == 0:
+        return {
+            "ok": False,
+            "shape_mask_path": "",
+            "part_cutout_path": "",
+            "error": "shape_mask_empty",
+        }
+    pad = max(5, min(10, min(h, w) // 16))
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad + 1)
+    y2 = min(h, int(ys.max()) + pad + 1)
+    cropped_mask = cleaned[y1:y2, x1:x2]
+    cropped_img = img[y1:y2, x1:x2]
+    if cropped_mask is None or cropped_mask.size == 0 or cropped_img is None or cropped_img.size == 0:
+        return {
+            "ok": False,
+            "shape_mask_path": "",
+            "part_cutout_path": "",
+            "error": "shape_mask_crop_empty",
+        }
+
     _SHAPE_MASK_DIR.mkdir(parents=True, exist_ok=True)
     _PART_CUTOUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -146,9 +169,9 @@ def create_shape_mask_for_slot_crop(
     mask_path = _SHAPE_MASK_DIR / f"{stem}_mask.png"
     cutout_path = _PART_CUTOUT_DIR / f"{stem}_cutout.png"
 
-    ok_mask = cv2.imwrite(str(mask_path), cleaned)
-    bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-    bgra[:, :, 3] = cleaned
+    ok_mask = cv2.imwrite(str(mask_path), cropped_mask)
+    bgra = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = cropped_mask
     ok_cutout = cv2.imwrite(str(cutout_path), bgra)
     if not ok_mask:
         return {
@@ -163,4 +186,5 @@ def create_shape_mask_for_slot_crop(
         "part_cutout_path": str(cutout_path) if ok_cutout else "",
         "error": "",
         "mask_component_count": kept,
+        "mask_crop_box": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
     }
