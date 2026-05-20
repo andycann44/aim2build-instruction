@@ -1575,6 +1575,47 @@ def _dedupe_qty_tokens_high_overlap_only(tokens: List[Dict[str, Any]]) -> List[D
     return deduped
 
 
+def _final_crop_qty_token_is_valid(token: Dict[str, Any], crop_width: int, crop_height: int) -> bool:
+    try:
+        x = int(token.get("x", 0) or 0)
+        y = int(token.get("y", 0) or 0)
+        w = int(token.get("w", 0) or 0)
+        h = int(token.get("h", 0) or 0)
+    except Exception:
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    if x < 0 or y < 0 or x + w > int(crop_width) or y + h > int(crop_height):
+        return False
+    if y < max(4, int(crop_height * 0.14)):
+        return False
+    if w > max(48, int(crop_width * 0.16)) or h > max(30, int(crop_height * 0.20)):
+        return False
+    return True
+
+
+def _order_qty_tokens_by_rows(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[List[Dict[str, Any]]] = []
+    for token in sorted(list(tokens or []), key=lambda item: (int(item.get("cy", 0) or 0), int(item.get("x", 0) or 0))):
+        cy = int(token.get("cy", 0) or 0)
+        placed = False
+        for row in rows:
+            row_cy = int(round(sum(int(item.get("cy", 0) or 0) for item in row) / max(1, len(row))))
+            row_h = max(int(item.get("h", 0) or 0) for item in row)
+            token_h = int(token.get("h", 0) or 0)
+            if abs(cy - row_cy) <= max(18, int(max(row_h, token_h) * 1.8)):
+                row.append(token)
+                placed = True
+                break
+        if not placed:
+            rows.append([token])
+
+    ordered: List[Dict[str, Any]] = []
+    for row in sorted(rows, key=lambda items: sum(int(item.get("cy", 0) or 0) for item in items) / max(1, len(items))):
+        ordered.extend(sorted(row, key=lambda item: int(item.get("x", 0) or 0)))
+    return ordered
+
+
 def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int, source_label: str = "page_level_callout_assignment") -> Dict[str, Any]:
     payload = _auto_qty_payload_for_crop(crop_img, step_number)
     debug_regions: List[Dict[str, Any]] = []
@@ -1674,9 +1715,13 @@ def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int, so
         except Exception:
             pass
 
-    ordered_tokens = sorted(
-        _dedupe_qty_tokens_high_overlap_only(tokens),
-        key=lambda item: (int(item.get("cy", 0) or 0), int(item.get("x", 0) or 0)),
+    filtered_tokens = [
+        token
+        for token in _dedupe_qty_tokens_high_overlap_only(tokens)
+        if _final_crop_qty_token_is_valid(token, int(width), int(height))
+    ]
+    ordered_tokens = _order_qty_tokens_by_rows(
+        filtered_tokens,
     )
     if ordered_tokens:
         detected_qty_text: List[str] = []
