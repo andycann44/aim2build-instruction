@@ -45,6 +45,7 @@ from clean.routers.debug import (
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.azure_openai_service import rank_crop_candidates
+from clean.services.ai_snap_crop_service import create_shape_mask_for_slot_crop
 from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
@@ -3607,6 +3608,8 @@ async def ai_rank_slot(req: Request):
     ai_failure_reason = ""
     candidate_count = len(mock_ranked_candidates)
     ai_snap_input_path = ""
+    shape_mask_path = ""
+    part_cutout_path = ""
     normalized_path = ""
     component_path = ""
     selected_box: Optional[Dict[str, Any]] = None
@@ -3635,6 +3638,17 @@ async def ai_rank_slot(req: Request):
             else:
                 normalization_fallback_reason = "selected_qty_box_unavailable"
             ai_snap_input_path = rank_input_path
+            if ai_snap_input_path:
+                shape_result = create_shape_mask_for_slot_crop(
+                    ai_snap_input_path,
+                    set_num=set_num,
+                    bag=int(bag),
+                    crop_id=crop_id,
+                    slot_index=int(slot_index),
+                )
+                if bool(shape_result.get("ok")):
+                    shape_mask_path = str(shape_result.get("shape_mask_path") or "")
+                    part_cutout_path = str(shape_result.get("part_cutout_path") or "")
             if not normalized_path and not normalization_fallback_reason:
                 normalization_fallback_reason = "normalized_path_unavailable"
             print(
@@ -3745,6 +3759,8 @@ async def ai_rank_slot(req: Request):
             "slot_qty_text": slot_qty_text,
             "sequence_length": len(sequence),
             "ai_snap_input_path": ai_snap_input_path,
+            "shape_mask_path": shape_mask_path,
+            "part_cutout_path": part_cutout_path,
             "normalized_path": normalized_path,
             "component_path": component_path,
             "selected_qty_box": selected_qty_box,
