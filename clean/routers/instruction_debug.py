@@ -510,6 +510,180 @@ def _detect_callout_rect_by_edges(
         return None
 
 
+def _pale_blue_callout_ratio_bgr(crop_img: Any) -> float:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return 0.0
+        hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+        bgr = crop_img
+        mask = (
+            (
+                (hsv[:, :, 0] >= 80)
+                & (hsv[:, :, 0] <= 132)
+                & (hsv[:, :, 1] <= 150)
+                & (hsv[:, :, 2] >= 135)
+            )
+            | (
+                (bgr[:, :, 0] >= 150)
+                & (bgr[:, :, 1] >= 150)
+                & (bgr[:, :, 2] >= 130)
+                & ((bgr[:, :, 0].astype(np.int16) - bgr[:, :, 2].astype(np.int16)) >= 8)
+            )
+        )
+        return float(mask.mean())
+    except Exception:
+        return 0.0
+
+
+def _box_contains_box(outer: List[int], inner: List[int], pad: int = 0) -> bool:
+    ox, oy, ow, oh = [int(value) for value in outer]
+    ix, iy, iw, ih = [int(value) for value in inner]
+    return (
+        ox - int(pad) <= ix
+        and oy - int(pad) <= iy
+        and ox + ow + int(pad) >= ix + iw
+        and oy + oh + int(pad) >= iy + ih
+    )
+
+
+def _repair_callout_box_candidate_crop(
+    img: Any,
+    candidate: Dict[str, Any],
+    *,
+    page_width: int,
+    page_height: int,
+) -> Optional[Dict[str, Any]]:
+    """Conservatively expand a narrow fallback candidate to the full callout.
+
+    This is only for material-pipeline `callout_box_candidate` rows. It never
+    creates a replacement unless the larger box still contains the original
+    candidate and known qty token boxes.
+    """
+    try:
+        if str(candidate.get("candidate_origin") or "") != "callout_box_candidate":
+            return None
+        if str(candidate.get("source") or "").strip().startswith("edge_detect"):
+            return None
+        crop_box = _coerce_box_list(candidate.get("coords_xywh"))
+        if crop_box is None:
+            return None
+        x, y, w, h = [int(value) for value in crop_box]
+        if w <= 0 or h <= 0:
+            return None
+        aspect = w / float(max(1, h))
+        if w >= 340 and h >= 120 and aspect <= 3.9:
+            return None
+
+        search_pad_left = max(80, int(round(w * 0.45)))
+        search_pad_right = max(180, int(round(w * 0.95)))
+        search_pad_y = max(70, int(round(h * 0.70)))
+        search_bounds = _safe_crop_bounds(
+            x - search_pad_left,
+            y - search_pad_y,
+            x + w + search_pad_right,
+            y + h + search_pad_y,
+            page_width,
+            page_height,
+        )
+        if search_bounds is None:
+            return None
+        sx1, sy1, sx2, sy2 = search_bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return None
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        bgr = roi
+        pale_mask = (
+            (
+                (hsv[:, :, 0] >= 80)
+                & (hsv[:, :, 0] <= 132)
+                & (hsv[:, :, 1] <= 155)
+                & (hsv[:, :, 2] >= 130)
+            )
+            | (
+                (bgr[:, :, 0] >= 145)
+                & (bgr[:, :, 1] >= 145)
+                & (bgr[:, :, 2] >= 120)
+                & ((bgr[:, :, 0].astype(np.int16) - bgr[:, :, 2].astype(np.int16)) >= 6)
+            )
+        ).astype(np.uint8) * 255
+        pale_mask = cv2.morphologyEx(pale_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=1)
+        pale_mask = cv2.morphologyEx(pale_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(pale_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        token_boxes = [
+            dict(item)
+            for item in list(candidate.get("qty_token_boxes") or [])
+            if isinstance(item, dict)
+        ]
+        token_page_boxes = []
+        for token in token_boxes:
+            tx = int(token.get("x", 0) or 0)
+            ty = int(token.get("y", 0) or 0)
+            tw = max(1, int(token.get("w", 0) or 0))
+            th = max(1, int(token.get("h", 0) or 0))
+            token_page_boxes.append([x + tx, y + ty, tw, th])
+
+        best_box: Optional[List[int]] = None
+        best_score = -1.0
+        for contour in contours:
+            cx, cy, cw, ch = cv2.boundingRect(contour)
+            if cw <= 0 or ch <= 0:
+                continue
+            # Include the dark rounded border around the pale-blue interior.
+            pad = 4
+            repaired = [
+                max(0, sx1 + cx - pad),
+                max(0, sy1 + cy - pad),
+                min(page_width, sx1 + cx + cw + pad) - max(0, sx1 + cx - pad),
+                min(page_height, sy1 + cy + ch + pad) - max(0, sy1 + cy - pad),
+            ]
+            rx, ry, rw, rh = [int(value) for value in repaired]
+            if rw <= w or rh < h:
+                continue
+            if rw < 160 or rh < 55:
+                continue
+            if not _box_contains_box(repaired, crop_box, pad=2):
+                continue
+            if any(not _box_contains_box(repaired, token_box, pad=2) for token_box in token_page_boxes):
+                continue
+            repaired_crop = img[ry : ry + rh, rx : rx + rw]
+            if repaired_crop is None or repaired_crop.size == 0:
+                continue
+            if _yellow_ratio_bgr(repaired_crop) > 0.18:
+                continue
+            pale_ratio = _pale_blue_callout_ratio_bgr(repaired_crop)
+            if pale_ratio < 0.38:
+                continue
+            gray = cv2.cvtColor(repaired_crop, cv2.COLOR_BGR2GRAY)
+            dark = gray < 100
+            band = max(2, min(7, min(rw, rh) // 14))
+            border_dark = (
+                int(dark[:band, :].sum())
+                + int(dark[rh - band :, :].sum())
+                + int(dark[:, :band].sum())
+                + int(dark[:, rw - band :].sum())
+            )
+            if border_dark < max(24, int((rw + rh) * 0.12)):
+                continue
+            score = float(rw * rh) + (pale_ratio * 10000.0) + float(border_dark)
+            if score > best_score:
+                best_score = score
+                best_box = repaired
+
+        if best_box is None:
+            return None
+        repaired_candidate = dict(candidate)
+        repaired_candidate["coords_xywh"] = [int(value) for value in best_box]
+        repaired_candidate["coords_label"] = "callout_box_candidate repaired"
+        repaired_candidate["source"] = "callout_box_candidate_repaired"
+        repaired_candidate["edge_rect"] = [int(value) for value in best_box]
+        return repaired_candidate
+    except Exception:
+        return None
+
+
 def _estimate_visible_part_count_from_crop(crop_img: Any) -> int:
     """Estimate visible part count from contrast against callout background.
 
@@ -1967,6 +2141,40 @@ def _build_instruction_callout_crops(
                 if str(item.get("candidate_origin", "")) == "callout_box_candidate"
                 and bool(item.get("match_enabled"))
             ]
+            repaired_candidates: List[Dict[str, Any]] = []
+            for candidate in callout_candidates:
+                repaired = _repair_callout_box_candidate_crop(
+                    img,
+                    candidate,
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+                if repaired is None:
+                    repaired_candidates.append(candidate)
+                    continue
+                crop_box = _coerce_box_list(repaired.get("coords_xywh"))
+                if crop_box is None:
+                    repaired_candidates.append(candidate)
+                    continue
+                rx, ry, rw, rh = [int(value) for value in crop_box]
+                crop_img = img[ry : ry + rh, rx : rx + rw]
+                if crop_img is None or crop_img.size == 0:
+                    repaired_candidates.append(candidate)
+                    continue
+                try:
+                    repaired["data_uri"] = _encode_debug_image_data_uri(crop_img, max_width=420)
+                except Exception:
+                    repaired_candidates.append(candidate)
+                    continue
+                repaired_qty_payload = _auto_qty_payload_for_crop(
+                    crop_img,
+                    int(repaired.get("step_number", candidate.get("step_number", 0)) or 0),
+                )
+                repaired["detected_qty_text"] = repaired_qty_payload.get("detected_qty_text", [])
+                repaired["detected_qty_numbers"] = repaired_qty_payload.get("detected_qty_numbers", [])
+                repaired["qty_token_boxes"] = repaired_qty_payload.get("qty_token_boxes")
+                repaired_candidates.append(repaired)
+            callout_candidates = repaired_candidates
 
         for idx, candidate in enumerate(callout_candidates, start=1):
             step_number = int(candidate.get("step_number", 0) or 0)
@@ -2016,6 +2224,17 @@ def _build_instruction_callout_crops(
                 ]
                 detected_qty_text = [text for text, _ in clean_pairs]
                 detected_qty_numbers = [number for _, number in clean_pairs]
+            qty_missing = not detected_qty_text and not detected_qty_numbers
+            if qty_missing:
+              candidate_box = _coerce_box_list(candidate.get("coords_xywh"))
+              visible_part_estimate = 0
+              if candidate_box is not None:
+                cx, cy, cw, ch = [int(value) for value in candidate_box]
+                if cw > 0 and ch > 0:
+                  candidate_crop = img[cy : cy + ch, cx : cx + cw]
+                  visible_part_estimate = _estimate_visible_part_count_from_crop(candidate_crop)
+              if int(visible_part_estimate) <= 0:
+                continue
             crop_id = f"p{int(page)}_s{max(step_number, 0)}_c{idx}"
             crops.append(
                 {
