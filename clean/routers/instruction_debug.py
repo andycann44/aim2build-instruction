@@ -25,7 +25,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -50,6 +50,19 @@ from clean.services.part_crop_normalize_service import normalize_part_crop, norm
 from clean.services.instruction_buildability_source import load_instruction_set_parts
 
 router = APIRouter()
+
+_PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+
+def _page_callout_cache_key(set_num: str, page: int) -> Tuple[str, int]:
+    return (str(set_num or "").strip(), int(page or 0))
+
+
+def _page_callout_cache_entry(set_num: str, page: int, *, rebuild: bool = False) -> Dict[str, Any]:
+    key = _page_callout_cache_key(set_num, page)
+    if rebuild:
+        _PAGE_CALLOUT_DETECTION_CACHE.pop(key, None)
+    return _PAGE_CALLOUT_DETECTION_CACHE.setdefault(key, {})
 
 
 def _coerce_label_filename(set_num: str, bag: int) -> str:
@@ -510,6 +523,115 @@ def _detect_callout_rect_by_edges(
         return None
 
 
+def _quantized_bgr_keys(img: Any, bin_size: int = 24) -> Any:
+    arr = np.asarray(img, dtype=np.uint16)
+    quantized = np.minimum(arr // max(1, int(bin_size)), 255)
+    return (
+        (quantized[:, :, 0].astype(np.uint32) << 16)
+        | (quantized[:, :, 1].astype(np.uint32) << 8)
+        | quantized[:, :, 2].astype(np.uint32)
+    )
+
+
+def _quantized_color_counts(img: Any, bin_size: int = 24) -> Dict[int, int]:
+    try:
+        if img is None or getattr(img, "size", 0) == 0:
+            return {}
+        keys = _quantized_bgr_keys(img, bin_size=bin_size).reshape(-1)
+        values, counts = np.unique(keys, return_counts=True)
+        return {int(value): int(count) for value, count in zip(values.tolist(), counts.tolist())}
+    except Exception:
+        return {}
+
+
+def _dominant_color_key_and_pct(counts: Dict[int, int], total: int) -> Tuple[Optional[int], float]:
+    if not counts or total <= 0:
+        return None, 0.0
+    key, count = max(counts.items(), key=lambda item: int(item[1]))
+    return int(key), float(count) / float(max(1, total))
+
+
+def _page_background_colour_stats(
+    img: Any,
+    *,
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> Dict[str, Any]:
+    cache_entry: Optional[Dict[str, Any]] = None
+    if set_num is not None and page is not None:
+        cache_entry = _page_callout_cache_entry(str(set_num), int(page), rebuild=rebuild)
+        cached = cache_entry.get("page_background_colour_stats")
+        if isinstance(cached, dict):
+            return cached
+    page_height, page_width = img.shape[:2]
+    page_total = int(page_width) * int(page_height)
+    page_counts = _quantized_color_counts(img)
+    main_key, main_pct = _dominant_color_key_and_pct(page_counts, page_total)
+    stats = {
+        "page_counts": page_counts,
+        "page_total": page_total,
+        "main_page_key": main_key,
+        "main_page_pct": main_pct,
+    }
+    if cache_entry is not None:
+        cache_entry["page_background_colour_stats"] = stats
+    return stats
+
+
+def _panel_colour_contrast_stats(
+    crop_img: Any,
+    page_counts: Dict[int, int],
+    page_total: int,
+    main_page_key: Optional[int],
+    main_page_pct: float,
+    *,
+    bin_size: int = 24,
+) -> Dict[str, float]:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return {"ok": 0.0, "local_pct": 0.0, "page_pct": 1.0}
+        counts = _quantized_color_counts(crop_img, bin_size=bin_size)
+        crop_total = int(crop_img.shape[0]) * int(crop_img.shape[1])
+        local_key, local_pct = _dominant_color_key_and_pct(counts, crop_total)
+        if local_key is None:
+            return {"ok": 0.0, "local_pct": 0.0, "page_pct": 1.0}
+        page_pct = float(page_counts.get(int(local_key), 0)) / float(max(1, page_total))
+        ok = (
+            int(local_key) != int(main_page_key or -1)
+            and float(local_pct) >= 0.24
+            and float(page_pct) < max(float(main_page_pct) * 0.82, 0.035)
+        )
+        return {"ok": 1.0 if ok else 0.0, "local_pct": float(local_pct), "page_pct": float(page_pct)}
+    except Exception:
+        return {"ok": 0.0, "local_pct": 0.0, "page_pct": 1.0}
+
+
+def _page_panel_colour_mask(
+    img: Any,
+    page_counts: Dict[int, int],
+    page_total: int,
+    main_page_key: Optional[int],
+    main_page_pct: float,
+    *,
+    bin_size: int = 24,
+) -> Any:
+    keys = _quantized_bgr_keys(img, bin_size=bin_size)
+    allowed_keys = {
+        int(key)
+        for key, count in page_counts.items()
+        if int(key) != int(main_page_key or -1)
+        and (float(count) / float(max(1, page_total))) < max(float(main_page_pct) * 0.82, 0.035)
+        and count >= max(120, int(page_total * 0.00025))
+    }
+    if not allowed_keys:
+        return np.zeros(keys.shape, dtype=np.uint8)
+    mask = np.isin(keys, np.array(sorted(allowed_keys), dtype=np.uint32)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((17, 17), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+    return mask
+
+
 def _pale_blue_callout_ratio_bgr(crop_img: Any) -> float:
     try:
         if crop_img is None or getattr(crop_img, "size", 0) == 0:
@@ -684,6 +806,628 @@ def _repair_callout_box_candidate_crop(
         return None
 
 
+def _detect_page_step_number_boxes(
+    img: Any,
+    step_boxes: List[Dict[str, Any]],
+    *,
+    page_width: int,
+    page_height: int,
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> List[Dict[str, Any]]:
+    cache_entry: Optional[Dict[str, Any]] = None
+    if set_num is not None and page is not None:
+        cache_entry = _page_callout_cache_entry(str(set_num), int(page), rebuild=rebuild)
+        cached_boxes = cache_entry.get("detected_step_number_boxes")
+        if not rebuild and isinstance(cached_boxes, list):
+            return [dict(item) for item in cached_boxes if isinstance(item, dict)]
+
+    detected: List[Dict[str, Any]] = []
+    for step_box in step_boxes or []:
+        try:
+            value = int(step_box.get("step_number", 0) or 0)
+            x = int(step_box.get("x", 0) or 0)
+            y = int(step_box.get("y", 0) or 0)
+            w = int(step_box.get("w", 0) or 0)
+            h = int(step_box.get("h", 0) or 0)
+        except Exception:
+            continue
+        if value <= 0 or w <= 0 or h <= 0:
+            continue
+        detected.append({"step_number": value, "x": x, "y": y, "w": w, "h": h, "source": step_box.get("source") or "step_detector"})
+
+    if not detected:
+        try:
+            import pytesseract
+
+            data = pytesseract.image_to_data(
+                img,
+                config="--psm 11 -c tessedit_char_whitelist=0123456789",
+                output_type=pytesseract.Output.DICT,
+            )
+            ocr_tokens: List[Dict[str, Any]] = []
+            for idx in range(len(data.get("text", []) or [])):
+                text = re.sub(r"\D+", "", str((data.get("text", [""])[idx] or "")).strip())
+                if not text:
+                    continue
+                value = int(text)
+                if value <= 0 or value >= 1000:
+                    continue
+                try:
+                    conf = float((data.get("conf", ["-1"])[idx] or -1))
+                except Exception:
+                    conf = -1.0
+                if conf < 25:
+                    continue
+                x = int(data.get("left", [0])[idx] or 0)
+                y = int(data.get("top", [0])[idx] or 0)
+                w = int(data.get("width", [0])[idx] or 0)
+                h = int(data.get("height", [0])[idx] or 0)
+                ocr_tokens.append({"text": text, "x": x, "y": y, "w": w, "h": h, "conf": conf})
+                if w < 8 or h < 16 or w > int(page_width * 0.16) or h > int(page_height * 0.16):
+                    continue
+                detected.append({"step_number": value, "x": x, "y": y, "w": w, "h": h, "source": "page_ocr"})
+            if cache_entry is not None:
+                cache_entry["ocr_tokens"] = ocr_tokens
+        except Exception:
+            pass
+
+    deduped: List[Dict[str, Any]] = []
+    for item in sorted(detected, key=lambda row: (int(row.get("step_number", 0) or 0), int(row.get("y", 0) or 0), int(row.get("x", 0) or 0))):
+        ix = int(item.get("x", 0) or 0)
+        iy = int(item.get("y", 0) or 0)
+        iw = int(item.get("w", 0) or 0)
+        ih = int(item.get("h", 0) or 0)
+        value = int(item.get("step_number", 0) or 0)
+        duplicate = False
+        for existing in deduped:
+            if int(existing.get("step_number", 0) or 0) != value:
+                continue
+            ex = int(existing.get("x", 0) or 0)
+            ey = int(existing.get("y", 0) or 0)
+            if abs((ix + iw // 2) - (ex + int(existing.get("w", 0) or 0) // 2)) <= 28 and abs((iy + ih // 2) - (ey + int(existing.get("h", 0) or 0) // 2)) <= 28:
+                duplicate = True
+                break
+        if not duplicate:
+            deduped.append(item)
+    if cache_entry is not None:
+        cache_entry["detected_step_number_boxes"] = [dict(item) for item in deduped]
+    return deduped
+
+
+def _detect_step_number_below_panel(
+    img: Any,
+    panel_box: List[int],
+    *,
+    page_width: int,
+    page_height: int,
+) -> List[Dict[str, Any]]:
+    try:
+        import pytesseract
+
+        px, py, pw, ph = [int(value) for value in panel_box]
+        bounds = _safe_crop_bounds(
+            px - max(130, int(pw * 0.50)),
+            py + ph - 8,
+            px + max(170, int(pw * 0.45)),
+            py + ph + max(170, int(ph * 1.20)),
+            page_width,
+            page_height,
+        )
+        if bounds is None:
+            return []
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return []
+        original_roi = roi
+        roi = cv2.resize(original_roi, None, fx=2.8, fy=2.8, interpolation=cv2.INTER_CUBIC)
+        data = pytesseract.image_to_data(
+            roi,
+            config="--psm 11 -c tessedit_char_whitelist=0123456789",
+            output_type=pytesseract.Output.DICT,
+        )
+        steps: List[Dict[str, Any]] = []
+        ocr_tokens: List[Dict[str, Any]] = []
+        scale = 2.8
+        for idx in range(len(data.get("text", []) or [])):
+            text = re.sub(r"\D+", "", str((data.get("text", [""])[idx] or "")).strip())
+            if not text:
+                continue
+            value = int(text)
+            if value <= 0 or value >= 1000:
+                continue
+            try:
+                conf = float((data.get("conf", ["-1"])[idx] or -1))
+            except Exception:
+                conf = -1.0
+            if conf < 15:
+                continue
+            x = sx1 + int(float(data.get("left", [0])[idx] or 0) / scale)
+            y = sy1 + int(float(data.get("top", [0])[idx] or 0) / scale)
+            w = max(1, int(float(data.get("width", [0])[idx] or 0) / scale))
+            h = max(1, int(float(data.get("height", [0])[idx] or 0) / scale))
+            ocr_tokens.append({"text": text, "x": x, "y": y, "w": w, "h": h, "conf": conf, "source": "panel_below_ocr"})
+            if w < 7 or h < 14:
+                continue
+            steps.append({"step_number": value, "x": x, "y": y, "w": w, "h": h, "source": "panel_below_ocr"})
+        if steps:
+            return [{"_ocr_tokens": ocr_tokens}, *steps]
+
+        gray = cv2.cvtColor(original_roi, cv2.COLOR_BGR2GRAY)
+        dark = (gray < 70).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 8 or h < 28 or w > int((sx2 - sx1) * 0.30) or h > int((sy2 - sy1) * 0.60):
+                continue
+            pad = 8
+            bounds = _safe_crop_bounds(x - pad, y - pad, x + w + pad, y + h + pad, sx2 - sx1, sy2 - sy1)
+            if bounds is None:
+                continue
+            x1, y1, x2, y2 = bounds
+            crop = original_roi[y1:y2, x1:x2]
+            if crop is None or crop.size == 0:
+                continue
+            crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+            text = pytesseract.image_to_string(
+                crop,
+                config="--psm 10 -c tessedit_char_whitelist=0123456789",
+            )
+            text = re.sub(r"\D+", "", str(text or ""))
+            if not text:
+                continue
+            value = int(text)
+            if value <= 0 or value >= 1000:
+                continue
+            token = {"text": text, "x": sx1 + x, "y": sy1 + y, "w": w, "h": h, "conf": None, "source": "panel_below_component_ocr"}
+            ocr_tokens.append(token)
+            steps.append({"step_number": value, "x": sx1 + x, "y": sy1 + y, "w": w, "h": h, "source": "panel_below_component_ocr"})
+        return ([{"_ocr_tokens": ocr_tokens}] if ocr_tokens else []) + steps
+    except Exception:
+        return []
+
+
+def _callout_panel_has_boundary(crop_img: Any) -> bool:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return False
+        h, w = crop_img.shape[:2]
+        if h <= 0 or w <= 0:
+            return False
+        gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+        dark = gray < 95
+        band = max(2, min(8, min(w, h) // 12))
+        border_dark = (
+            int(dark[:band, :].sum())
+            + int(dark[h - band :, :].sum())
+            + int(dark[:, :band].sum())
+            + int(dark[:, w - band :].sum())
+        )
+        if border_dark >= max(28, int((w + h) * 0.13)):
+            return True
+        edges = cv2.Canny(gray, 60, 150)
+        edge_band = (
+            int(edges[:band, :].sum() // 255)
+            + int(edges[h - band :, :].sum() // 255)
+            + int(edges[:, :band].sum() // 255)
+            + int(edges[:, w - band :].sum() // 255)
+        )
+        return edge_band >= max(34, int((w + h) * 0.20))
+    except Exception:
+        return False
+
+
+def _dark_line_group_centers(values: Any, threshold: int) -> List[int]:
+    centers: List[int] = []
+    start: Optional[int] = None
+    for idx, value in enumerate(list(values)):
+        if int(value) >= int(threshold):
+            if start is None:
+                start = int(idx)
+        elif start is not None:
+            centers.append((start + int(idx) - 1) // 2)
+            start = None
+    if start is not None:
+        centers.append((start + len(values) - 1) // 2)
+    return centers
+
+
+def _expand_panel_box_to_dark_boundary(
+    img: Any,
+    box: List[int],
+    *,
+    page_width: int,
+    page_height: int,
+) -> List[int]:
+    try:
+        x, y, w, h = [int(value) for value in box]
+        bounds = _safe_crop_bounds(
+            x - max(90, int(w * 0.75)),
+            y - max(35, int(h * 0.35)),
+            x + w + max(45, int(w * 0.18)),
+            y + h + max(70, int(h * 0.70)),
+            page_width,
+            page_height,
+        )
+        if bounds is None:
+            return box
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return box
+        roi_h, roi_w = roi.shape[:2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        dark = (gray < 100).astype(np.uint8)
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        col_counts = dark.sum(axis=0)
+        row_counts = dark.sum(axis=1)
+        vertical_threshold = max(10, int(roi_h * 0.12))
+        horizontal_threshold = max(18, int(roi_w * 0.16))
+        col_centers = _dark_line_group_centers(col_counts, vertical_threshold)
+        row_centers = _dark_line_group_centers(row_counts, horizontal_threshold)
+
+        local_left = x - sx1
+        local_right = x + w - sx1
+        local_top = y - sy1
+        local_bottom = y + h - sy1
+
+        left_options = [value for value in col_centers if value <= local_left + 8]
+        right_options = [value for value in col_centers if value >= local_right - 8]
+        top_options = [value for value in row_centers if value <= local_top + 8]
+        bottom_options = [value for value in row_centers if value >= local_bottom - 8]
+        if not left_options or not right_options or not top_options or not bottom_options:
+            return box
+
+        left = max(left_options)
+        right = min(right_options)
+        top = max(top_options)
+        bottom = min(bottom_options)
+        pad = 3
+        expanded = [
+            max(0, sx1 + left - pad),
+            max(0, sy1 + top - pad),
+            min(page_width, sx1 + right + pad) - max(0, sx1 + left - pad),
+            min(page_height, sy1 + bottom + pad) - max(0, sy1 + top - pad),
+        ]
+        ex, ey, ew, eh = [int(value) for value in expanded]
+        if ew <= w or eh < max(35, int(h * 0.65)):
+            return box
+        if ew > int(page_width * 0.60) or eh > int(page_height * 0.35):
+            return box
+        if not _box_contains_box(expanded, box, pad=2):
+            return box
+        return expanded
+    except Exception:
+        return box
+
+
+def _refine_page_level_panel_with_step_geometry(
+    img: Any,
+    panel_box: List[int],
+    *,
+    step_y: int,
+    page_width: int,
+    page_height: int,
+) -> Optional[List[int]]:
+    try:
+        px, py, pw, ph = [int(value) for value in panel_box]
+        bounds = _safe_crop_bounds(
+            px - max(45, int(pw * 0.20)),
+            py - max(28, int(ph * 0.25)),
+            px + pw + max(45, int(pw * 0.20)),
+            min(page_height, int(step_y) - 1),
+            page_width,
+            page_height,
+        )
+        if bounds is None:
+            return None
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return None
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 35, 110)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180.0,
+            threshold=35,
+            minLineLength=max(70, min(180, int(pw * 0.35))),
+            maxLineGap=14,
+        )
+        if lines is None:
+            return None
+
+        groups: List[Dict[str, int]] = []
+        for raw in lines:
+            x1, y1, x2, y2 = [int(v) for v in raw[0]]
+            if abs(y1 - y2) > 5:
+                continue
+            length = abs(x2 - x1)
+            if length < 70:
+                continue
+            y = int(round((y1 + y2) / 2.0))
+            lx = min(x1, x2)
+            rx = max(x1, x2)
+            matched = False
+            for group in groups:
+                if abs(group["y"] - y) <= 7:
+                    group["y"] = int(round((group["y"] + y) / 2.0))
+                    group["x1"] = min(group["x1"], lx)
+                    group["x2"] = max(group["x2"], rx)
+                    matched = True
+                    break
+            if not matched:
+                groups.append({"y": y, "x1": lx, "x2": rx})
+
+        groups.sort(key=lambda item: item["y"])
+        best: Optional[List[int]] = None
+        best_score = 10**9
+        for top_idx, top in enumerate(groups):
+            for bottom in groups[top_idx + 1 :]:
+                box_h = int(bottom["y"] - top["y"])
+                if box_h < 38 or box_h > 240:
+                    continue
+                left = max(0, min(int(top["x1"]), int(bottom["x1"])) - 8)
+                right = min(roi.shape[1], max(int(top["x2"]), int(bottom["x2"])) + 8)
+                box_w = int(right - left)
+                if box_w < 110 or box_w > 700:
+                    continue
+                top_y = max(0, int(top["y"]) - 20)
+                bottom_y = min(roi.shape[0], int(bottom["y"]) + 8)
+                ax = int(sx1 + left)
+                ay = int(sy1 + top_y)
+                bx = int(sx1 + right)
+                by = int(sy1 + bottom_y)
+                if by > int(step_y) - 5:
+                    by = int(step_y) - 5
+                if bx <= ax or by <= ay:
+                    continue
+                candidate = [ax, ay, bx - ax, by - ay]
+                if not _box_contains_box(candidate, panel_box, pad=14):
+                    continue
+                crop = img[ay:by, ax:bx]
+                if crop is None or crop.size == 0:
+                    continue
+                if _yellow_ratio_bgr(crop) > 0.18:
+                    continue
+                score = abs(int(step_y) - by) + abs((ax + bx) // 2 - (px + pw // 2)) // 5
+                if score < best_score:
+                    best_score = score
+                    best = candidate
+        return best
+    except Exception:
+        return None
+
+
+def _detect_page_level_callout_panels(
+    img: Any,
+    *,
+    page_width: int,
+    page_height: int,
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> List[Dict[str, Any]]:
+    try:
+        stats = _page_background_colour_stats(img, set_num=set_num, page=page, rebuild=rebuild)
+        page_total = int(stats.get("page_total") or (int(page_width) * int(page_height)))
+        page_counts = dict(stats.get("page_counts") or {})
+        main_key = stats.get("main_page_key")
+        main_pct = float(stats.get("main_page_pct") or 0.0)
+        mask = _page_panel_colour_mask(img, page_counts, page_total, main_key, main_pct)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        panels: List[Dict[str, Any]] = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 95 or h < 45:
+                continue
+            if w > int(page_width * 0.55) or h > int(page_height * 0.28):
+                continue
+            if w * h > int(page_total * 0.16):
+                continue
+            aspect = w / float(max(1, h))
+            if aspect < 1.15 or aspect > 7.0:
+                continue
+            pad = 5
+            bounds = _safe_crop_bounds(x - pad, y - pad, x + w + pad, y + h + pad, page_width, page_height)
+            if bounds is None:
+                continue
+            x1, y1, x2, y2 = bounds
+            expanded_box = _expand_panel_box_to_dark_boundary(
+                img,
+                [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                page_width=page_width,
+                page_height=page_height,
+            )
+            x1, y1, ew, eh = [int(value) for value in expanded_box]
+            x2 = min(page_width, x1 + ew)
+            y2 = min(page_height, y1 + eh)
+            crop = img[y1:y2, x1:x2]
+            if crop is None or crop.size == 0:
+                continue
+            if _yellow_ratio_bgr(crop) > 0.18:
+                continue
+            colour_stats = _panel_colour_contrast_stats(crop, page_counts, page_total, main_key, main_pct)
+            if float(colour_stats.get("ok", 0.0)) <= 0.0:
+                continue
+            if not _callout_panel_has_boundary(crop):
+                continue
+            qty_payload = _auto_qty_payload_for_crop(crop, 0)
+            qty_tokens = list(qty_payload.get("qty_token_boxes") or [])
+            if not qty_tokens:
+                continue
+            panels.append(
+                {
+                    "coords_xywh": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                    "detected_qty_text": qty_payload.get("detected_qty_text", []),
+                    "detected_qty_numbers": qty_payload.get("detected_qty_numbers", []),
+                    "qty_token_boxes": qty_tokens,
+                    "panel_colour_local_pct": colour_stats.get("local_pct"),
+                    "panel_colour_page_pct": colour_stats.get("page_pct"),
+                }
+            )
+
+        deduped: List[Dict[str, Any]] = []
+        for panel in sorted(panels, key=lambda item: (int(item["coords_xywh"][1]), int(item["coords_xywh"][0]), -(int(item["coords_xywh"][2]) * int(item["coords_xywh"][3])))):
+            box = panel["coords_xywh"]
+            duplicate = False
+            for existing in deduped:
+                existing_box = existing["coords_xywh"]
+                if _box_contains_box(existing_box, box, pad=10) or _box_contains_box(box, existing_box, pad=10):
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append(panel)
+        return deduped
+    except Exception:
+        return []
+
+
+def _page_level_callout_candidates_for_fallback(
+    img: Any,
+    *,
+    page_width: int,
+    page_height: int,
+    step_boxes: List[Dict[str, Any]],
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> List[Dict[str, Any]]:
+    panels = _detect_page_level_callout_panels(
+        img,
+        page_width=page_width,
+        page_height=page_height,
+        set_num=set_num,
+        page=page,
+        rebuild=rebuild,
+    )
+    if not panels:
+        return []
+    steps = _detect_page_step_number_boxes(
+        img,
+        step_boxes,
+        page_width=page_width,
+        page_height=page_height,
+        set_num=set_num,
+        page=page,
+        rebuild=False,
+    )
+    if not steps:
+        cache_entry = _page_callout_cache_entry(str(set_num), int(page), rebuild=False) if set_num is not None and page is not None else None
+        cached_panel_steps = cache_entry.get("panel_step_number_boxes") if cache_entry is not None else None
+        used_cached_panel_steps = False
+        if not rebuild and isinstance(cached_panel_steps, list):
+            steps = [dict(item) for item in cached_panel_steps if isinstance(item, dict)]
+            used_cached_panel_steps = True
+        panel_ocr_tokens: List[Dict[str, Any]] = []
+        if not used_cached_panel_steps:
+            for panel in panels:
+                panel_box = _coerce_box_list(panel.get("coords_xywh"))
+                if panel_box is None:
+                    continue
+                detected_rows = _detect_step_number_below_panel(
+                    img,
+                    panel_box,
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+                for row in detected_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if isinstance(row.get("_ocr_tokens"), list):
+                        panel_ocr_tokens.extend([dict(item) for item in row.get("_ocr_tokens", []) if isinstance(item, dict)])
+                        continue
+                    steps.append(row)
+            if cache_entry is not None:
+                cache_entry["panel_step_number_boxes"] = [dict(item) for item in steps]
+                existing_tokens = list(cache_entry.get("ocr_tokens") or [])
+                cache_entry["ocr_tokens"] = existing_tokens + panel_ocr_tokens
+    if not steps:
+        return []
+
+    assigned: Dict[int, Dict[str, Any]] = {}
+    for panel in panels:
+        px, py, pw, ph = [int(value) for value in panel.get("coords_xywh", [])]
+        panel_bottom = py + ph
+        best_step: Optional[Dict[str, Any]] = None
+        best_score: Optional[float] = None
+        for step in steps:
+            sx = int(step.get("x", 0) or 0)
+            sy = int(step.get("y", 0) or 0)
+            sw = int(step.get("w", 0) or 0)
+            sh = int(step.get("h", 0) or 0)
+            step_left = sx
+            step_mid_y = sy + sh // 2
+            if step_mid_y < panel_bottom - 4:
+                continue
+            if step_left > px + max(85, int(pw * 0.20)):
+                continue
+            horizontal_gap = abs(step_left - px)
+            if horizontal_gap > max(180, int(pw * 0.55)):
+                continue
+            vertical_gap = max(0, step_mid_y - panel_bottom)
+            score = float(vertical_gap) + float(horizontal_gap) * 0.45
+            if best_score is None or score < best_score:
+                best_score = score
+                best_step = step
+        if best_step is None or best_score is None:
+            continue
+        step_number = int(best_step.get("step_number", 0) or 0)
+        if step_number <= 0:
+            continue
+        refined_box = _refine_page_level_panel_with_step_geometry(
+            img,
+            [px, py, pw, ph],
+            step_y=int(best_step.get("y", 0) or 0),
+            page_width=page_width,
+            page_height=page_height,
+        )
+        if refined_box is not None:
+            px, py, pw, ph = [int(value) for value in refined_box]
+        current = assigned.get(step_number)
+        if current is not None and float(current.get("_assignment_score", 999999.0)) <= best_score:
+            continue
+        crop_img = img[py : py + ph, px : px + pw]
+        if crop_img is None or crop_img.size == 0:
+            continue
+        try:
+            data_uri = _encode_debug_image_data_uri(crop_img, max_width=420)
+        except Exception:
+            continue
+        qty_payload = _qty_payload_for_page_level_callout_crop(crop_img, step_number)
+        candidate = {
+            "candidate_origin": "callout_box_candidate",
+            "source": "page_level_callout_assignment",
+            "match_enabled": True,
+            "data_uri": data_uri,
+            "coords_xywh": [px, py, pw, ph],
+            "coords_label": "page-level assigned callout",
+            "edge_rect": [px, py, pw, ph],
+            "confidence": 0.44,
+            "step_number": step_number,
+            "qty_source": qty_payload.get("qty_source") or "page_level_callout_assignment",
+            "detected_qty_text": qty_payload.get("detected_qty_text", []),
+            "detected_qty_numbers": qty_payload.get("detected_qty_numbers", []),
+            "qty_token_boxes": qty_payload.get("qty_token_boxes"),
+            "qty_ocr_source_regions": qty_payload.get("qty_ocr_source_regions", []),
+            "qty_ocr_ordered_qty_list": qty_payload.get("qty_ocr_ordered_qty_list", []),
+            "_assignment_score": float(best_score),
+        }
+        assigned[step_number] = candidate
+
+    cleaned: List[Dict[str, Any]] = []
+    for candidate in sorted(assigned.values(), key=lambda item: (int(item.get("step_number", 0) or 0), int(item.get("coords_xywh", [0, 0])[1]), int(item.get("coords_xywh", [0, 0])[0]))):
+        item = dict(candidate)
+        item.pop("_assignment_score", None)
+        cleaned.append(item)
+    return cleaned
+
+
 def _estimate_visible_part_count_from_crop(crop_img: Any) -> int:
     """Estimate visible part count from contrast against callout background.
 
@@ -793,6 +1537,121 @@ def _dedupe_qty_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         deduped.append(normalized_token)
     return deduped
+
+
+def _dedupe_qty_tokens_high_overlap_only(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    for token in sorted(
+        list(tokens or []),
+        key=lambda item: (
+            int(item.get("cy", 0) or 0),
+            int(item.get("x", 0) or 0),
+            int(item.get("w", 0) or 0) * int(item.get("h", 0) or 0),
+        ),
+    ):
+        normalized = _normalize_qty_token_text(token.get("text"))
+        if not normalized:
+            continue
+        normalized_token = {
+            "text": normalized,
+            "x": int(token.get("x", 0) or 0),
+            "y": int(token.get("y", 0) or 0),
+            "w": int(token.get("w", 0) or 0),
+            "h": int(token.get("h", 0) or 0),
+            "cx": int(token.get("cx", 0) or 0),
+            "cy": int(token.get("cy", 0) or 0),
+        }
+        if any(
+            _normalize_qty_token_text(existing.get("text")) == normalized
+            and _token_overlap_ratio(existing, normalized_token) >= 0.75
+            for existing in deduped
+        ):
+            continue
+        deduped.append(normalized_token)
+    return deduped
+
+
+def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int) -> Dict[str, Any]:
+    payload = _auto_qty_payload_for_crop(crop_img, step_number)
+    debug_regions: List[Dict[str, Any]] = []
+    if crop_img is None or getattr(crop_img, "size", 0) == 0:
+        payload["qty_ocr_source_regions"] = debug_regions
+        payload["qty_ocr_ordered_qty_list"] = list(payload.get("detected_qty_text", []) or [])
+        return payload
+
+    height, width = crop_img.shape[:2]
+    region_specs = [
+        ("final_crop_full", 0, 0, width, height),
+        ("final_crop_up_right", 0, 0, width, min(height, max(1, int(height * 0.72)))),
+        ("final_crop_lower_expanded_up_right", 0, max(0, int(height * 0.38)), width, height),
+        ("final_crop_right_expanded", max(0, int(width * 0.22)), 0, width, height),
+    ]
+
+    tokens: List[Dict[str, Any]] = []
+    for name, x1, y1, x2, y2 in region_specs:
+        if x2 <= x1 or y2 <= y1:
+            continue
+        region_img = crop_img[y1:y2, x1:x2]
+        if region_img is None or region_img.size == 0:
+            continue
+        debug_regions.append({"name": name, "x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1)})
+        for token in _extract_qty_tokens_from_image(region_img) or []:
+            normalized = _normalize_qty_token_text(token.get("text"))
+            if not normalized:
+                continue
+            tx = int(token.get("x", 0) or 0) + int(x1)
+            ty = int(token.get("y", 0) or 0) + int(y1)
+            tw = int(token.get("w", 0) or 0)
+            th = int(token.get("h", 0) or 0)
+            tokens.append(
+                {
+                    "text": normalized,
+                    "x": tx,
+                    "y": ty,
+                    "w": tw,
+                    "h": th,
+                    "cx": tx + (tw // 2),
+                    "cy": ty + (th // 2),
+                    "source_region": name,
+                }
+            )
+
+    ordered_tokens = sorted(
+        _dedupe_qty_tokens_high_overlap_only(tokens),
+        key=lambda item: (int(item.get("cy", 0) or 0), int(item.get("x", 0) or 0)),
+    )
+    if ordered_tokens:
+        detected_qty_text: List[str] = []
+        detected_qty_numbers: List[int] = []
+        for token in ordered_tokens:
+            text = str(token.get("text") or "")
+            number_match = re.search(r"(\d{1,2})", text)
+            qty_val = int(number_match.group(1)) if number_match else None
+            detected_qty_text.append(text)
+            if qty_val is not None:
+                detected_qty_numbers.append(qty_val)
+        payload["detected_qty_text"] = detected_qty_text
+        payload["detected_qty_numbers"] = detected_qty_numbers
+        payload["qty_token_boxes"] = [
+            token
+            for token in ordered_tokens
+        ]
+
+    payload["qty_source"] = "page_level_callout_assignment"
+    payload["qty_ocr_source_regions"] = debug_regions
+    payload["qty_ocr_ordered_qty_list"] = list(payload.get("detected_qty_text", []) or [])
+    print(
+        "[qty-ocr] source=page_level_callout_assignment",
+        "step=",
+        int(step_number or 0),
+        "regions=",
+        debug_regions,
+        "tokens=",
+        payload.get("qty_token_boxes") or [],
+        "ordered=",
+        payload.get("qty_ocr_ordered_qty_list") or [],
+    )
+    return payload
 
 
 def _extract_detected_qty_details_from_crop(crop_img) -> Dict[str, Any]:
@@ -1995,8 +2854,14 @@ def _build_instruction_callout_crops(
     bag: int,
     ai_enabled: bool = False,
     step_filter: Optional[int] = None,
+    page_filter: Optional[int] = None,
+    rebuild: bool = False,
 ) -> List[Dict[str, Any]]:
     rendered_pages, start_page, end_page = _resolve_bag_page_range(str(set_num), int(bag))
+    if page_filter is not None:
+        rendered_pages = [int(page_filter)]
+        start_page = min(int(start_page), int(page_filter))
+        end_page = max(int(end_page), int(page_filter))
     crops: List[Dict[str, Any]] = []
 
     def _recover_right_half_missing_steps(
@@ -2127,54 +2992,30 @@ def _build_instruction_callout_crops(
         if edge_callout_candidates:
             callout_candidates = edge_callout_candidates
         else:
-            crop_candidates = _build_material_crop_candidates(
+            callout_candidates = _page_level_callout_candidates_for_fallback(
                 img,
                 page_width=page_width,
                 page_height=page_height,
                 step_boxes=step_boxes,
-                include_minifig=False,
+                set_num=str(set_num),
+                page=int(page),
+                rebuild=bool(rebuild),
             )
-
-            callout_candidates = [
-                item
-                for item in crop_candidates
-                if str(item.get("candidate_origin", "")) == "callout_box_candidate"
-                and bool(item.get("match_enabled"))
-            ]
-            repaired_candidates: List[Dict[str, Any]] = []
-            for candidate in callout_candidates:
-                repaired = _repair_callout_box_candidate_crop(
+            if not callout_candidates:
+                crop_candidates = _build_material_crop_candidates(
                     img,
-                    candidate,
                     page_width=page_width,
                     page_height=page_height,
+                    step_boxes=step_boxes,
+                    include_minifig=False,
                 )
-                if repaired is None:
-                    repaired_candidates.append(candidate)
-                    continue
-                crop_box = _coerce_box_list(repaired.get("coords_xywh"))
-                if crop_box is None:
-                    repaired_candidates.append(candidate)
-                    continue
-                rx, ry, rw, rh = [int(value) for value in crop_box]
-                crop_img = img[ry : ry + rh, rx : rx + rw]
-                if crop_img is None or crop_img.size == 0:
-                    repaired_candidates.append(candidate)
-                    continue
-                try:
-                    repaired["data_uri"] = _encode_debug_image_data_uri(crop_img, max_width=420)
-                except Exception:
-                    repaired_candidates.append(candidate)
-                    continue
-                repaired_qty_payload = _auto_qty_payload_for_crop(
-                    crop_img,
-                    int(repaired.get("step_number", candidate.get("step_number", 0)) or 0),
-                )
-                repaired["detected_qty_text"] = repaired_qty_payload.get("detected_qty_text", [])
-                repaired["detected_qty_numbers"] = repaired_qty_payload.get("detected_qty_numbers", [])
-                repaired["qty_token_boxes"] = repaired_qty_payload.get("qty_token_boxes")
-                repaired_candidates.append(repaired)
-            callout_candidates = repaired_candidates
+
+                callout_candidates = [
+                    item
+                    for item in crop_candidates
+                    if str(item.get("candidate_origin", "")) == "callout_box_candidate"
+                    and bool(item.get("match_enabled"))
+                ]
 
         for idx, candidate in enumerate(callout_candidates, start=1):
             step_number = int(candidate.get("step_number", 0) or 0)
@@ -2183,7 +3024,9 @@ def _build_instruction_callout_crops(
             qty_payload: Dict[str, Any] = {
                 "detected_qty_text": list(candidate.get("detected_qty_text", []) or []),
                 "detected_qty_numbers": list(candidate.get("detected_qty_numbers", []) or []),
-                "qty_source": "local",
+                "qty_source": str(candidate.get("qty_source") or "local"),
+                "qty_ocr_source_regions": list(candidate.get("qty_ocr_source_regions", []) or []),
+                "qty_ocr_ordered_qty_list": list(candidate.get("qty_ocr_ordered_qty_list", []) or []),
                 "ai_part_count": None,
                 "ai_issues": [],
                 "ai_crop_box": None,
@@ -2216,7 +3059,7 @@ def _build_instruction_callout_crops(
                 if str(value).strip()
             ]
             # Final safety: do not allow OCR to turn the step number into a qty.
-            if step_number and str(qty_payload.get("qty_source") or "local") != "openai":
+            if step_number and str(qty_payload.get("qty_source") or "local") not in {"openai", "page_level_callout_assignment"}:
                 clean_pairs = [
                     (text, number)
                     for text, number in zip(detected_qty_text, detected_qty_numbers)
@@ -2259,6 +3102,8 @@ def _build_instruction_callout_crops(
                     "crop_image_path": str(image_path),
                     "confidence": _coerce_float(candidate.get("confidence")),
                     "qty_token_boxes": qty_payload.get("qty_token_boxes") or candidate.get("qty_token_boxes"),
+                    "qty_ocr_source_regions": qty_payload.get("qty_ocr_source_regions") or candidate.get("qty_ocr_source_regions"),
+                    "qty_ocr_ordered_qty_list": qty_payload.get("qty_ocr_ordered_qty_list") or candidate.get("qty_ocr_ordered_qty_list"),
                     "edge_rect": candidate.get("edge_rect"),
                 }
             )
@@ -3645,6 +4490,8 @@ def instruction_buildability(
     bag: Optional[int] = Query(None, ge=1),
     ai: Optional[int] = Query(0),
     step: Optional[int] = Query(None),
+    page: Optional[int] = Query(None, ge=1),
+    rebuild: Optional[int] = Query(0),
     v: Optional[str] = Query(None),
 ):
     bag_number = int(bag or 1)
@@ -3675,6 +4522,8 @@ def instruction_buildability(
         bag_number,
         ai_enabled=int(ai or 0) == 1,
         step_filter=step,
+        page_filter=page,
+        rebuild=int(rebuild or 0) == 1,
     )
     manual_pages = _build_manual_crop_pages(str(set_num), bag_number)
     parts_by_key = {
