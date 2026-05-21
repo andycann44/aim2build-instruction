@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from clean.routers.debug import (
     _build_material_crop_candidates,
@@ -45,7 +45,7 @@ from clean.routers.debug import (
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.azure_openai_service import rank_crop_candidates
-from clean.services.ai_snap_crop_service import create_shape_mask_for_slot_crop
+from clean.services.ai_snap_crop_service import create_shape_mask_for_slot_crop, create_shape_masks_for_callout_slots
 from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
@@ -2059,7 +2059,17 @@ def _crop_qty_slot_state(crop_record: Dict[str, Any], qty_values: Any, qty_text_
         }
 
     assigned_counts: Dict[str, int] = {}
+    filled_by_slot_index = {
+        int(slot_index)
+        for slot_index in (
+            _coerce_int(part.get("selected_slot_index"))
+            for part in parts
+        )
+        if slot_index is not None and int(slot_index) >= 0
+    }
     for part in parts:
+        if _coerce_int(part.get("selected_slot_index")) is not None:
+            continue
         signature = _qty_slot_signature(part.get("qty"), part.get("qty_text"))
         if not signature:
             continue
@@ -2070,6 +2080,9 @@ def _crop_qty_slot_state(crop_record: Dict[str, Any], qty_values: Any, qty_text_
     next_slot: Optional[Dict[str, Any]] = None
     next_qty_index = len(sequence)
     for slot_index, slot in enumerate(sequence):
+        if int(slot_index) in filled_by_slot_index:
+            filled_slots += 1
+            continue
         signature = _qty_slot_signature(slot.get("qty"), slot.get("qty_text"))
         if signature and assigned_counts.get(signature, 0) > consumed_counts.get(signature, 0):
             consumed_counts[signature] = consumed_counts.get(signature, 0) + 1
@@ -2211,6 +2224,7 @@ def _normalize_part_entry(data: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "qty": qty,
         "qty_text": qty_text,
+        "selected_slot_index": _coerce_int(data.get("selected_slot_index")),
         "part_bbox": _coerce_box_list(data.get("part_bbox")),
         "confidence": _coerce_float(data.get("confidence")),
     }
@@ -2283,6 +2297,263 @@ def _prepare_instruction_parts_for_display(parts: List[Dict[str, Any]]) -> List[
 
 def _candidate_part_key(part_num: Any, color_id: Any) -> str:
     return f"{str(part_num or '').strip()}::{int(color_id or 0)}"
+
+
+def _debug_bag_specific_part_rows(set_num: str, bag: int) -> List[Dict[str, Any]]:
+    db_path = Path("/Users/olly/aim2build-instruction/bag_inspector.db")
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT part_num, color_id, qty_total
+            FROM set_bag_parts
+            WHERE set_num = ? AND bag_number = ?
+            ORDER BY part_num, color_id
+            """,
+            (str(set_num or "").strip(), int(bag or 1)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        part_num = str(row["part_num"] or "").strip()
+        color_id = _coerce_int(row["color_id"])
+        if not part_num or color_id is None:
+            continue
+        out.append(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "qty": int(row["qty_total"] or 0),
+            }
+        )
+    return out
+
+
+def _slot_mask_candidate_pool(set_num: str, bag: int) -> Tuple[List[Dict[str, Any]], str]:
+    parts_payload = load_instruction_set_parts(str(set_num))
+    set_parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
+    set_by_key = {
+        _candidate_part_key(part.get("part_num"), part.get("color_id")): dict(part or {})
+        for part in set_parts
+    }
+    bag_rows = _debug_bag_specific_part_rows(str(set_num), int(bag or 1))
+    source = "bag_specific" if bag_rows else "set_fallback"
+    seed_rows = bag_rows if bag_rows else set_parts
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in seed_rows:
+        part_num = str(row.get("part_num") or "").strip()
+        color_id = _coerce_int(row.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        key = _candidate_part_key(part_num, color_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        meta = dict(set_by_key.get(key, {}) or {})
+        candidate = dict(meta)
+        candidate.update(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "qty": int(row.get("qty", meta.get("qty", 0)) or 0),
+            }
+        )
+        if not str(candidate.get("img_url") or "").strip():
+            candidate["img_url"] = str(meta.get("img_url") or "").strip()
+        if not str(candidate.get("color_name") or "").strip():
+            candidate["color_name"] = str(meta.get("color_name") or "n/a")
+        if not str(candidate.get("element_id") or "").strip():
+            candidate["element_id"] = str(meta.get("element_id") or "")
+        candidates.append(candidate)
+    return candidates, source
+
+
+def _slot_mask_resolve_local_image_path(img_url: Any) -> Optional[Path]:
+    text = str(img_url or "").strip()
+    if not text:
+        return None
+    if text.startswith(("http://", "https://")):
+        return None
+    if text.startswith("file://"):
+        text = text[7:]
+    path = Path(text).expanduser()
+    if path.exists():
+        return path
+    repo_path = Path("/Users/olly/aim2build-instruction") / text
+    if repo_path.exists():
+        return repo_path
+    return None
+
+
+def _slot_mask_read_rgba(path_value: Any) -> Optional[np.ndarray]:
+    path = Path(str(path_value or "").strip()).expanduser()
+    if not path.exists() or not path.is_file():
+        return None
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    if img.ndim == 2:
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        alpha = np.full(img.shape, 255, dtype=np.uint8)
+        return np.dstack([bgr, alpha])
+    if img.shape[2] == 3:
+        alpha = np.full(img.shape[:2], 255, dtype=np.uint8)
+        return np.dstack([img, alpha])
+    return img[:, :, :4]
+
+
+def _slot_mask_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    x0 = int(xs.min())
+    y0 = int(ys.min())
+    x1 = int(xs.max()) + 1
+    y1 = int(ys.max()) + 1
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def _slot_mask_normalized(mask: np.ndarray, size: int = 64) -> np.ndarray:
+    bbox = _slot_mask_bbox(mask)
+    canvas = np.zeros((size, size), dtype=np.uint8)
+    if bbox is None:
+        return canvas
+    x, y, w, h = bbox
+    crop = (mask[y : y + h, x : x + w] > 0).astype(np.uint8) * 255
+    scale = min(size / max(1, w), size / max(1, h))
+    nw = max(1, min(size, int(round(w * scale))))
+    nh = max(1, min(size, int(round(h * scale))))
+    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
+    ox = (size - nw) // 2
+    oy = (size - nh) // 2
+    canvas[oy : oy + nh, ox : ox + nw] = resized
+    return canvas
+
+
+def _slot_mask_profile_from_rgba(rgba: np.ndarray, mask_override: Optional[np.ndarray] = None) -> Optional[Dict[str, Any]]:
+    bgr = rgba[:, :, :3]
+    alpha = rgba[:, :, 3]
+    if mask_override is not None:
+        mask = (mask_override > 20).astype(np.uint8) * 255
+    else:
+        mask = (alpha > 20).astype(np.uint8) * 255
+        if int(np.count_nonzero(mask)) >= int(mask.size * 0.96):
+            border = np.concatenate(
+                [
+                    bgr[:2, :, :].reshape(-1, 3),
+                    bgr[-2:, :, :].reshape(-1, 3),
+                    bgr[:, :2, :].reshape(-1, 3),
+                    bgr[:, -2:, :].reshape(-1, 3),
+                ],
+                axis=0,
+            )
+            bg = np.median(border, axis=0)
+            delta = np.linalg.norm(bgr.astype(np.float32) - bg.reshape(1, 1, 3), axis=2)
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            sat = hsv[:, :, 1]
+            val = hsv[:, :, 2]
+            mask = ((delta > 22) & (val < 248) & ~((sat < 18) & (val > 235))).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    bbox = _slot_mask_bbox(mask)
+    if bbox is None:
+        return None
+    pixels = bgr[mask > 0]
+    if pixels.size == 0:
+        return None
+    median_bgr = np.median(pixels.reshape(-1, 3), axis=0).astype(np.float32)
+    x, y, w, h = bbox
+    aspect = float(w) / float(max(1, h))
+    return {
+        "bgr": median_bgr,
+        "aspect": aspect,
+        "mask": _slot_mask_normalized(mask),
+        "area_ratio": float(np.count_nonzero(mask)) / float(max(1, mask.size)),
+    }
+
+
+def _slot_mask_query_profile(part_cutout_path: Any, shape_mask_path: Any) -> Optional[Dict[str, Any]]:
+    cutout = _slot_mask_read_rgba(part_cutout_path)
+    if cutout is None:
+        return None
+    mask_override: Optional[np.ndarray] = None
+    mask_path = Path(str(shape_mask_path or "").strip()).expanduser()
+    if mask_path.exists() and mask_path.is_file():
+        mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask_img is not None and getattr(mask_img, "size", 0) != 0:
+            if mask_img.shape[:2] != cutout.shape[:2]:
+                mask_img = cv2.resize(mask_img, (cutout.shape[1], cutout.shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask_override = mask_img
+    return _slot_mask_profile_from_rgba(cutout, mask_override=mask_override)
+
+
+def _slot_mask_candidate_profile(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    image_path = _slot_mask_resolve_local_image_path(part.get("img_url"))
+    if image_path is None:
+        return None
+    rgba = _slot_mask_read_rgba(image_path)
+    if rgba is None:
+        return None
+    return _slot_mask_profile_from_rgba(rgba)
+
+
+def _slot_mask_hex_to_bgr(value: Any) -> Optional[np.ndarray]:
+    rgb_hex = _normalize_rgb_hex(value)
+    if not rgb_hex:
+        return None
+    return np.array(
+        [
+            int(rgb_hex[4:6], 16),
+            int(rgb_hex[2:4], 16),
+            int(rgb_hex[0:2], 16),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _slot_mask_score_candidate(
+    query: Dict[str, Any],
+    candidate: Dict[str, Any],
+    color_bgr_by_id: Dict[int, np.ndarray],
+) -> Dict[str, float]:
+    candidate_profile = _slot_mask_candidate_profile(candidate)
+    if candidate_profile is not None:
+        candidate_bgr = candidate_profile["bgr"]
+        aspect_score = 1.0 - min(
+            1.0,
+            abs(float(query["aspect"]) - float(candidate_profile["aspect"]))
+            / max(float(query["aspect"]), float(candidate_profile["aspect"]), 0.01),
+        )
+        query_mask = (query["mask"] > 20).astype(np.uint8)
+        candidate_mask = (candidate_profile["mask"] > 20).astype(np.uint8)
+        intersection = int(np.count_nonzero(query_mask & candidate_mask))
+        union = int(np.count_nonzero(query_mask | candidate_mask))
+        silhouette_score = float(intersection) / float(union) if union else 0.0
+    else:
+        candidate_bgr = color_bgr_by_id.get(int(candidate.get("color_id", 0) or 0))
+        aspect_score = 0.0
+        silhouette_score = 0.0
+    if candidate_bgr is None:
+        colour_score = 0.0
+    else:
+        distance = float(np.linalg.norm(np.asarray(query["bgr"], dtype=np.float32) - candidate_bgr))
+        colour_score = max(0.0, 1.0 - distance / 441.7)
+    confidence = (0.50 * colour_score) + (0.25 * aspect_score) + (0.25 * silhouette_score)
+    return {
+        "colour": round(float(colour_score), 4),
+        "aspect": round(float(aspect_score), 4),
+        "silhouette": round(float(silhouette_score), 4),
+        "confidence": round(float(confidence), 4),
+        "candidate_image_available": 1.0 if candidate_profile is not None else 0.0,
+    }
 
 
 def _ai_snap_crop_from_saved_record(crop_id: str, saved_crop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3441,21 +3712,48 @@ async def save_label(req: Request):
         adjustments=data.get("adjustments"),
         notes=data.get("notes"),
     )
-    already_present = any(
-        _same_part_entry(existing_part, part_entry) for existing_part in crop_record["parts"]
+    selected_slot_index = _coerce_int(data.get("selected_slot_index"))
+    sequence = _build_qty_sequence(
+        data.get("crop_qty", data.get("qty", [])),
+        data.get("crop_qty_text", data.get("qty_text", [])),
     )
-    if not already_present:
-        assigned_qty = _pick_qty_assignment(
-            crop_record,
-            data.get("crop_qty", data.get("qty", [])),
-            data.get("crop_qty_text", data.get("qty_text", [])),
-            allow_extra_part=allow_extra_part,
+    has_explicit_slot = selected_slot_index is not None and 0 <= int(selected_slot_index) < len(sequence)
+    if has_explicit_slot:
+        slot = dict(sequence[int(selected_slot_index)] or {})
+        part_entry["qty"] = slot.get("qty")
+        part_entry["qty_text"] = slot.get("qty_text")
+        part_entry["selected_slot_index"] = int(selected_slot_index)
+        replaced = False
+        for index, existing_part in enumerate(list(crop_record["parts"] or [])):
+            if _coerce_int((existing_part or {}).get("selected_slot_index")) == int(selected_slot_index):
+                crop_record["parts"][index] = part_entry
+                replaced = True
+                break
+        if (
+            not replaced
+            and int(selected_slot_index) < len(crop_record["parts"] or [])
+            and _coerce_int((crop_record["parts"][int(selected_slot_index)] or {}).get("selected_slot_index")) is None
+        ):
+            crop_record["parts"][int(selected_slot_index)] = part_entry
+            replaced = True
+        if not replaced:
+            crop_record["parts"].append(part_entry)
+    else:
+        already_present = any(
+            _same_part_entry(existing_part, part_entry) for existing_part in crop_record["parts"]
         )
-        if assigned_qty.get("slots_full"):
-            raise HTTPException(status_code=400, detail="All qty slots filled")
-        part_entry["qty"] = assigned_qty.get("qty")
-        part_entry["qty_text"] = assigned_qty.get("qty_text")
-        crop_record["parts"].append(part_entry)
+        if not already_present:
+            assigned_qty = _pick_qty_assignment(
+                crop_record,
+                data.get("crop_qty", data.get("qty", [])),
+                data.get("crop_qty_text", data.get("qty_text", [])),
+                allow_extra_part=allow_extra_part,
+            )
+            if assigned_qty.get("slots_full"):
+                raise HTTPException(status_code=400, detail="All qty slots filled")
+            part_entry["qty"] = assigned_qty.get("qty")
+            part_entry["qty_text"] = assigned_qty.get("qty_text")
+            crop_record["parts"].append(part_entry)
     _refresh_crop_next_qty_index(crop_record)
     crop_record["annotated_at"] = _iso_now()
     _write_labels(path, existing)
@@ -3610,6 +3908,8 @@ async def ai_rank_slot(req: Request):
     ai_snap_input_path = ""
     shape_mask_path = ""
     part_cutout_path = ""
+    mask_slot_index: Optional[int] = None
+    cutout_slot_index: Optional[int] = None
     normalized_path = ""
     component_path = ""
     selected_box: Optional[Dict[str, Any]] = None
@@ -3639,8 +3939,16 @@ async def ai_rank_slot(req: Request):
                 normalization_fallback_reason = "selected_qty_box_unavailable"
             ai_snap_input_path = rank_input_path
             if ai_snap_input_path:
+                shape_input_path = ai_snap_input_path
+                shape_qty_box: Optional[Dict[str, Any]] = None
+                if 0 <= int(slot_index) < len(qty_token_boxes):
+                    shape_qty_box = dict(qty_token_boxes[int(slot_index)])
+                if temp_crop_path is not None and shape_qty_box is not None:
+                    shape_normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), shape_qty_box)
+                    if bool(shape_normalized_result.get("ok")) and str(shape_normalized_result.get("normalized_path") or "").strip():
+                        shape_input_path = str(shape_normalized_result.get("normalized_path") or "").strip()
                 shape_result = create_shape_mask_for_slot_crop(
-                    ai_snap_input_path,
+                    shape_input_path,
                     set_num=set_num,
                     bag=int(bag),
                     crop_id=crop_id,
@@ -3649,6 +3957,8 @@ async def ai_rank_slot(req: Request):
                 if bool(shape_result.get("ok")):
                     shape_mask_path = str(shape_result.get("shape_mask_path") or "")
                     part_cutout_path = str(shape_result.get("part_cutout_path") or "")
+                    mask_slot_index = _coerce_int(shape_result.get("mask_slot_index"))
+                    cutout_slot_index = _coerce_int(shape_result.get("cutout_slot_index"))
             if not normalized_path and not normalization_fallback_reason:
                 normalization_fallback_reason = "normalized_path_unavailable"
             print(
@@ -3757,10 +4067,13 @@ async def ai_rank_slot(req: Request):
             "crop_step": int(crop.get("step", 0) or 0),
             "slot_qty": slot_qty,
             "slot_qty_text": slot_qty_text,
+            "selected_slot_index": int(slot_index),
             "sequence_length": len(sequence),
             "ai_snap_input_path": ai_snap_input_path,
             "shape_mask_path": shape_mask_path,
             "part_cutout_path": part_cutout_path,
+            "mask_slot_index": mask_slot_index,
+            "cutout_slot_index": cutout_slot_index,
             "normalized_path": normalized_path,
             "component_path": component_path,
             "selected_qty_box": selected_qty_box,
@@ -3784,6 +4097,151 @@ async def ai_rank_slot(req: Request):
             "model": model_name,
             "labels_path": str(labels_path),
         },
+    }
+
+
+@router.get("/debug/ai-snap-artifact")
+def ai_snap_artifact(path: str = Query(...)):
+    requested = Path(str(path or "").strip()).expanduser()
+    allowed_root = (Path("/Users/olly/aim2build-instruction") / "debug" / "ai_training").resolve()
+    try:
+        resolved = requested.resolve()
+    except Exception:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if allowed_root not in resolved.parents or not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return FileResponse(str(resolved))
+
+
+@router.post("/debug/auto-mask-slots")
+async def auto_mask_slots(req: Request):
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag"))
+    crop_id = str(data.get("crop_id") or "").strip()
+    if bag is None or bag < 1:
+        bag = 1
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+
+    crop = _load_crop_for_ai_snap(set_num, int(bag), crop_id)
+    if not crop:
+        raise HTTPException(status_code=404, detail="crop not found")
+    qty_token_boxes = [
+        dict(item)
+        for item in list(crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    temp_crop_path: Optional[Path] = None
+    try:
+        temp_crop_path = _write_ai_snap_temp_crop_image(crop)
+        if temp_crop_path is None:
+            raise HTTPException(status_code=400, detail="crop image unavailable")
+        result = create_shape_masks_for_callout_slots(
+            str(temp_crop_path),
+            qty_token_boxes,
+            set_num=set_num,
+            bag=int(bag),
+            crop_id=crop_id,
+        )
+    finally:
+        if temp_crop_path is not None:
+            try:
+                temp_crop_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return {
+        "ok": bool(result.get("ok")),
+        "crop_id": crop_id,
+        "slots": list(result.get("slots") or []),
+        "slot_count": int(result.get("slot_count") or 0),
+        "full_crop_mask_path": str(result.get("full_crop_mask_path") or ""),
+        "full_crop_mask_overlay_path": str(result.get("full_crop_mask_overlay_path") or ""),
+        "full_crop_mask_error": str(result.get("full_crop_mask_error") or ""),
+        "generated_at": str(result.get("generated_at") or ""),
+        "error": str(result.get("error") or ""),
+    }
+
+
+@router.post("/debug/slot-mask-candidates")
+async def slot_mask_candidates(req: Request):
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag"))
+    crop_id = str(data.get("crop_id") or "").strip()
+    slot_index = _coerce_int(data.get("slot_index"))
+    part_cutout_path = str(data.get("part_cutout_path") or "").strip()
+    shape_mask_path = str(data.get("shape_mask_path") or "").strip()
+    if bag is None or bag < 1:
+        bag = 1
+    if slot_index is None or slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+    if not part_cutout_path:
+        raise HTTPException(status_code=400, detail="part_cutout_path is required")
+
+    query_profile = _slot_mask_query_profile(part_cutout_path, shape_mask_path)
+    if query_profile is None:
+        raise HTTPException(status_code=400, detail="slot mask/cutout unavailable")
+
+    candidate_rows, pool_source = _slot_mask_candidate_pool(set_num, int(bag))
+    color_ids = [int(part.get("color_id", 0) or 0) for part in candidate_rows]
+    color_bgr_by_id = {
+        int(item["color_id"]): _slot_mask_hex_to_bgr(item.get("rgb"))
+        for item in _load_catalog_colors_for_ids(color_ids)
+    }
+    color_bgr_by_id = {
+        color_id: bgr
+        for color_id, bgr in color_bgr_by_id.items()
+        if bgr is not None
+    }
+
+    ranked: List[Dict[str, Any]] = []
+    for candidate in candidate_rows:
+        part_num = str(candidate.get("part_num") or "").strip()
+        color_id = _coerce_int(candidate.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        scores = _slot_mask_score_candidate(query_profile, candidate, color_bgr_by_id)
+        ranked.append(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "color_name": str(candidate.get("color_name") or "n/a"),
+                "element_id": str(candidate.get("element_id") or ""),
+                "image_url": str(candidate.get("img_url") or "").strip(),
+                "image_path": str(_slot_mask_resolve_local_image_path(candidate.get("img_url")) or ""),
+                "confidence": scores["confidence"],
+                "score_breakdown": {
+                    "colour": scores["colour"],
+                    "aspect": scores["aspect"],
+                    "silhouette": scores["silhouette"],
+                    "candidate_image_available": bool(scores["candidate_image_available"]),
+                },
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("confidence", 0.0) or 0.0),
+            float((item.get("score_breakdown") or {}).get("colour", 0.0) or 0.0),
+            str(item.get("part_num") or ""),
+        ),
+        reverse=True,
+    )
+    top = ranked[:5]
+    print(
+        "[slot-mask-candidates] "
+        f"set={set_num} bag={int(bag)} crop_id={crop_id} slot_index={int(slot_index)} "
+        f"pool={pool_source} candidates={len(candidate_rows)} returned={len(top)}"
+    )
+    return {
+        "ok": True,
+        "set_num": set_num,
+        "bag": int(bag),
+        "crop_id": crop_id,
+        "slot_index": int(slot_index),
+        "candidate_pool_source": pool_source,
+        "candidate_count": len(candidate_rows),
+        "ranked_candidates": top,
     }
 
 
@@ -5343,6 +5801,39 @@ def instruction_buildability(
           color: #9b5b09;
           font-weight: 800;
         }}
+        .ai-snap-debug {{
+          margin-top: 8px;
+          display: flex;
+          gap: 10px;
+          align-items: flex-start;
+          flex-wrap: wrap;
+        }}
+        .ai-snap-debug-figure {{
+          margin: 0;
+          font-size: 11px;
+          color: #627283;
+        }}
+        .ai-snap-debug-figure img {{
+          display: block;
+          width: 82px;
+          max-height: 82px;
+          object-fit: contain;
+          border: 1px solid #d6dee8;
+          border-radius: 8px;
+          background-color: #fff;
+          background-image:
+            linear-gradient(45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(-45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #edf1f5 75%),
+            linear-gradient(-45deg, transparent 75%, #edf1f5 75%);
+          background-size: 14px 14px;
+          background-position: 0 0, 0 7px, 7px -7px, -7px 0;
+        }}
+        .ai-snap-debug-figure figcaption {{
+          margin-top: 4px;
+          max-width: 82px;
+          word-break: break-word;
+        }}
         .suggested-part-actions {{
           margin-top: 10px;
           display: flex;
@@ -5401,6 +5892,77 @@ def instruction_buildability(
           background: #eef6ef;
           border-color: #7db28a;
           color: #2f6c41;
+        }}
+        .picker-slot-mask {{
+          margin-top: 4px;
+          display: flex;
+          justify-content: center;
+        }}
+        .picker-slot-mask img {{
+          width: 54px;
+          height: 54px;
+          object-fit: contain;
+          border: 1px solid #d6dee8;
+          border-radius: 8px;
+          background-color: #fff;
+          background-image:
+            linear-gradient(45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(-45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #edf1f5 75%),
+            linear-gradient(-45deg, transparent 75%, #edf1f5 75%);
+          background-size: 12px 12px;
+          background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+        }}
+        .picker-slot-review {{
+          margin-top: 4px;
+          color: #8a5a00;
+          font-size: 11px;
+        }}
+        .picker-slot-candidates {{
+          display: grid;
+          grid-template-columns: repeat(5, minmax(34px, 1fr));
+          gap: 4px;
+          margin-top: 6px;
+          width: 100%;
+        }}
+        .picker-slot-candidate {{
+          appearance: none;
+          border: 0;
+          background: transparent;
+          padding: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 2px;
+          min-width: 0;
+          color: #536576;
+          font-size: 9px;
+          font-weight: 700;
+          line-height: 1.1;
+        }}
+        .picker-slot-candidate img {{
+          width: 30px;
+          height: 30px;
+          object-fit: contain;
+          border: 1px solid #d6dee8;
+          border-radius: 6px;
+          background: #fff;
+        }}
+        .picker-slot-candidate span {{
+          max-width: 42px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }}
+        .picker-slot-debug {{
+          margin-top: 6px;
+          color: #6c7c8d;
+          font-size: 9px;
+          font-weight: 600;
+          line-height: 1.2;
+          text-align: left;
+          word-break: break-word;
+          max-width: 150px;
         }}
         .picker-slot-name {{
           font-size: 12px;
@@ -5908,6 +6470,7 @@ def instruction_buildability(
                     </div>
                     <div class="picker-slot-toolbar">
                       <button type="button" class="remove-btn" id="ai-snap-btn" onclick="runAiSnap()">AI Snap</button>
+                      <button type="button" class="remove-btn" id="auto-mask-slots-btn" onclick="runAutoMaskSlots()">Auto Mask Slots</button>
                       <div id="ai-snap-status" class="save-note"></div>
                     </div>
                   </div>
@@ -6000,6 +6563,7 @@ def instruction_buildability(
           partRecords.map(item => [partKey(item.part_num, item.color_id), item])
         );
         const buildabilityVariant = {buildability_variant_json};
+        const SHOW_SLOT_MATCHES = false;
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
@@ -6410,7 +6974,13 @@ def instruction_buildability(
           }}
 
           const assignedCounts = new Map();
+          const filledBySlotIndex = new Set();
           parts.forEach((part) => {{
+            const explicitSlotIndex = Number(part && part.selected_slot_index);
+            if (Number.isInteger(explicitSlotIndex) && explicitSlotIndex >= 0) {{
+              filledBySlotIndex.add(explicitSlotIndex);
+              return;
+            }}
             const signature = qtySlotSignature(part.qty, part.qty_text);
             if (!signature) {{
               return;
@@ -6421,7 +6991,12 @@ def instruction_buildability(
           const consumedCounts = new Map();
           let filledSlots = 0;
           let nextSlot = null;
-          for (const slot of sequence) {{
+          for (let currentIndex = 0; currentIndex < sequence.length; currentIndex += 1) {{
+            const slot = sequence[currentIndex];
+            if (filledBySlotIndex.has(currentIndex)) {{
+              filledSlots += 1;
+              continue;
+            }}
             const signature = qtySlotSignature(slot.qty, slot.qty_text);
             const assignedCount = Number(assignedCounts.get(signature) || 0);
             const consumedCount = Number(consumedCounts.get(signature) || 0);
@@ -6449,6 +7024,15 @@ def instruction_buildability(
           if (!crop || slotState.noQtyDetected || slotState.totalSlots <= 0 || slotState.slotsFull) {{
             return null;
           }}
+          const explicitSlotIndex = Number(crop.ai_snap_selected_slot_index);
+          if (
+            Number.isInteger(explicitSlotIndex)
+            && explicitSlotIndex >= 0
+            && explicitSlotIndex < slotState.totalSlots
+            && explicitSlotIndex >= slotState.filledSlots
+          ) {{
+            return explicitSlotIndex;
+          }}
           return Math.max(0, Math.min(slotState.filledSlots, slotState.totalSlots - 1));
         }}
 
@@ -6465,8 +7049,165 @@ def instruction_buildability(
             : null;
         }}
 
+        function aiSnapArtifactUrl(pathValue, cacheKey = "") {{
+          const path = String(pathValue || "").trim();
+          if (!path) {{
+            return "";
+          }}
+          const version = String(cacheKey || path).trim();
+          return "/debug/ai-snap-artifact?path=" + encodeURIComponent(path)
+            + "&v=" + encodeURIComponent(version || String(Date.now()));
+        }}
+
+        function pathBasename(pathValue) {{
+          const parts = String(pathValue || "").split(/[\\\\/]/).filter(Boolean);
+          return parts.length ? parts[parts.length - 1] : "";
+        }}
+
+        function formatDebugBox(box) {{
+          if (Array.isArray(box)) {{
+            return box.map((value) => Number(value) || 0).join(",");
+          }}
+          if (box && typeof box === "object") {{
+            return [
+              Number(box.x) || 0,
+              Number(box.y) || 0,
+              Number(box.w) || 0,
+              Number(box.h) || 0
+            ].join(",");
+          }}
+          return "";
+        }}
+
+        function renderSlotMaskDebug(maskSlot) {{
+          if (!maskSlot) {{
+            return "";
+          }}
+          const generatedAt = String(maskSlot.generated_at || "");
+          const cutoutBase = String(maskSlot.cutout_basename || pathBasename(maskSlot.part_cutout_path));
+          const sourceBase = String(maskSlot.source_mask_basename || pathBasename(maskSlot.source_mask_path));
+          const cropBase = String(maskSlot.source_crop_basename || pathBasename(maskSlot.source_crop_path));
+          const overlayBase = String(maskSlot.slot_window_overlay_basename || pathBasename(maskSlot.slot_window_overlay_path));
+          return '<span class="picker-slot-debug">'
+            + 'slot_index: ' + escapeHtml(String(maskSlot.slot_index ?? "")) + '<br/>'
+            + 'path: ' + escapeHtml(String(maskSlot.function_path_used || "")) + '<br/>'
+            + 'source crop: ' + escapeHtml(cropBase) + '<br/>'
+            + 'master mask: ' + escapeHtml(String(maskSlot.master_mask_basename || sourceBase)) + '<br/>'
+            + 'qty_box: ' + escapeHtml(formatDebugBox(maskSlot.qty_box || maskSlot.qty_token_box)) + '<br/>'
+            + 'slot_window: ' + escapeHtml(formatDebugBox(maskSlot.slot_window || maskSlot.slot_crop_box)) + '<br/>'
+            + 'cutout: ' + escapeHtml(cutoutBase) + '<br/>'
+            + 'cutout size: ' + escapeHtml(formatDebugBox(maskSlot.actual_saved_cutout_size)) + '<br/>'
+            + 'alpha bbox: ' + escapeHtml(formatDebugBox(maskSlot.non_transparent_bbox)) + '<br/>'
+            + 'alpha pixels: ' + escapeHtml(String(maskSlot.alpha_pixel_count ?? "")) + '<br/>'
+            + 'generated_at: ' + escapeHtml(generatedAt) + '<br/>'
+            + 'using_master_mask: ' + escapeHtml(String(Boolean(maskSlot.using_master_mask))) + '<br/>'
+            + 'overwritten: ' + escapeHtml(String(Boolean(maskSlot.existing_file_overwritten))) + '<br/>'
+            + 'reused: ' + escapeHtml(String(Boolean(maskSlot.existing_file_reused))) + '<br/>'
+            + 'candidate before save: ' + escapeHtml(String(Boolean(maskSlot.candidate_matching_started_before_cutout_save))) + '<br/>'
+            + 'candidate after save: ' + escapeHtml(String(maskSlot.candidate_matching_started_after_cutout_save ?? "")) + '<br/>'
+            + 'slot overlay: ' + escapeHtml(overlayBase)
+            + '</span>';
+        }}
+
+        function renderSlotMaskCandidates(maskSlot) {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return "";
+          }}
+          const candidates = Array.isArray(maskSlot && maskSlot.ranked_candidates)
+            ? maskSlot.ranked_candidates
+            : [];
+          if (!candidates.length) {{
+            if (maskSlot && maskSlot.candidates_loading) {{
+              return '<span class="picker-slot-review">matching...</span>';
+            }}
+            if (maskSlot && maskSlot.candidates_error) {{
+              return '<span class="picker-slot-review">' + escapeHtml(String(maskSlot.candidates_error)) + '</span>';
+            }}
+            return "";
+          }}
+          return '<span class="picker-slot-candidates">' + candidates.slice(0, 5).map((candidate) => {{
+            const imageUrl = String(candidate && (candidate.image_url || candidate.img_url || "") || "");
+            const confidence = Number(candidate && candidate.confidence);
+            const label = String(candidate && candidate.part_num || "") + ":" + String(candidate && candidate.color_id || "");
+            return '<span role="button" tabindex="0" class="picker-slot-candidate" data-slot-suggestion="true" data-slot-index="' + escapeHtml(String(maskSlot.slot_index ?? "")) + '" data-part-num="' + escapeHtml(String(candidate && candidate.part_num || "")) + '" data-color-id="' + escapeHtml(String(candidate && candidate.color_id || 0)) + '" data-element-id="' + escapeHtml(String(candidate && candidate.element_id || "")) + '" data-color-name="' + escapeHtml(String(candidate && candidate.color_name || "")) + '" title="' + escapeHtml(label + (Number.isFinite(confidence) ? " " + confidence.toFixed(2) : "")) + '">'
+              + (imageUrl ? '<img src="' + escapeHtml(imageUrl) + '" alt="' + escapeHtml(label) + '" loading="lazy" />' : '')
+              + '<span>' + escapeHtml(label) + '</span>'
+              + '</span>';
+          }}).join("") + '</span>';
+        }}
+
+        function confirmedPartForSlot(crop, slotIndex) {{
+          const parts = Array.isArray(crop && crop.parts) ? crop.parts : [];
+          const explicit = parts.find((part) => Number(part && part.selected_slot_index) === Number(slotIndex));
+          if (explicit) {{
+            return explicit;
+          }}
+          return Number.isInteger(Number(slotIndex)) && Number(slotIndex) >= 0 && Number(slotIndex) < parts.length
+            ? parts[Number(slotIndex)]
+            : null;
+        }}
+
+        function renderFullCropMaskDebug(crop) {{
+          const cacheKey = String(crop && crop.full_crop_mask_generated_at || "");
+          const maskUrl = aiSnapArtifactUrl(crop && crop.full_crop_mask_path, cacheKey);
+          const overlayUrl = aiSnapArtifactUrl(crop && crop.full_crop_mask_overlay_path, cacheKey);
+          if (!maskUrl && !overlayUrl) {{
+            return "";
+          }}
+          return `
+            <div class="ai-snap-debug">
+              ${{maskUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(maskUrl)}}" alt="Full crop mask" loading="lazy" />
+                  <figcaption>full crop mask</figcaption>
+                </figure>
+              ` : ""}}
+              ${{overlayUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(overlayUrl)}}" alt="Full crop mask overlay" loading="lazy" />
+                  <figcaption>full crop mask overlay</figcaption>
+                </figure>
+              ` : ""}}
+            </div>
+          `;
+        }}
+
+        function renderAiSnapArtifactDebug(result) {{
+          const debug = result && result.debug ? result.debug : {{}};
+          const cacheKey = String(debug.generated_at || debug.ai_snap_input_path || "");
+          const cutoutUrl = aiSnapArtifactUrl(debug.part_cutout_path, cacheKey);
+          const maskUrl = aiSnapArtifactUrl(debug.shape_mask_path, cacheKey);
+          if (!cutoutUrl && !maskUrl) {{
+            return "";
+          }}
+          return `
+            <div class="ai-snap-debug">
+              <div class="ai-snap-debug-figure">
+                <figcaption>
+                  selected slot: ${{escapeHtml(String(debug.selected_slot_index ?? ""))}}<br/>
+                  cutout slot: ${{escapeHtml(String(debug.cutout_slot_index ?? ""))}}<br/>
+                  mask slot: ${{escapeHtml(String(debug.mask_slot_index ?? ""))}}
+                </figcaption>
+              </div>
+              ${{cutoutUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(cutoutUrl)}}" alt="AI Snap part cutout" loading="lazy" />
+                  <figcaption>part cutout</figcaption>
+                </figure>
+              ` : ""}}
+              ${{maskUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(maskUrl)}}" alt="AI Snap shape mask" loading="lazy" />
+                  <figcaption>shape mask</figcaption>
+                </figure>
+              ` : ""}}
+            </div>
+          `;
+        }}
+
         function renderAiSnapStatus(crop) {{
           const button = document.getElementById("ai-snap-btn");
+          const autoMaskButton = document.getElementById("auto-mask-slots-btn");
           const status = document.getElementById("ai-snap-status");
           if (!button || !status) {{
             return;
@@ -6475,32 +7216,47 @@ def instruction_buildability(
           const aiSnapResult = activeAiSnapResultForCrop(crop);
           if (!crop) {{
             button.disabled = true;
+            button.style.display = SHOW_SLOT_MATCHES ? "" : "none";
+            if (autoMaskButton) {{
+              autoMaskButton.disabled = true;
+            }}
             button.textContent = "AI Snap";
             status.textContent = "Select a crop to rank the current open slot.";
             return;
           }}
           if (crop.ai_snap_loading) {{
             button.disabled = true;
+            button.style.display = SHOW_SLOT_MATCHES ? "" : "none";
+            if (autoMaskButton) {{
+              autoMaskButton.disabled = true;
+            }}
             button.textContent = "AI Snap...";
             status.textContent = "Ranking remaining candidates for this slot...";
             return;
           }}
           button.textContent = "AI Snap";
+          button.style.display = SHOW_SLOT_MATCHES ? "" : "none";
           button.disabled = slotIndex === null;
+          if (autoMaskButton) {{
+            autoMaskButton.disabled = Boolean(crop.auto_mask_loading) || !Array.isArray(buildClientQtySequence(crop)) || buildClientQtySequence(crop).length === 0;
+            autoMaskButton.textContent = crop.auto_mask_loading ? "Masking..." : "Auto Mask Slots";
+          }}
           if (slotIndex === null) {{
             status.textContent = "No open slot available for AI Snap.";
             return;
           }}
           if (crop.ai_snap_error) {{
-            status.textContent = String(crop.ai_snap_error);
+            status.innerHTML = escapeHtml(String(crop.ai_snap_error)) + renderFullCropMaskDebug(crop);
             return;
           }}
-          if (aiSnapResult && Array.isArray(aiSnapResult.ranked_candidates)) {{
-            status.textContent = "AI Snap ranked " + aiSnapResult.ranked_candidates.length + " candidates for slot " + (slotIndex + 1)
-              + (aiSnapResult.model ? " using " + aiSnapResult.model : "") + ".";
+          if (SHOW_SLOT_MATCHES && aiSnapResult && Array.isArray(aiSnapResult.ranked_candidates)) {{
+            status.innerHTML = escapeHtml(
+              "AI Snap ranked " + aiSnapResult.ranked_candidates.length + " candidates for slot " + (slotIndex + 1)
+                + (aiSnapResult.model ? " using " + aiSnapResult.model : "") + "."
+            ) + renderAiSnapArtifactDebug(aiSnapResult) + renderFullCropMaskDebug(crop);
             return;
           }}
-          status.textContent = "Run AI Snap for slot " + (slotIndex + 1) + ".";
+          status.innerHTML = escapeHtml("Run AI Snap for slot " + (slotIndex + 1) + ".") + renderFullCropMaskDebug(crop);
         }}
 
         function renderBuildabilitySlots(cropId) {{
@@ -6522,17 +7278,68 @@ def instruction_buildability(
             return;
           }}
           const selectedIndex = currentBuildabilitySlotIndex(crop);
+          const autoMaskSlots = new Map();
+          (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).forEach((slot) => {{
+            autoMaskSlots.set(Number(slot && slot.slot_index), slot);
+          }});
           list.innerHTML = sequence.map((slot, idx) => `
             <button
               type="button"
-              class="picker-slot-btn${{idx < slotState.filledSlots ? " assigned" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
+              class="picker-slot-btn${{confirmedPartForSlot(crop, idx) ? " assigned" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
               data-picker-slot-index="${{idx}}"
-              title="${{idx < slotState.filledSlots ? "Filled slot" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot")}}"
+              title="${{confirmedPartForSlot(crop, idx) ? "Filled slot" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot")}}"
             >
               <span class="picker-slot-name">Slot ${{idx + 1}}</span>
               <span class="picker-slot-qty">${{escapeHtml(String((slot && (slot.qty_text || slot.qty)) || "none"))}}</span>
+              ${{confirmedPartForSlot(crop, idx) ? '<span class="picker-slot-review">confirmed: ' + escapeHtml(String(confirmedPartForSlot(crop, idx).part_num || "")) + ':' + escapeHtml(String(confirmedPartForSlot(crop, idx).color_id || "")) + '</span>' : ''}}
+              ${{(() => {{
+                const maskSlot = autoMaskSlots.get(Number(idx));
+                const cutoutUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.part_cutout_path, maskSlot.generated_at) : "";
+                const slotOverlayUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.slot_window_overlay_path, maskSlot.generated_at) : "";
+                if (cutoutUrl) {{
+                  return '<span class="picker-slot-mask"><img src="' + escapeHtml(cutoutUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' cutout" loading="lazy" /></span>'
+                    + (slotOverlayUrl ? '<span class="picker-slot-mask"><img src="' + escapeHtml(slotOverlayUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' window overlay" loading="lazy" /></span>' : '')
+                    + renderSlotMaskDebug(maskSlot)
+                    + renderSlotMaskCandidates(maskSlot);
+                }}
+                if (maskSlot && String(maskSlot.status || "") === "needs_review") {{
+                  return '<span class="picker-slot-review">needs review</span>'
+                    + (slotOverlayUrl ? '<span class="picker-slot-mask"><img src="' + escapeHtml(slotOverlayUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' window overlay" loading="lazy" /></span>' : '')
+                    + renderSlotMaskDebug(maskSlot);
+                }}
+                return "";
+              }})()}}
             </button>
           `).join("");
+          list.querySelectorAll("[data-picker-slot-index]").forEach((button) => {{
+            button.addEventListener("click", () => {{
+              const nextIndex = Number(button.dataset.pickerSlotIndex);
+              if (!Number.isInteger(nextIndex) || nextIndex < slotState.filledSlots || nextIndex >= slotState.totalSlots) {{
+                return;
+              }}
+              crop.ai_snap_selected_slot_index = nextIndex;
+              if (crop.ai_snap_result && Number(crop.ai_snap_result.slot_index) !== Number(nextIndex)) {{
+                crop.ai_snap_result = null;
+              }}
+              crop.ai_snap_error = "";
+              renderBuildabilitySlots(crop.crop_id);
+              renderSuggestedParts(crop.crop_id);
+            }});
+          }});
+          list.querySelectorAll("[data-slot-suggestion]").forEach((el) => {{
+            el.addEventListener("click", (event) => {{
+              event.stopPropagation();
+              acceptSlotSuggestion(event, el);
+            }});
+            el.addEventListener("keydown", (event) => {{
+              if (event.key !== "Enter" && event.key !== " ") {{
+                return;
+              }}
+              event.preventDefault();
+              event.stopPropagation();
+              acceptSlotSuggestion(event, el);
+            }});
+          }});
           renderAiSnapStatus(crop);
         }}
 
@@ -6550,6 +7357,7 @@ def instruction_buildability(
             img_url: part.img_url || meta.img_url || "",
             qty: part.qty ?? null,
             qty_text: part.qty_text ?? null,
+            selected_slot_index: Number.isInteger(Number(part.selected_slot_index)) ? Number(part.selected_slot_index) : null,
             part_bbox: Array.isArray(part.part_bbox) ? part.part_bbox : null,
             confidence: part.confidence ?? null,
             selected_qty_label: part.selected_qty_label || selectedQtyLabel(part.qty, part.qty_text)
@@ -7114,7 +7922,15 @@ def instruction_buildability(
 
         async function renderSuggestedParts(cropId) {{
           const panel = document.getElementById("suggested-parts-grid");
+          const suggestedPanel = document.getElementById("suggested-parts-panel");
+          if (suggestedPanel) {{
+            suggestedPanel.style.display = SHOW_SLOT_MATCHES ? "" : "none";
+          }}
           if (!panel) {{
+            return;
+          }}
+          if (!SHOW_SLOT_MATCHES) {{
+            panel.innerHTML = "";
             return;
           }}
           if (!cropId) {{
@@ -7660,6 +8476,9 @@ def instruction_buildability(
         }}
 
         async function runAiSnap() {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return;
+          }}
           const crop = activeCropId ? cropMap.get(activeCropId) : null;
           if (!crop) {{
             return;
@@ -7746,6 +8565,134 @@ def instruction_buildability(
           }} finally {{
             crop.ai_snap_loading = false;
             renderAiSnapStatus(crop);
+          }}
+        }}
+
+        async function runAutoMaskSlots() {{
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          crop.auto_mask_loading = true;
+          crop.ai_snap_error = "";
+          renderAiSnapStatus(crop);
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+          }};
+          try {{
+            const res = await fetch("/debug/auto-mask-slots", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify(payload)
+            }});
+            if (!res.ok) {{
+              let detail = "Auto mask failed";
+              try {{
+                const errorPayload = await res.json();
+                detail = errorPayload.detail || detail;
+              }} catch (_error) {{
+                detail = "Auto mask failed";
+              }}
+              crop.ai_snap_error = detail;
+              crop.auto_mask_slots = [];
+              renderBuildabilitySlots(crop.crop_id);
+              return;
+            }}
+            const result = await res.json();
+            crop.auto_mask_slots = Array.isArray(result && result.slots) ? result.slots : [];
+            crop.full_crop_mask_path = String(result && result.full_crop_mask_path || "");
+            crop.full_crop_mask_overlay_path = String(result && result.full_crop_mask_overlay_path || "");
+            crop.full_crop_mask_error = String(result && result.full_crop_mask_error || "");
+            crop.full_crop_mask_generated_at = String(result && result.generated_at || "");
+            const maskedCount = crop.auto_mask_slots.filter((slot) => String(slot && slot.status || "") === "masked").length;
+            crop.ai_snap_error = "";
+            const status = document.getElementById("ai-snap-status");
+            if (status) {{
+              status.innerHTML = escapeHtml(
+                "Auto masked " + maskedCount + " / " + crop.auto_mask_slots.length + " slots."
+                + (SHOW_SLOT_MATCHES ? " Matching candidates..." : "")
+              )
+                + renderFullCropMaskDebug(crop);
+            }}
+            renderBuildabilitySlots(crop.crop_id);
+            const maskedSlots = crop.auto_mask_slots.filter((slot) => String(slot && slot.status || "") === "masked");
+            if (SHOW_SLOT_MATCHES) {{
+              await Promise.all(maskedSlots.map((slot) => loadSlotMaskCandidates(crop, slot)));
+            }}
+            const readyCount = maskedSlots.filter((slot) => Array.isArray(slot && slot.ranked_candidates)).length;
+            if (status) {{
+              status.innerHTML = escapeHtml(
+                SHOW_SLOT_MATCHES
+                  ? ("Auto masked " + maskedCount + " / " + crop.auto_mask_slots.length + " slots; candidates ready for " + readyCount + ".")
+                  : ("Auto masked " + maskedCount + " / " + crop.auto_mask_slots.length + " slots.")
+              )
+                + renderFullCropMaskDebug(crop);
+            }}
+            renderBuildabilitySlots(crop.crop_id);
+          }} catch (_error) {{
+            crop.ai_snap_error = "Auto mask failed";
+            crop.auto_mask_slots = [];
+            renderBuildabilitySlots(crop.crop_id);
+          }} finally {{
+            crop.auto_mask_loading = false;
+            renderAiSnapStatus(crop);
+          }}
+        }}
+
+        async function loadSlotMaskCandidates(crop, maskSlot) {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return;
+          }}
+          if (!crop || !maskSlot || String(maskSlot.status || "") !== "masked") {{
+            return;
+          }}
+          if (!maskSlot.part_cutout_path || maskSlot.ranked_candidates) {{
+            return;
+          }}
+          maskSlot.candidate_matching_started_at = new Date().toISOString();
+          maskSlot.candidate_matching_started_before_cutout_save = false;
+          maskSlot.candidate_matching_started_after_cutout_save = true;
+          console.log("slot mask candidate matching started", {{
+            crop_id: crop.crop_id,
+            slot_index: Number(maskSlot.slot_index),
+            generated_at: String(maskSlot.generated_at || ""),
+            started_at: maskSlot.candidate_matching_started_at,
+            cutout_path: String(maskSlot.part_cutout_path || ""),
+            function_path_used: String(maskSlot.function_path_used || "")
+          }});
+          maskSlot.candidates_loading = true;
+          maskSlot.candidates_error = "";
+          renderBuildabilitySlots(crop.crop_id);
+          try {{
+            const res = await fetch("/debug/slot-mask-candidates", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{
+                set_num: {json.dumps(str(set_num))},
+                bag: {bag_number},
+                crop_id: crop.crop_id,
+                slot_index: Number(maskSlot.slot_index),
+                part_cutout_path: String(maskSlot.part_cutout_path || ""),
+                shape_mask_path: String(maskSlot.shape_mask_path || "")
+              }})
+            }});
+            if (!res.ok) {{
+              maskSlot.candidates_error = "match failed";
+              return;
+            }}
+            const result = await res.json();
+            maskSlot.ranked_candidates = Array.isArray(result && result.ranked_candidates)
+              ? result.ranked_candidates
+              : [];
+            maskSlot.candidate_pool_source = String(result && result.candidate_pool_source || "");
+            maskSlot.candidate_count = Number(result && result.candidate_count || 0);
+          }} catch (_error) {{
+            maskSlot.candidates_error = "match failed";
+          }} finally {{
+            maskSlot.candidates_loading = false;
+            renderBuildabilitySlots(crop.crop_id);
           }}
         }}
 
@@ -8397,6 +9344,88 @@ def instruction_buildability(
         async function addSuggestedPart(event, partNum, colorId, elementId, colorName) {{
           event.stopPropagation();
           await selectTile(partNum, colorId, elementId, colorName);
+        }}
+
+        async function acceptSlotSuggestion(event, el) {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return;
+          }}
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop || !el || !el.dataset) {{
+            return;
+          }}
+          const slotIndex = Number(el.dataset.slotIndex);
+          const sequence = buildClientQtySequence(crop);
+          const slot = Number.isInteger(slotIndex) ? sequence[slotIndex] : null;
+          if (!slot) {{
+            return;
+          }}
+          const partNum = String(el.dataset.partNum || "");
+          const colorId = Number(el.dataset.colorId || 0);
+          const elementId = String(el.dataset.elementId || "");
+          const colorName = String(el.dataset.colorName || "");
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.qty_numbers,
+            crop_qty_text: crop.qty_text,
+            crop_box: crop.crop_box,
+            crop_box_format: crop.crop_box_format,
+            crop_image_path: crop.crop_image_path,
+            crop_confidence: crop.confidence,
+            part_num: partNum,
+            color_id: colorId,
+            color_name: colorName || null,
+            element_id: elementId || null,
+            qty: slot.qty ?? null,
+            qty_text: slot.qty_text || null,
+            selected_slot_index: slotIndex,
+            adjustments: [{{ type: "auto_mask_slot_suggestion", slot_index: slotIndex }}],
+            allow_extra_part: true
+          }};
+          const res = await fetch("/debug/save-label", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload)
+          }});
+          const status = document.getElementById("save-status");
+          if (!res.ok) {{
+            let detail = "Save failed";
+            try {{
+              const errorPayload = await res.json();
+              detail = errorPayload.detail || detail;
+            }} catch (_error) {{}}
+            if (status) {{
+              status.textContent = detail;
+            }}
+            return;
+          }}
+          const result = await res.json();
+          syncCropFromResponse(crop, result.crop);
+          const maskSlot = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find((slotItem) => Number(slotItem && slotItem.slot_index) === Number(slotIndex));
+          if (maskSlot) {{
+            maskSlot.accepted_part = {{
+              part_num: partNum,
+              color_id: colorId,
+              element_id: elementId,
+              color_name: colorName,
+            }};
+          }}
+          crop.ai_snap_result = null;
+          crop.ai_snap_error = "";
+          renderAssignedParts(crop.crop_id);
+          renderBuildabilitySlots(crop.crop_id);
+          renderSuggestedParts(crop.crop_id);
+          updatePartTileAssignmentState();
+          if (status) {{
+            status.textContent = "Saved slot " + (slotIndex + 1) + " -> " + partNum + " / color " + colorId;
+          }}
         }}
 
         async function selectTile(partNum, colorId, elementId, colorName) {{
