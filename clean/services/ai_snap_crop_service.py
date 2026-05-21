@@ -17,6 +17,9 @@ _FULL_CROP_MASK_DIR = _REPO_ROOT / "debug" / "ai_training" / "full_crop_masks"
 _FULL_CROP_MASK_OVERLAY_DIR = _REPO_ROOT / "debug" / "ai_training" / "full_crop_mask_overlays"
 _SLOT_WINDOW_OVERLAY_DIR = _REPO_ROOT / "debug" / "ai_training" / "slot_window_overlays"
 _DESKTOP_MASK_OVERLAY_DIR = Path.home() / "Desktop" / "aim2build-mask-overlays"
+_SAM_REFINED_DIR = Path.home() / "aim2build-data" / "instruction-training" / "sam_refined"
+_MIN_ALPHA_PIXELS = 30
+_MIN_ALPHA_RATIO = 0.04   # 4 % of the slot ROI bounding box
 
 
 def _safe_slug(value: Any, fallback: str = "unknown") -> str:
@@ -230,6 +233,64 @@ def _write_temp_slot_crop(img: Any, box: list[int]) -> Optional[Path]:
     return path
 
 
+def _recover_grey_foreground(
+    mask: np.ndarray,
+    img: np.ndarray,
+    bg: np.ndarray,
+) -> np.ndarray:
+    """Conservative expansion pass for low-saturation grey/light parts.
+
+    Grey parts on a coloured (e.g. light-blue) background are under-detected by the
+    colour-diff threshold because their L2 distance from the background is smaller
+    than dark parts.  When the 72nd-percentile threshold is pulled up by high-contrast
+    dark parts, grey pixels can fall below it and leave large internal holes.
+
+    Strategy
+    --------
+    1. Grey-candidate pixels: HSV-saturation < 80 (rules out the coloured background)
+       AND at least a small colour diff from background (rules out pure bg).
+    2. Restrict candidates to the dilation zone of already-found blobs — never expands
+       into regions far from existing foreground.
+    3. Morphological close fills internal holes; open removes isolated specks.
+
+    The saturation guard is the primary safety: the light-blue background has
+    S ≈ 80-150 in OpenCV HSV, so ``S < 80`` excludes it reliably while admitting
+    neutral greys (S ≈ 0-40).
+    """
+    if mask is None or int(np.count_nonzero(mask)) == 0:
+        return mask
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1].astype(np.float32)  # 0-255
+    diff = np.linalg.norm(img.astype(np.float32) - bg.reshape(1, 1, 3), axis=2)
+
+    # Grey-candidate: low saturation (not background-coloured) and at least slightly
+    # different from background in colour distance.  Threshold 10 is deliberately low
+    # — the saturation guard carries the safety burden, not the diff floor.
+    grey_cand = ((s < 80) & (diff > 10)).astype(np.uint8) * 255
+
+    # Dilation zone: only accept grey candidates within this neighbourhood.
+    zone_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
+    zone = cv2.dilate(mask, zone_k, iterations=1)
+    in_zone = cv2.bitwise_and(grey_cand, zone)
+
+    expanded = cv2.bitwise_or(mask, in_zone)
+
+    # Close internal holes, then drop isolated specks smaller than the open kernel.
+    expanded = cv2.morphologyEx(expanded, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+    expanded = cv2.morphologyEx(expanded, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
+    # Re-apply border zeroing.
+    h, w = mask.shape[:2]
+    border = max(1, min(4, min(h, w) // 24))
+    expanded[:border, :] = 0
+    expanded[h - border:, :] = 0
+    expanded[:, :border] = 0
+    expanded[:, w - border:] = 0
+
+    return expanded
+
+
 def _foreground_mask_for_image(img: Any) -> tuple[Optional[np.ndarray], str]:
     h, w = img.shape[:2]
     bg = _edge_background_bgr(img)
@@ -250,6 +311,7 @@ def _foreground_mask_for_image(img: Any) -> tuple[Optional[np.ndarray], str]:
 
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    mask = _recover_grey_foreground(mask, img, bg)
     return mask, ""
 
 
@@ -259,6 +321,7 @@ def create_full_crop_mask_debug(
     set_num: Optional[str] = None,
     bag: Optional[int] = None,
     crop_id: Optional[str] = None,
+    desktop_overlays: bool = True,
 ) -> Dict[str, Any]:
     source_path = Path(str(callout_crop_path or "").strip())
     if not source_path.exists():
@@ -299,7 +362,7 @@ def create_full_crop_mask_debug(
     ok_mask = cv2.imwrite(str(mask_path), mask)
     ok_overlay = cv2.imwrite(str(overlay_path), overlay)
     desktop_overlay_path = ""
-    if ok_overlay:
+    if ok_overlay and desktop_overlays:
         try:
             _DESKTOP_MASK_OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
             page_part, step_part = _page_step_from_crop_id(crop_id)
@@ -351,6 +414,18 @@ def _alpha_stats(alpha: Any) -> Dict[str, Any]:
         "alpha_pixel_count": count,
         "non_transparent_bbox": [x1, y1, int(x2 - x1), int(y2 - y1)],
     }
+
+
+def _rgb_stats_from_bgra(bgra: np.ndarray) -> Dict[str, Any]:
+    """Return median and mean RGB (not BGR) of opaque pixels in a BGRA image."""
+    alpha = bgra[:, :, 3]
+    mask = alpha > 0
+    if not mask.any():
+        return {"slot_rgb_median": None, "slot_rgb_avg": None}
+    b, g, r = bgra[:, :, 0][mask], bgra[:, :, 1][mask], bgra[:, :, 2][mask]
+    med = [int(np.median(r)), int(np.median(g)), int(np.median(b))]
+    avg = [int(np.mean(r)),   int(np.mean(g)),   int(np.mean(b))]
+    return {"slot_rgb_median": med, "slot_rgb_avg": avg}
 
 
 def _write_slot_window_overlay(
@@ -654,6 +729,99 @@ def create_shape_mask_for_slot_crop(
     }
 
 
+def _enhance_slot_crop(
+    slot_img: np.ndarray,
+    slot_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Per-slot CLAHE + unsharp + grey-fill recovery pass.
+
+    Parameters
+    ----------
+    slot_img  : BGR image cropped to the component bounding box.
+    slot_mask : Binary (0/255) mask of the same spatial extent.
+
+    Returns
+    -------
+    enhanced_img         : BGR with CLAHE and mild unsharp applied.
+    refined_mask         : Binary mask after conservative grey-fill recovery.
+    overexpanded         : True when refined area > 135 % of original area
+                           (caller should mark the slot needs_review).
+
+    Design notes
+    ------------
+    - CLAHE and unsharp are applied only to the saved pixel data; they do not
+      affect ownership or the global mask used for slot assignment.
+    - Grey-fill recovery is restricted to a small dilation zone around existing
+      foreground and gated by HSV saturation < 80, so the coloured background
+      (S ≈ 80-150 for light-blue) cannot leak in.
+    - If the crop is too small or any step raises an exception the function
+      returns the inputs unchanged.
+    """
+    h, w = slot_img.shape[:2]
+    if h < 8 or w < 8 or slot_img.ndim != 3:
+        return slot_img, slot_mask, False
+
+    original_area = int(np.count_nonzero(slot_mask))
+
+    # ── 1. CLAHE on L* channel ────────────────────────────────────────────
+    try:
+        lab = cv2.cvtColor(slot_img, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        tile_w = max(2, min(8, w // 8))
+        tile_h = max(2, min(8, h // 8))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+        l_ch = clahe.apply(l_ch)
+        enhanced = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+    except Exception:
+        enhanced = slot_img.copy()
+
+    # ── 2. Mild unsharp mask ──────────────────────────────────────────────
+    try:
+        blur = cv2.GaussianBlur(enhanced, (3, 3), 0.8)
+        enhanced = cv2.addWeighted(enhanced, 1.35, blur, -0.35, 0)
+    except Exception:
+        pass
+
+    # ── 3. Grey-fill recovery near existing foreground ───────────────────
+    refined_mask = slot_mask.copy()
+    if original_area > 0 and h >= 12 and w >= 12:
+        try:
+            hsv = cv2.cvtColor(slot_img, cv2.COLOR_BGR2HSV)
+            s = hsv[:, :, 1].astype(np.float32)
+
+            local_bg = _edge_background_bgr(slot_img)
+            if local_bg is not None:
+                diff = np.linalg.norm(
+                    slot_img.astype(np.float32) - local_bg.reshape(1, 1, 3), axis=2
+                )
+                grey_cand = ((s < 80) & (diff > 8)).astype(np.uint8) * 255
+            else:
+                # No reliable local background — use saturation alone with a
+                # stricter threshold so we don't over-expand on ambiguous crops.
+                grey_cand = (s < 50).astype(np.uint8) * 255
+
+            # Limit expansion to a 9×9 ellipse neighbourhood of existing blobs.
+            zone_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            zone = cv2.dilate(refined_mask, zone_k, iterations=1)
+            in_zone = cv2.bitwise_and(grey_cand, zone)
+
+            refined_mask = cv2.bitwise_or(refined_mask, in_zone)
+            refined_mask = cv2.morphologyEx(
+                refined_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1
+            )
+            refined_mask = cv2.morphologyEx(
+                refined_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1
+            )
+        except Exception:
+            refined_mask = slot_mask.copy()
+
+    # ── 4. Area-growth guard ──────────────────────────────────────────────
+    refined_area = int(np.count_nonzero(refined_mask))
+    overexpanded = original_area > 0 and refined_area > int(original_area * 1.35)
+
+    return enhanced, refined_mask, overexpanded
+
+
 def _write_slot_artifacts_from_master_mask(
     slot_img: Any,
     slot_mask: Any,
@@ -715,16 +883,46 @@ def _write_slot_artifacts_from_master_mask(
     mask_existed_before = mask_path.exists()
     cutout_existed_before = cutout_path.exists()
 
-    ok_mask = cv2.imwrite(str(mask_path), cropped_mask)
-    bgra = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2BGRA)
-    alpha = cropped_mask
+    # Per-slot enhancement: CLAHE, unsharp mask, grey-fill recovery.
+    # enhanced_img replaces cropped_img for the saved RGBA; refined_mask replaces
+    # cropped_mask.  Neither feeds back into ownership or global mask assignment.
+    _original_area = int(np.count_nonzero(cropped_mask))
+    _enhanced_img, _refined_mask, _enhancement_overexpanded = _enhance_slot_crop(
+        cropped_img, cropped_mask
+    )
+    _refined_area = int(np.count_nonzero(_refined_mask))
+    _enhancement_expanded_pct = (
+        float((_refined_area - _original_area) / _original_area)
+        if _original_area > 0 else 0.0
+    )
+
+    ok_mask = cv2.imwrite(str(mask_path), _refined_mask)
+    bgra = cv2.cvtColor(_enhanced_img, cv2.COLOR_BGR2BGRA)
+    alpha = _refined_mask
     if min(alpha.shape[:2]) >= 12:
         feathered = cv2.GaussianBlur(alpha, (3, 3), 0)
         edge = cv2.morphologyEx(alpha, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8), iterations=1)
         alpha = np.where(edge > 0, feathered, alpha).astype(np.uint8)
     bgra[:, :, 3] = alpha
-    ok_cutout = cv2.imwrite(str(cutout_path), bgra)
     alpha_debug = _alpha_stats(bgra[:, :, 3])
+    rgb_stats = _rgb_stats_from_bgra(bgra)
+    _alpha_count = int(alpha_debug.get("alpha_pixel_count", 0) or 0)
+    _ah, _aw = bgra.shape[:2]
+    if _alpha_count < _MIN_ALPHA_PIXELS or _alpha_count < _ah * _aw * _MIN_ALPHA_RATIO:
+        return {
+            "ok": False,
+            "shape_mask_path": "",
+            "part_cutout_path": "",
+            "mask_slot_index": slot_index,
+            "cutout_slot_index": slot_index,
+            "error": "needs_review_low_alpha",
+            "mask_component_reason": component_reason,
+            "alpha_pixel_count": _alpha_count,
+            "enhancement_overexpanded": bool(_enhancement_overexpanded),
+            "enhancement_expanded_pct": _enhancement_expanded_pct,
+            **rgb_stats,
+        }
+    ok_cutout = cv2.imwrite(str(cutout_path), bgra)
     if not ok_mask:
         return {
             "ok": False,
@@ -738,7 +936,10 @@ def _write_slot_artifacts_from_master_mask(
             "existing_file_overwritten": bool(mask_existed_before or cutout_existed_before),
             "existing_file_reused": False,
             "actual_saved_cutout_size": [int(bgra.shape[1]), int(bgra.shape[0])] if ok_cutout else None,
+            "enhancement_overexpanded": bool(_enhancement_overexpanded),
+            "enhancement_expanded_pct": _enhancement_expanded_pct,
             **alpha_debug,
+            **rgb_stats,
         }
     return {
         "ok": True,
@@ -754,8 +955,12 @@ def _write_slot_artifacts_from_master_mask(
         "existing_file_overwritten": bool(mask_existed_before or cutout_existed_before),
         "existing_file_reused": False,
         "actual_saved_cutout_size": [int(bgra.shape[1]), int(bgra.shape[0])],
+        "enhancement_overexpanded": bool(_enhancement_overexpanded),
+        "enhancement_expanded_pct": _enhancement_expanded_pct,
         **alpha_debug,
+        **rgb_stats,
     }
+
 
 
 def _make_needs_review_slot(
@@ -811,6 +1016,7 @@ def create_shape_masks_for_callout_slots(
     set_num: Optional[str] = None,
     bag: Optional[int] = None,
     crop_id: Optional[str] = None,
+    desktop_overlays: bool = True,
 ) -> Dict[str, Any]:
     generated_at = _utc_timestamp()
     source_path = Path(str(callout_crop_path or "").strip())
@@ -825,12 +1031,26 @@ def create_shape_masks_for_callout_slots(
         set_num=set_num,
         bag=bag,
         crop_id=crop_id,
+        desktop_overlays=desktop_overlays,
     )
 
     h, w = img.shape[:2]
-    master_mask, master_mask_error = _foreground_mask_for_image(img)
     source_mask_path = str(full_mask_debug.get("full_crop_mask_path") or "")
     source_mask_basename = Path(source_mask_path).name if source_mask_path else ""
+
+    # Primary: load the binary mask written by create_full_crop_mask_debug directly.
+    # Threshold > 0 to recover the binary foreground mask.
+    # The overlay image is for human viewing only and is never used for extraction.
+    # Fallback: recompute via _foreground_mask_for_image if the mask file is missing/unreadable.
+    master_mask: Optional[np.ndarray] = None
+    master_mask_error = ""
+    _mask_file_path = str(full_mask_debug.get("full_crop_mask_path") or "")
+    if _mask_file_path and Path(_mask_file_path).exists():
+        _gray = cv2.imread(_mask_file_path, cv2.IMREAD_GRAYSCALE)
+        if _gray is not None and _gray.size > 0:
+            master_mask = (_gray > 0).astype(np.uint8) * 255
+    if master_mask is None:
+        master_mask, master_mask_error = _foreground_mask_for_image(img)
 
     # Validate and normalise token coordinates.
     tokens: list[Dict[str, Any]] = []
@@ -875,203 +1095,186 @@ def create_shape_masks_for_callout_slots(
             if tx2 > tx1 and ty2 > ty1:
                 clean_mask[ty1:ty2, tx1:tx2] = 0
 
-    row_bottoms = [
-        max(int(item.get("y", 0) or 0) + int(item.get("h", 0) or 0) for item in row)
-        for row in rows
-    ]
-
-    # Stage 2 — per-token local extraction.
-    # Each slot is extracted independently from its own column/row ROI.
-    # No global competition, no scoring across slots, no component merging.
-    slot_index = 0
-    for row_index, row in enumerate(rows):
-        previous_qty_bottom = row_bottoms[row_index - 1] if row_index > 0 else None
-        row_top_bound = 0 if previous_qty_bottom is None else max(0, int(previous_qty_bottom) + 4)
-
+    # Precompute column x-bounds per token (midpoint between adjacent centres,
+    # or image edge).  Stored by object id to avoid mutating the token dicts.
+    _col_bounds: Dict[int, tuple[int, int]] = {}
+    for row in rows:
         for col_index, token in enumerate(row):
-            prev_token = row[col_index - 1] if col_index > 0 else None
-            next_token = row[col_index + 1] if col_index + 1 < len(row) else None
-            cx = int(token.get("cx", 0) or 0)
-            token_y = int(token.get("y", 0) or 0)
+            _prev = row[col_index - 1] if col_index > 0 else None
+            _next = row[col_index + 1] if col_index + 1 < len(row) else None
+            _tcx = int(token.get("cx", 0) or 0)
+            _xl = 0 if _prev is None else int((int(_prev.get("cx", 0) or 0) + _tcx) / 2)
+            _xr = w if _next is None else int((_tcx + int(_next.get("cx", 0) or 0)) / 2)
+            _col_bounds[id(token)] = (max(0, _xl - 10), min(w, _xr + 10))
 
-            # Column x-bounds: midpoints between adjacent qty centres (or image edge).
-            x_left = 0 if prev_token is None else int((int(prev_token.get("cx", 0) or 0) + cx) / 2)
-            x_right = w if next_token is None else int((cx + int(next_token.get("cx", 0) or 0)) / 2)
-            x_left = max(0, x_left - 10)
-            x_right = min(w, x_right + 10)
-
-            # Row y-bottom: just above the qty token text.
-            y_bottom = max(0, token_y - 1)
-            slot_box = [
-                int(x_left),
-                int(row_top_bound),
-                int(max(0, x_right - x_left)),
-                int(max(0, y_bottom - row_top_bound)),
-            ]
-
-            if clean_mask is None or x_right <= x_left:
-                slots.append(_make_needs_review_slot(
-                    slot_index, source_path, source_mask_path, source_mask_basename,
-                    slot_box, token, generated_at, master_mask_error or "no_clean_mask",
-                ))
-                slot_index += 1
+    # Stage 2 — global component extraction.
+    # Run connectedComponentsWithStats on the full clean_mask once, then assign
+    # each component to the best-matching qty token using column x-bounds and the
+    # constraint that the component centroid must be above the qty label.
+    # This eliminates the row_top_bound hard clip that sliced vertically stacked parts.
+    slot_index = 0
+    global_comps: list[Dict[str, Any]] = []
+    _gl: Optional[np.ndarray] = None  # labels array, shared across all token iterations
+    if clean_mask is not None:
+        _min_comp_area = max(16.0, float(h * w) * 0.0008)
+        _glc, _gl, _gls, _glcentroids = cv2.connectedComponentsWithStats(
+            (clean_mask > 0).astype(np.uint8), 8
+        )
+        for _lab in range(1, _glc):
+            _garea = int(_gls[_lab, cv2.CC_STAT_AREA])
+            _glx = int(_gls[_lab, cv2.CC_STAT_LEFT])
+            _gly = int(_gls[_lab, cv2.CC_STAT_TOP])
+            _glw = int(_gls[_lab, cv2.CC_STAT_WIDTH])
+            _glh = int(_gls[_lab, cv2.CC_STAT_HEIGHT])
+            if _glw <= 2 or _glh <= 2 or _garea < _min_comp_area:
                 continue
+            global_comps.append({
+                "lab": _lab,
+                "area": _garea,
+                "lx": _glx, "ly": _gly, "lw": _glw, "lh": _glh,
+                "gcx": float(_glcentroids[_lab][0]),
+                "gcy": float(_glcentroids[_lab][1]),
+                "used": False,
+            })
 
-            def _pick_local_component(
-                y_top: int,
-                _cm: np.ndarray = clean_mask,  # type: ignore[assignment]
-                _xl: int = x_left,
-                _xr: int = x_right,
-                _ty: int = token_y,
-                _cx: int = cx,
-            ) -> Optional[tuple]:
-                """Return (extraction_box, component_mask, area) from clean_mask ROI, or None."""
-                y_bot = max(0, _ty - 1)
-                if y_bot <= y_top or _xr <= _xl:
-                    return None
-                roi = _cm[y_top:y_bot, _xl:_xr]
-                if roi.size == 0 or int(np.count_nonzero(roi)) == 0:
-                    return None
-                min_area = max(16.0, float(roi.shape[0] * roi.shape[1]) * 0.003)
-                lc, ll, ls, lcentroids = cv2.connectedComponentsWithStats(
-                    (roi > 0).astype(np.uint8), 8
-                )
-                if lc <= 1:
-                    return None
-                # Thin bottom band used to discard text-fragment slivers.
-                bottom_band = max(4, int(roi.shape[0] * 0.06))
-                candidates: list[Dict[str, Any]] = []
-                for lab in range(1, lc):
-                    area = int(ls[lab, cv2.CC_STAT_AREA])
-                    if area < min_area:
-                        continue
-                    lx_ = int(ls[lab, cv2.CC_STAT_LEFT])
-                    ly_ = int(ls[lab, cv2.CC_STAT_TOP])
-                    lw_ = int(ls[lab, cv2.CC_STAT_WIDTH])
-                    lh_ = int(ls[lab, cv2.CC_STAT_HEIGHT])
-                    if lw_ <= 2 or lh_ <= 2:
-                        continue
-                    # Skip tiny slivers at the very bottom of the ROI.
-                    if ly_ + lh_ >= roi.shape[0] - bottom_band and lh_ <= bottom_band:
-                        continue
-                    comp_cx = float(lcentroids[lab][0])
-                    hdist = abs(comp_cx - float(_cx - _xl))
-                    candidates.append({
-                        "lab": int(lab),
-                        "area": int(area),
-                        "lx": lx_,
-                        "ly": ly_,
-                        "lw": lw_,
-                        "lh": lh_,
-                        "hdist": float(hdist),
-                    })
-                if not candidates:
-                    return None
-                # Largest component wins; tiebreak by horizontal proximity to qty centre.
-                best = max(candidates, key=lambda c: (c["area"], -c["hdist"]))
-                comp_mask_roi = np.zeros(roi.shape[:2], dtype=np.uint8)
-                comp_mask_roi[ll == best["lab"]] = 255
-                abs_x = _xl + best["lx"]
-                abs_y = y_top + best["ly"]
-                component_mask = comp_mask_roi[
-                    best["ly"]: best["ly"] + best["lh"],
-                    best["lx"]: best["lx"] + best["lw"],
-                ].copy()
-                extraction_box = [int(abs_x), int(abs_y), int(best["lw"]), int(best["lh"])]
-                return extraction_box, component_mask, best["area"]
+    for token in ordered_tokens:
+        token_y = int(token.get("y", 0) or 0)
+        cx_tok = int(token.get("cx", 0) or 0)
+        x_left, x_right = _col_bounds.get(id(token), (0, w))
+        slot_box = [int(x_left), 0, int(max(0, x_right - x_left)), int(token_y)]
 
-            # Primary: ROI from row_top_bound to just above qty label.
-            result_tuple = _pick_local_component(row_top_bound)
-            extraction_reason = "local_roi_largest_component"
+        if clean_mask is None or _gl is None or x_right <= x_left:
+            slots.append(_make_needs_review_slot(
+                slot_index, source_path, source_mask_path, source_mask_basename,
+                slot_box, token, generated_at, master_mask_error or "no_clean_mask",
+            ))
+            slot_index += 1
+            continue
 
-            # Fallback: expand y_top to 0 to catch parts that bleed above the row boundary.
-            if result_tuple is None and row_top_bound > 0:
-                result_tuple = _pick_local_component(0)
-                if result_tuple is not None:
-                    extraction_reason = "local_roi_expanded_to_top"
-
-            if result_tuple is None:
-                slots.append(_make_needs_review_slot(
-                    slot_index, source_path, source_mask_path, source_mask_basename,
-                    slot_box, token, generated_at, "needs_review_no_local_component",
-                ))
-                print(
-                    "[auto-mask-slot] "
-                    f"crop_id={crop_id} slot_index={slot_index} "
-                    f"function_path=needs_review_no_local_component "
-                    f"source_crop={source_path} slot_window={slot_box} "
-                    f"component_box=None generated_at={generated_at}"
-                )
-                slot_index += 1
+        # Score every unused global component against this token.
+        # Hard constraints: centroid above qty label; centroid within column band.
+        # Rank: largest area first; tiebreak by horizontal closeness to token centre.
+        candidates = []
+        for comp in global_comps:
+            if comp["used"]:
                 continue
+            if comp["gcy"] >= token_y:
+                continue
+            if not (x_left <= comp["gcx"] < x_right):
+                continue
+            hdist = abs(comp["gcx"] - float(cx_tok))
+            candidates.append((comp, hdist))
 
-            extraction_box, component_mask, component_area = result_tuple
-            ex, ey, ew, eh = [int(v) for v in extraction_box]
-            slot_img = img[ey: ey + eh, ex: ex + ew]
-
-            artifact_result = _write_slot_artifacts_from_master_mask(
-                slot_img,
-                component_mask,
-                source_path,
-                set_num=set_num,
-                bag=bag,
-                crop_id=crop_id,
-                slot_index=slot_index,
-                component_count=1,
-                component_reason=extraction_reason,
-            )
-
-            slots.append(
-                {
-                    "slot_index": int(slot_index),
-                    "status": "masked" if bool(artifact_result.get("ok")) else "needs_review",
-                    "shape_mask_path": str(artifact_result.get("shape_mask_path") or ""),
-                    "part_cutout_path": str(artifact_result.get("part_cutout_path") or ""),
-                    "reason": str(artifact_result.get("error") or ""),
-                    "function_path_used": extraction_reason,
-                    "source_crop_path": str(source_path),
-                    "source_crop_basename": _path_basename(source_path),
-                    "master_mask_path": source_mask_path,
-                    "master_mask_basename": source_mask_basename,
-                    "slot_crop_box": slot_box,
-                    "slot_window": slot_box,
-                    "component_box": extraction_box,
-                    "component_area": int(component_area),
-                    "component_assignment_score": None,
-                    "slot_window_overlay_path": "",
-                    "slot_window_overlay_basename": "",
-                    "qty_box": dict(token),
-                    "qty_token_box": dict(token),
-                    "mask_component_reason": str(artifact_result.get("mask_component_reason") or ""),
-                    "cutout_basename": Path(str(artifact_result.get("part_cutout_path") or "")).name,
-                    "generated_at": generated_at,
-                    "using_master_mask": True,
-                    "source_mask_path": source_mask_path,
-                    "source_mask_basename": source_mask_basename,
-                    "actual_saved_cutout_size": artifact_result.get("actual_saved_cutout_size"),
-                    "non_transparent_bbox": artifact_result.get("non_transparent_bbox"),
-                    "alpha_pixel_count": int(artifact_result.get("alpha_pixel_count", 0) or 0),
-                    "existing_file_overwritten": bool(artifact_result.get("existing_file_overwritten")),
-                    "existing_file_reused": bool(artifact_result.get("existing_file_reused")),
-                    "candidate_matching_started_before_cutout_save": False,
-                    "candidate_matching_started_after_cutout_save": None,
-                }
-            )
+        if not candidates:
+            slots.append(_make_needs_review_slot(
+                slot_index, source_path, source_mask_path, source_mask_basename,
+                slot_box, token, generated_at, "needs_review_no_component",
+            ))
             print(
                 "[auto-mask-slot] "
-                f"crop_id={crop_id} slot_index={slot_index} function_path={extraction_reason} "
+                f"crop_id={crop_id} slot_index={slot_index} "
+                f"function_path=needs_review_no_component "
                 f"source_crop={source_path} slot_window={slot_box} "
-                f"component_box={extraction_box} component_area={component_area} "
-                f"cutout={artifact_result.get('part_cutout_path') or ''} "
-                f"size={artifact_result.get('actual_saved_cutout_size')} "
-                f"alpha_pixels={int(artifact_result.get('alpha_pixel_count', 0) or 0)} "
-                f"alpha_bbox={artifact_result.get('non_transparent_bbox')} "
-                f"generated_at={generated_at} "
-                f"overwritten={bool(artifact_result.get('existing_file_overwritten'))} "
-                f"reused={bool(artifact_result.get('existing_file_reused'))} "
-                f"candidate_before_save=false overlay="
+                f"component_box=None generated_at={generated_at}"
             )
             slot_index += 1
+            continue
+
+        best_comp = max(candidates, key=lambda item: (item[0]["area"], -item[1]))[0]
+        best_comp["used"] = True
+        extraction_reason = "global_mask_component"
+
+        ex = best_comp["lx"]
+        ey_val = best_comp["ly"]
+        ew = best_comp["lw"]
+        eh = best_comp["lh"]
+        extraction_box = [ex, ey_val, ew, eh]
+        slot_img = img[ey_val: ey_val + eh, ex: ex + ew]
+        component_mask = (_gl[ey_val: ey_val + eh, ex: ex + ew] == best_comp["lab"]).astype(np.uint8) * 255
+
+        artifact_result = _write_slot_artifacts_from_master_mask(
+            slot_img,
+            component_mask,
+            source_path,
+            set_num=set_num,
+            bag=bag,
+            crop_id=crop_id,
+            slot_index=slot_index,
+            component_count=1,
+            component_reason=extraction_reason,
+        )
+
+        _artifact_error = str(artifact_result.get("error") or "")
+        _enhancement_overexpanded = bool(artifact_result.get("enhancement_overexpanded"))
+        _slot_status = (
+            "needs_review_low_alpha" if _artifact_error == "needs_review_low_alpha"
+            else "needs_review" if _enhancement_overexpanded
+            else "masked" if bool(artifact_result.get("ok"))
+            else "needs_review"
+        )
+        _alpha_px = int(artifact_result.get("alpha_pixel_count") or 0)
+        _expanded_pct = float(artifact_result.get("enhancement_expanded_pct") or 0.0)
+        _slot_confidence = (
+            "low" if _slot_status != "masked" or _alpha_px < 150
+            else "medium" if _expanded_pct > 0.10
+            else "high"
+        )
+        slots.append(
+            {
+                "slot_index": int(slot_index),
+                "status": _slot_status,
+                "shape_mask_path": str(artifact_result.get("shape_mask_path") or ""),
+                "part_cutout_path": str(artifact_result.get("part_cutout_path") or ""),
+                "reason": _artifact_error,
+                "function_path_used": extraction_reason,
+                "source_crop_path": str(source_path),
+                "source_crop_basename": _path_basename(source_path),
+                "master_mask_path": source_mask_path,
+                "master_mask_basename": source_mask_basename,
+                "slot_crop_box": slot_box,
+                "slot_window": slot_box,
+                "component_box": extraction_box,
+                "component_area": int(best_comp["area"]),
+                "component_assignment_score": None,
+                "slot_window_overlay_path": "",
+                "slot_window_overlay_basename": "",
+                "qty_box": dict(token),
+                "qty_token_box": dict(token),
+                "mask_component_reason": str(artifact_result.get("mask_component_reason") or ""),
+                "cutout_basename": Path(str(artifact_result.get("part_cutout_path") or "")).name,
+                "generated_at": generated_at,
+                "using_master_mask": True,
+                "source_mask_path": source_mask_path,
+                "source_mask_basename": source_mask_basename,
+                "actual_saved_cutout_size": artifact_result.get("actual_saved_cutout_size"),
+                "non_transparent_bbox": artifact_result.get("non_transparent_bbox"),
+                "alpha_pixel_count": int(artifact_result.get("alpha_pixel_count", 0) or 0),
+                "existing_file_overwritten": bool(artifact_result.get("existing_file_overwritten")),
+                "existing_file_reused": bool(artifact_result.get("existing_file_reused")),
+                "candidate_matching_started_before_cutout_save": False,
+                "candidate_matching_started_after_cutout_save": None,
+                "slot_rgb_median": artifact_result.get("slot_rgb_median"),
+                "slot_rgb_avg": artifact_result.get("slot_rgb_avg"),
+                "enhancement_overexpanded": _enhancement_overexpanded,
+                "enhancement_expanded_pct": _expanded_pct,
+                "slot_confidence": _slot_confidence,
+            }
+        )
+        print(
+            "[auto-mask-slot] "
+            f"crop_id={crop_id} slot_index={slot_index} function_path={extraction_reason} "
+            f"source_crop={source_path} slot_window={slot_box} "
+            f"component_box={extraction_box} component_area={best_comp['area']} "
+            f"cutout={artifact_result.get('part_cutout_path') or ''} "
+            f"size={artifact_result.get('actual_saved_cutout_size')} "
+            f"alpha_pixels={int(artifact_result.get('alpha_pixel_count', 0) or 0)} "
+            f"alpha_bbox={artifact_result.get('non_transparent_bbox')} "
+            f"generated_at={generated_at} "
+            f"overwritten={bool(artifact_result.get('existing_file_overwritten'))} "
+            f"reused={bool(artifact_result.get('existing_file_reused'))} "
+            f"candidate_before_save=false overlay="
+        )
+        slot_index += 1
 
     return {
         "ok": True,
@@ -1084,3 +1287,174 @@ def create_shape_masks_for_callout_slots(
         "generated_at": generated_at,
         "error": "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Optional SAM refinement — upgrades alpha-mask edges when SAM is installed.
+# The core extraction pipeline is not affected; this is a purely additive step.
+# ---------------------------------------------------------------------------
+
+def refine_slot_cutout_with_sam(
+    part_cutout_path: str,
+    *,
+    set_num: Optional[str] = None,
+    bag: Optional[int] = None,
+    crop_id: Optional[str] = None,
+    slot_index: int = 0,
+) -> Dict[str, Any]:
+    """Refine the alpha mask of an existing RGBA slot cutout using SAM/SAM2.
+
+    Returns a dict with keys:
+        ok               – bool
+        sam_refined_path – str  (absolute path to refined PNG, or "")
+        sam_refine_status – "ok" | "unavailable" | "failed[: reason]"
+
+    The original cutout is never modified.  If SAM is not installed, or its
+    model weights are absent, returns status="unavailable" immediately.
+    """
+    _FAIL = lambda status: {"ok": False, "sam_refined_path": "", "sam_refine_status": status}
+
+    cutout_path = Path(str(part_cutout_path or "").strip())
+    if not cutout_path.exists():
+        return _FAIL("failed_no_cutout")
+
+    # ------------------------------------------------------------------
+    # 1. Try to import SAM (segment_anything preferred; fall back to sam2)
+    # ------------------------------------------------------------------
+    _sam_version: int = 0
+    _sam_module: Any = None
+    try:
+        import segment_anything as _sam_module  # type: ignore[import]
+        _sam_version = 1
+    except ImportError:
+        pass
+
+    if _sam_version == 0:
+        try:
+            import sam2 as _sam_module  # type: ignore[import]  # noqa: F401
+            _sam_version = 2
+        except ImportError:
+            pass
+
+    if _sam_version == 0:
+        return _FAIL("unavailable")
+
+    # ------------------------------------------------------------------
+    # 2. Locate a model checkpoint in the standard data directory
+    # ------------------------------------------------------------------
+    model_dir = Path.home() / "aim2build-data" / "instruction-training" / "models"
+    checkpoint: Optional[Path] = None
+
+    if _sam_version == 1:
+        for name in (
+            "sam_vit_b_01ec64.pth",
+            "sam_vit_l_0b3195.pth",
+            "sam_vit_h_4b8939.pth",
+        ):
+            cand = model_dir / name
+            if cand.exists():
+                checkpoint = cand
+                break
+    else:  # SAM2
+        for name in (
+            "sam2_hiera_base_plus.pt",
+            "sam2_hiera_large.pt",
+            "sam2_hiera_small.pt",
+            "sam2_hiera_tiny.pt",
+        ):
+            cand = model_dir / name
+            if cand.exists():
+                checkpoint = cand
+                break
+
+    if checkpoint is None:
+        return _FAIL("unavailable")
+
+    # ------------------------------------------------------------------
+    # 3. Load the existing RGBA cutout and derive the SAM box prompt
+    # ------------------------------------------------------------------
+    try:
+        rgba = cv2.imread(str(cutout_path), cv2.IMREAD_UNCHANGED)
+        if rgba is None or rgba.ndim < 3 or rgba.shape[2] != 4:
+            return _FAIL("failed_read_cutout")
+
+        alpha_ch = rgba[:, :, 3]
+        ys, xs = np.where(alpha_ch > 10)
+        if ys.size == 0:
+            return _FAIL("failed_empty_alpha")
+
+        x1, y1 = int(xs.min()), int(ys.min())
+        x2, y2 = int(xs.max()), int(ys.max())
+        box_xyxy = np.array([x1, y1, x2, y2], dtype=float)
+
+        # SAM expects an RGB image (H, W, 3) in uint8
+        rgb_img = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_BGR2RGB)
+
+        # ------------------------------------------------------------------
+        # 4. Run SAM prediction
+        # ------------------------------------------------------------------
+        refined_mask: Optional[np.ndarray] = None
+
+        if _sam_version == 1:
+            from segment_anything import sam_model_registry, SamPredictor  # type: ignore[import]
+
+            if "vit_b" in checkpoint.name:
+                model_type = "vit_b"
+            elif "vit_l" in checkpoint.name:
+                model_type = "vit_l"
+            else:
+                model_type = "vit_h"
+
+            sam_model = sam_model_registry[model_type](checkpoint=str(checkpoint))
+            sam_model.eval()
+            predictor = SamPredictor(sam_model)
+            predictor.set_image(rgb_img)
+            masks, _, _ = predictor.predict(
+                box=box_xyxy,
+                multimask_output=False,
+            )
+            refined_mask = np.asarray(masks[0], dtype=bool)
+
+        else:  # SAM2
+            import torch  # type: ignore[import]
+            from sam2.build_sam import build_sam2  # type: ignore[import]
+            from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore[import]
+
+            _cfg_map = {
+                "sam2_hiera_base_plus.pt": "sam2_hiera_b+.yaml",
+                "sam2_hiera_large.pt": "sam2_hiera_l.yaml",
+                "sam2_hiera_small.pt": "sam2_hiera_s.yaml",
+                "sam2_hiera_tiny.pt": "sam2_hiera_t.yaml",
+            }
+            cfg = _cfg_map.get(checkpoint.name, "sam2_hiera_b+.yaml")
+            sam2_model = build_sam2(cfg, str(checkpoint))
+            predictor_s2 = SAM2ImagePredictor(sam2_model)
+            with torch.inference_mode():
+                predictor_s2.set_image(rgb_img)
+                masks, _, _ = predictor_s2.predict(
+                    box=box_xyxy,
+                    multimask_output=False,
+                )
+            refined_mask = np.asarray(masks[0], dtype=bool)
+
+        if refined_mask is None or refined_mask.shape[:2] != rgba.shape[:2]:
+            return _FAIL("failed_mask_shape_mismatch")
+
+        # ------------------------------------------------------------------
+        # 5. Apply refined mask and save beside the original
+        # ------------------------------------------------------------------
+        refined_rgba = rgba.copy()
+        refined_rgba[:, :, 3] = np.where(refined_mask, 255, 0).astype(np.uint8)
+
+        _SAM_REFINED_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = _SAM_REFINED_DIR / f"{cutout_path.stem}_sam_refined.png"
+        cv2.imwrite(str(out_path), refined_rgba)
+
+        return {
+            "ok": True,
+            "sam_refined_path": str(out_path),
+            "sam_refine_status": "ok",
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        return _FAIL(f"failed: {exc!s}")

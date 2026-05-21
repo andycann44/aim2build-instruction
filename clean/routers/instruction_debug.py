@@ -45,7 +45,11 @@ from clean.routers.debug import (
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.azure_openai_service import rank_crop_candidates
-from clean.services.ai_snap_crop_service import create_shape_mask_for_slot_crop, create_shape_masks_for_callout_slots
+from clean.services.ai_snap_crop_service import (
+    create_shape_mask_for_slot_crop,
+    create_shape_masks_for_callout_slots,
+    refine_slot_cutout_with_sam,
+)
 from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
@@ -2557,6 +2561,141 @@ def _slot_mask_score_candidate(
     }
 
 
+# ---------------------------------------------------------------------------
+# Confirmed-label visual memory — local, deterministic, no FAISS/CLIP needed.
+# ---------------------------------------------------------------------------
+
+_CONFIRMED_MEMORY_THRESHOLD = 0.72
+
+
+def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
+    """Build a list of visual memory entries from confirmed slot labels in this bag.
+
+    Each entry carries:
+        profile  – same dict as _slot_mask_profile_from_rgba (bgr, aspect, mask, area_ratio)
+        part_num, color_id, element_id, color_name
+        source_crop_id, source_slot_index
+    Only entries whose ai_snap_input_path file still exists on disk are included.
+    """
+    labels_path = _label_store_path(str(set_num), int(bag))
+    labels_payload = _load_existing_labels(labels_path)
+    memory: List[Dict[str, Any]] = []
+    for crop_id, saved_crop in dict(labels_payload.get("crops") or {}).items():
+        if not isinstance(saved_crop, dict):
+            continue
+        for part in list(saved_crop.get("parts") or []):
+            if not isinstance(part, dict):
+                continue
+            part_num = str(part.get("part_num") or "").strip()
+            color_id = _coerce_int(part.get("color_id"))
+            if not part_num or color_id is None:
+                continue
+            ai_snap_path = str(part.get("ai_snap_input_path") or "").strip()
+            if not ai_snap_path:
+                continue
+            profile = _slot_mask_query_profile(ai_snap_path, "")
+            if profile is None:
+                continue
+            memory.append(
+                {
+                    "profile": profile,
+                    "part_num": part_num,
+                    "color_id": int(color_id),
+                    "element_id": str(part.get("element_id") or ""),
+                    "color_name": str(part.get("color_name") or ""),
+                    "source_crop_id": str(crop_id),
+                    "source_slot_index": _coerce_int(part.get("selected_slot_index")),
+                }
+            )
+    return memory
+
+
+def _compare_slot_profiles(q: Dict[str, Any], m: Dict[str, Any]) -> float:
+    """Combined similarity between two slot profiles (both from _slot_mask_profile_from_rgba).
+
+    Weights: 50 % colour, 25 % aspect, 25 % mask-IoU — identical to _slot_mask_score_candidate
+    so thresholds are directly comparable.
+    Returns a float in [0.0, 1.0].
+    """
+    q_bgr = np.asarray(q["bgr"], dtype=np.float32)
+    m_bgr = np.asarray(m["bgr"], dtype=np.float32)
+    colour_score = max(0.0, 1.0 - float(np.linalg.norm(q_bgr - m_bgr)) / 441.7)
+
+    q_asp = float(q.get("aspect") or 1.0)
+    m_asp = float(m.get("aspect") or 1.0)
+    aspect_score = 1.0 - min(1.0, abs(q_asp - m_asp) / max(q_asp, m_asp, 0.01))
+
+    q_mask = (np.asarray(q["mask"]) > 20).astype(np.uint8)
+    m_mask = (np.asarray(m["mask"]) > 20).astype(np.uint8)
+    intersection = int(np.count_nonzero(q_mask & m_mask))
+    union = int(np.count_nonzero(q_mask | m_mask))
+    silhouette_score = float(intersection) / float(union) if union else 0.0
+
+    return round(
+        (0.50 * colour_score) + (0.25 * aspect_score) + (0.25 * silhouette_score), 4
+    )
+
+
+def _apply_confirmed_memory_predictions(
+    slots: List[Dict[str, Any]],
+    set_num: str,
+    bag: int,
+) -> None:
+    """Annotate masked slots with predictions from confirmed visual memory.
+
+    Mutates slot dicts in-place; adds three optional keys when a match is found:
+        predicted_part        – {part_num, color_id, element_id, color_name}
+        prediction_source     – "predicted_from_confirmed"
+        prediction_similarity – float score that triggered the match
+
+    Only masked slots with a part_cutout_path are considered.
+    Does not overwrite any previously set predicted_part.
+    """
+    masked = [
+        s for s in (slots or [])
+        if str(s.get("status") or "") == "masked" and s.get("part_cutout_path")
+    ]
+    if not masked:
+        return
+
+    memory = _confirmed_label_memory(set_num, bag)
+    if not memory:
+        return
+
+    for slot in masked:
+        if slot.get("predicted_part"):
+            continue  # already predicted (e.g. from a previous pass)
+        query = _slot_mask_query_profile(
+            str(slot["part_cutout_path"]),
+            str(slot.get("shape_mask_path") or ""),
+        )
+        if query is None:
+            continue
+        best_score = 0.0
+        best_entry: Optional[Dict[str, Any]] = None
+        for entry in memory:
+            score = _compare_slot_profiles(query, entry["profile"])
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+        if best_entry is not None and best_score >= _CONFIRMED_MEMORY_THRESHOLD:
+            slot["predicted_part"] = {
+                "part_num": best_entry["part_num"],
+                "color_id": best_entry["color_id"],
+                "element_id": best_entry["element_id"],
+                "color_name": best_entry["color_name"],
+            }
+            slot["prediction_source"] = "predicted_from_confirmed"
+            slot["prediction_similarity"] = round(best_score, 4)
+            print(
+                "[confirmed-memory] "
+                f"crop_id={slot.get('slot_index')} slot_index={slot.get('slot_index')} "
+                f"predicted={best_entry['part_num']}:{best_entry['color_id']} "
+                f"similarity={best_score:.4f} "
+                f"source_crop={best_entry['source_crop_id']}"
+            )
+
+
 def _ai_snap_crop_from_saved_record(crop_id: str, saved_crop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     crop_box = _coerce_box_list(saved_crop.get("crop_box"))
     crop_image_path = str(saved_crop.get("crop_image_path") or "").strip()
@@ -4120,6 +4259,8 @@ async def auto_mask_slots(req: Request):
     set_num = str(data.get("set_num") or "70618").strip() or "70618"
     bag = _coerce_int(data.get("bag"))
     crop_id = str(data.get("crop_id") or "").strip()
+    sam_refine_flag = int(data.get("sam_refine") or 0) == 1
+    fast_map_flag = int(data.get("fast_map") or 0) == 1
     if bag is None or bag < 1:
         bag = 1
     if not crop_id:
@@ -4144,6 +4285,7 @@ async def auto_mask_slots(req: Request):
             set_num=set_num,
             bag=int(bag),
             crop_id=crop_id,
+            desktop_overlays=not fast_map_flag,
         )
     finally:
         if temp_crop_path is not None:
@@ -4151,6 +4293,33 @@ async def auto_mask_slots(req: Request):
                 temp_crop_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    # Optional SAM refinement: runs only when sam_refine=1 is in the request.
+    # The core extraction result is never modified; SAM adds two optional fields.
+    if sam_refine_flag:
+        for slot in list(result.get("slots") or []):
+            if str(slot.get("status") or "") != "masked":
+                continue
+            cutout = str(slot.get("part_cutout_path") or "")
+            if not cutout:
+                slot["sam_refine_status"] = "skipped_no_cutout"
+                slot["sam_refined_path"] = ""
+                continue
+            refine_result = refine_slot_cutout_with_sam(
+                cutout,
+                set_num=set_num,
+                bag=int(bag),
+                crop_id=crop_id,
+                slot_index=int(slot.get("slot_index", 0)),
+            )
+            slot["sam_refined_path"] = refine_result.get("sam_refined_path", "")
+            slot["sam_refine_status"] = refine_result.get("sam_refine_status", "")
+
+    # Confirmed-label memory: auto-predict parts for new slots from prior confirmed labels.
+    # Runs after extraction and SAM (if any); never overwrites confirmed parts — that check
+    # happens on the frontend using crop.parts.
+    _apply_confirmed_memory_predictions(list(result.get("slots") or []), set_num, int(bag))
+
     return {
         "ok": bool(result.get("ok")),
         "crop_id": crop_id,
@@ -4173,6 +4342,8 @@ async def slot_mask_candidates(req: Request):
     slot_index = _coerce_int(data.get("slot_index"))
     part_cutout_path = str(data.get("part_cutout_path") or "").strip()
     shape_mask_path = str(data.get("shape_mask_path") or "").strip()
+    _raw_clip_k = _coerce_int(data.get("clip_k"))
+    clip_k = max(1, min(200, _raw_clip_k)) if _raw_clip_k is not None and _raw_clip_k > 0 else 5
     if bag is None or bag < 1:
         bag = 1
     if slot_index is None or slot_index < 0:
@@ -4228,11 +4399,11 @@ async def slot_mask_candidates(req: Request):
         ),
         reverse=True,
     )
-    top = ranked[:5]
+    top = ranked[:clip_k]
     print(
         "[slot-mask-candidates] "
         f"set={set_num} bag={int(bag)} crop_id={crop_id} slot_index={int(slot_index)} "
-        f"pool={pool_source} candidates={len(candidate_rows)} returned={len(top)}"
+        f"pool={pool_source} candidates={len(candidate_rows)} clip_k={clip_k} returned={len(top)}"
     )
     return {
         "ok": True,
@@ -5085,6 +5256,9 @@ def instruction_buildability(
     page: Optional[int] = Query(None, ge=1),
     rebuild: Optional[int] = Query(0),
     v: Optional[str] = Query(None),
+    sam_refine: Optional[int] = Query(0),
+    clip_k: Optional[int] = Query(None),
+    fast_map: Optional[int] = Query(0),
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
@@ -5434,6 +5608,12 @@ def instruction_buildability(
     lego_colors_json = json.dumps(lego_colors)
     training_examples_json = json.dumps(training_examples)
     buildability_variant_json = json.dumps(str(v or "").strip())
+    _sam_refine_flag = 1 if int(sam_refine or 0) == 1 else 0
+    _clip_k_val = max(1, min(200, int(clip_k))) if clip_k is not None else 5
+    _fast_map_flag = 1 if int(fast_map or 0) == 1 else 0
+    sam_refine_json = json.dumps(_sam_refine_flag)
+    clip_k_json = json.dumps(_clip_k_val)
+    fast_map_json = json.dumps(_fast_map_flag)
     html = f"""
     <!doctype html>
     <html>
@@ -5965,6 +6145,80 @@ def instruction_buildability(
           word-break: break-word;
           max-width: 150px;
         }}
+        .picker-slot-color {{
+          display: block;
+          font-size: 10px;
+          color: #555;
+          margin-top: 2px;
+          line-height: 1.3;
+        }}
+        .picker-slot-color-swatch {{
+          display: inline-block;
+          width: 10px;
+          height: 10px;
+          border: 1px solid #999;
+          border-radius: 2px;
+          vertical-align: middle;
+          margin-right: 3px;
+        }}
+        .picker-slot-low-alpha {{
+          display: block;
+          background: #fff3cd;
+          color: #856404;
+          font-size: 10px;
+          padding: 1px 4px;
+          border-radius: 3px;
+          margin-top: 2px;
+        }}
+        .picker-slot-confidence {{
+          display: block;
+          font-size: 10px;
+          font-weight: 600;
+          margin-top: 2px;
+        }}
+        .picker-slot-confidence-high {{ color: #155724; }}
+        .picker-slot-confidence-medium {{ color: #856404; }}
+        .picker-slot-confidence-low {{ color: #721c24; }}
+        .picker-slot-btn.predicted {{
+          border-color: #fd7e14;
+        }}
+        .picker-slot-predicted {{
+          display: block;
+          margin-top: 4px;
+          padding: 3px 5px;
+          background: #fff3cd;
+          border: 1px solid #ffc107;
+          border-radius: 3px;
+          color: #856404;
+          font-size: 0.7em;
+          line-height: 1.3;
+          word-break: break-all;
+        }}
+        .picker-slot-predicted-actions {{
+          display: flex;
+          gap: 4px;
+          margin-top: 3px;
+        }}
+        .predicted-accept-btn,
+        .predicted-reject-btn {{
+          border: 1px solid transparent;
+          border-radius: 3px;
+          cursor: pointer;
+          font-size: 0.72em;
+          padding: 2px 7px;
+        }}
+        .predicted-accept-btn {{
+          background: #d4edda;
+          border-color: #c3e6cb;
+          color: #155724;
+        }}
+        .predicted-accept-btn:hover {{ background: #c3e6cb; }}
+        .predicted-reject-btn {{
+          background: #f8d7da;
+          border-color: #f5c6cb;
+          color: #721c24;
+        }}
+        .predicted-reject-btn:hover {{ background: #f5c6cb; }}
         .picker-slot-name {{
           font-size: 12px;
           font-weight: 700;
@@ -6472,6 +6726,7 @@ def instruction_buildability(
                     <div class="picker-slot-toolbar">
                       <button type="button" class="remove-btn" id="ai-snap-btn" onclick="runAiSnap()">AI Snap</button>
                       <button type="button" class="remove-btn" id="auto-mask-slots-btn" onclick="runAutoMaskSlots()">Auto Mask Slots</button>
+                      <button type="button" class="remove-btn" id="next-unfilled-btn" onclick="goToNextUnfilledCrop()">Next Unfilled</button>
                       <div id="ai-snap-status" class="save-note"></div>
                     </div>
                   </div>
@@ -6565,6 +6820,9 @@ def instruction_buildability(
         );
         const buildabilityVariant = {buildability_variant_json};
         const SHOW_SLOT_MATCHES = false;
+        const SAM_REFINE = {sam_refine_json};
+        const SLOT_MATCH_K = {clip_k_json};
+        const FAST_MAP = {fast_map_json};
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
@@ -7081,6 +7339,9 @@ def instruction_buildability(
         }}
 
         function renderSlotMaskDebug(maskSlot) {{
+          if (FAST_MAP) {{
+            return "";
+          }}
           if (!maskSlot) {{
             return "";
           }}
@@ -7126,7 +7387,7 @@ def instruction_buildability(
             }}
             return "";
           }}
-          return '<span class="picker-slot-candidates">' + candidates.slice(0, 5).map((candidate) => {{
+          return '<span class="picker-slot-candidates">' + candidates.slice(0, SLOT_MATCH_K).map((candidate) => {{
             const imageUrl = String(candidate && (candidate.image_url || candidate.img_url || "") || "");
             const confidence = Number(candidate && candidate.confidence);
             const label = String(candidate && candidate.part_num || "") + ":" + String(candidate && candidate.color_id || "");
@@ -7283,12 +7544,18 @@ def instruction_buildability(
           (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).forEach((slot) => {{
             autoMaskSlots.set(Number(slot && slot.slot_index), slot);
           }});
+          // Returns the maskSlot if a confirmed-memory prediction is available and
+          // no confirmed part has been saved for this slot yet.
+          function _maskSlotPrediction(idx) {{
+            const ms = autoMaskSlots.get(Number(idx));
+            return (!confirmedPartForSlot(crop, idx) && ms && ms.predicted_part) ? ms : null;
+          }}
           list.innerHTML = sequence.map((slot, idx) => `
             <button
               type="button"
-              class="picker-slot-btn${{confirmedPartForSlot(crop, idx) ? " assigned" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
+              class="picker-slot-btn${{confirmedPartForSlot(crop, idx) ? " assigned" : ""}}${{_maskSlotPrediction(idx) ? " predicted" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
               data-picker-slot-index="${{idx}}"
-              title="${{confirmedPartForSlot(crop, idx) ? "Filled slot" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot")}}"
+              title="${{confirmedPartForSlot(crop, idx) ? "Filled slot" : (_maskSlotPrediction(idx) ? "Predicted slot — accept or reject" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot"))}}"
             >
               <span class="picker-slot-name">Slot ${{idx + 1}}</span>
               <span class="picker-slot-qty">${{escapeHtml(String((slot && (slot.qty_text || slot.qty)) || "none"))}}</span>
@@ -7297,18 +7564,55 @@ def instruction_buildability(
                 const maskSlot = autoMaskSlots.get(Number(idx));
                 const cutoutUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.part_cutout_path, maskSlot.generated_at) : "";
                 const slotOverlayUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.slot_window_overlay_path, maskSlot.generated_at) : "";
+                // Predicted badge — shown only when no confirmed part exists for this slot.
+                const predSlot = _maskSlotPrediction(idx);
+                const predictedHtml = predSlot
+                  ? '<span class="picker-slot-predicted">'
+                    + 'predicted: ' + escapeHtml(String(predSlot.predicted_part.part_num || ""))
+                    + ':' + escapeHtml(String(predSlot.predicted_part.color_id || ""))
+                    + ' • sim ' + escapeHtml(String((predSlot.prediction_similarity || 0).toFixed(2)))
+                    + '<span class="picker-slot-predicted-actions">'
+                    + '<button type="button" class="predicted-accept-btn" onclick="acceptPredictedSlot(event,' + idx + ')">Accept</button>'
+                    + '<button type="button" class="predicted-reject-btn" onclick="rejectSlotPrediction(event,' + idx + ')">Reject</button>'
+                    + '</span>'
+                    + '</span>'
+                  : '';
+                let colorHtml = "";
+                if (maskSlot && maskSlot.slot_rgb_median) {{
+                  const [r, g, b] = maskSlot.slot_rgb_median;
+                  const colorMatch = closestLegoColorId({{r, g, b}});
+                  const colorName = (colorMatch && colorMatch.color_name) || String((colorMatch && colorMatch.color_id) || "");
+                  const dist = (colorMatch && Number.isFinite(colorMatch.distance)) ? colorMatch.distance.toFixed(0) : "";
+                  colorHtml = '<span class="picker-slot-color">'
+                    + '<span class="picker-slot-color-swatch" style="background:rgb(' + r + ',' + g + ',' + b + ')"></span>'
+                    + escapeHtml(colorName) + (dist ? " (" + dist + ")" : "")
+                    + '</span>';
+                }}
+                let lowAlphaHtml = "";
+                if (maskSlot && String(maskSlot.status || "") === "needs_review_low_alpha") {{
+                  lowAlphaHtml = '<span class="picker-slot-low-alpha">⚠ low alpha</span>';
+                }}
+                let confidenceHtml = "";
+                if (maskSlot && maskSlot.slot_confidence) {{
+                  const conf = String(maskSlot.slot_confidence);
+                  confidenceHtml = '<span class="picker-slot-confidence picker-slot-confidence-' + escapeHtml(conf) + '">Confidence: ' + escapeHtml(conf) + '</span>';
+                }}
                 if (cutoutUrl) {{
                   return '<span class="picker-slot-mask"><img src="' + escapeHtml(cutoutUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' cutout" loading="lazy" /></span>'
                     + (slotOverlayUrl ? '<span class="picker-slot-mask"><img src="' + escapeHtml(slotOverlayUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' window overlay" loading="lazy" /></span>' : '')
                     + renderSlotMaskDebug(maskSlot)
-                    + renderSlotMaskCandidates(maskSlot);
+                    + renderSlotMaskCandidates(maskSlot)
+                    + predictedHtml
+                    + colorHtml + lowAlphaHtml + confidenceHtml;
                 }}
                 if (maskSlot && String(maskSlot.status || "") === "needs_review") {{
                   return '<span class="picker-slot-review">needs review</span>'
                     + (slotOverlayUrl ? '<span class="picker-slot-mask"><img src="' + escapeHtml(slotOverlayUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' window overlay" loading="lazy" /></span>' : '')
-                    + renderSlotMaskDebug(maskSlot);
+                    + renderSlotMaskDebug(maskSlot)
+                    + predictedHtml
+                    + colorHtml + lowAlphaHtml + confidenceHtml;
                 }}
-                return "";
+                return predictedHtml + colorHtml + lowAlphaHtml + confidenceHtml;
               }})()}}
             </button>
           `).join("");
@@ -7498,6 +7802,26 @@ def instruction_buildability(
           if (nextCropId) {{
             selectCrop(nextCropId);
           }}
+        }}
+
+        function nextUnfilledCropId(fromCropId) {{
+          const ids = cropRecords
+            .filter((c) => cropMap.has(c.crop_id) && isCropVisibleInCurrentView(c))
+            .map((c) => c.crop_id);
+          const start = ids.indexOf(String(fromCropId));
+          for (let i = start + 1; i < ids.length; i++) {{
+            const c = cropMap.get(ids[i]);
+            if (!c) continue;
+            const st = computeCropSlotState(c);
+            if (!st.noQtyDetected && st.filledSlots < st.totalSlots) return ids[i];
+          }}
+          return null;
+        }}
+
+        function goToNextUnfilledCrop() {{
+          const nxt = nextUnfilledCropId(activeCropId);
+          if (nxt) selectCrop(nxt);
+          else alert("No unfilled crops remaining.");
         }}
 
         function setShowHiddenCrops(showHidden) {{
@@ -8581,6 +8905,8 @@ def instruction_buildability(
             set_num: {json.dumps(str(set_num))},
             bag: {bag_number},
             crop_id: crop.crop_id,
+            sam_refine: SAM_REFINE,
+            fast_map: FAST_MAP,
           }};
           try {{
             const res = await fetch("/debug/auto-mask-slots", {{
@@ -8676,7 +9002,8 @@ def instruction_buildability(
                 crop_id: crop.crop_id,
                 slot_index: Number(maskSlot.slot_index),
                 part_cutout_path: String(maskSlot.part_cutout_path || ""),
-                shape_mask_path: String(maskSlot.shape_mask_path || "")
+                shape_mask_path: String(maskSlot.shape_mask_path || ""),
+                clip_k: SLOT_MATCH_K,
               }})
             }});
             if (!res.ok) {{
@@ -9432,6 +9759,109 @@ def instruction_buildability(
           if (status) {{
             status.textContent = "Saved slot " + (slotIndex + 1) + " -> " + partNum + " / color " + colorId;
           }}
+        }}
+
+        // Accept a confirmed-memory prediction for a slot.
+        // Saves it as a real label then clears predicted_part so the tile
+        // re-renders as confirmed.  Independent of SHOW_SLOT_MATCHES.
+        async function acceptPredictedSlot(event, slotIndex) {{
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          const maskSlot = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          if (!maskSlot || !maskSlot.predicted_part) {{
+            return;
+          }}
+          const p = maskSlot.predicted_part;
+          const sequence = buildClientQtySequence(crop);
+          const seqSlot = Number.isInteger(Number(slotIndex)) ? sequence[Number(slotIndex)] : null;
+          if (!seqSlot) {{
+            return;
+          }}
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.qty_numbers,
+            crop_qty_text: crop.qty_text,
+            crop_box: crop.crop_box,
+            crop_box_format: crop.crop_box_format,
+            crop_image_path: crop.crop_image_path,
+            crop_confidence: crop.confidence,
+            part_num: String(p.part_num || ""),
+            color_id: Number(p.color_id || 0),
+            color_name: p.color_name || null,
+            element_id: p.element_id || null,
+            ai_snap_input_path: maskSlot.part_cutout_path || null,
+            qty: seqSlot.qty ?? null,
+            qty_text: seqSlot.qty_text || null,
+            selected_slot_index: Number(slotIndex),
+            adjustments: [{{
+              type: "predicted_from_confirmed",
+              slot_index: Number(slotIndex),
+              similarity: maskSlot.prediction_similarity || 0,
+            }}],
+            allow_extra_part: true,
+          }};
+          const res = await fetch("/debug/save-label", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+          }});
+          const status = document.getElementById("save-status");
+          if (!res.ok) {{
+            let detail = "Save failed";
+            try {{
+              const errPayload = await res.json();
+              detail = errPayload.detail || detail;
+            }} catch (_err) {{}}
+            if (status) {{
+              status.textContent = detail;
+            }}
+            return;
+          }}
+          const result = await res.json();
+          syncCropFromResponse(crop, result.crop);
+          // Clear the prediction so the slot now renders as confirmed.
+          maskSlot.predicted_part = null;
+          maskSlot.prediction_source = null;
+          maskSlot.prediction_similarity = null;
+          renderAssignedParts(crop.crop_id);
+          renderBuildabilitySlots(crop.crop_id);
+          updatePartTileAssignmentState();
+          if (status) {{
+            status.textContent = "Accepted prediction: slot " + (Number(slotIndex) + 1)
+              + " → " + String(p.part_num || "") + " / color " + Number(p.color_id || 0);
+          }}
+        }}
+
+        // Dismiss a confirmed-memory prediction without saving.
+        function rejectSlotPrediction(event, slotIndex) {{
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          const maskSlot = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          if (!maskSlot) {{
+            return;
+          }}
+          maskSlot.predicted_part = null;
+          maskSlot.prediction_source = null;
+          maskSlot.prediction_similarity = null;
+          renderBuildabilitySlots(crop.crop_id);
         }}
 
         async function selectTile(partNum, colorId, elementId, colorName) {{
