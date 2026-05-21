@@ -2227,6 +2227,7 @@ def _normalize_part_entry(data: Dict[str, Any]) -> Dict[str, Any]:
         "selected_slot_index": _coerce_int(data.get("selected_slot_index")),
         "part_bbox": _coerce_box_list(data.get("part_bbox")),
         "confidence": _coerce_float(data.get("confidence")),
+        "ai_snap_input_path": _coerce_str(data.get("ai_snap_input_path")),
     }
 
 
@@ -9367,6 +9368,10 @@ def instruction_buildability(
           const colorId = Number(el.dataset.colorId || 0);
           const elementId = String(el.dataset.elementId || "");
           const colorName = String(el.dataset.colorName || "");
+          const maskSlotForSave = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          const aiSnapInputPath = (maskSlotForSave && maskSlotForSave.part_cutout_path) || null;
           const payload = {{
             set_num: {json.dumps(str(set_num))},
             bag: {bag_number},
@@ -9383,6 +9388,7 @@ def instruction_buildability(
             color_id: colorId,
             color_name: colorName || null,
             element_id: elementId || null,
+            ai_snap_input_path: aiSnapInputPath,
             qty: slot.qty ?? null,
             qty_text: slot.qty_text || null,
             selected_slot_index: slotIndex,
