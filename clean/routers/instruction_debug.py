@@ -25,12 +25,12 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from clean.routers.debug import (
     _build_material_crop_candidates,
@@ -45,11 +45,29 @@ from clean.routers.debug import (
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.azure_openai_service import rank_crop_candidates
+from clean.services.ai_snap_crop_service import (
+    create_shape_mask_for_slot_crop,
+    create_shape_masks_for_callout_slots,
+    refine_slot_cutout_with_sam,
+)
 from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
 
 router = APIRouter()
+
+_PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+
+def _page_callout_cache_key(set_num: str, page: int) -> Tuple[str, int]:
+    return (str(set_num or "").strip(), int(page or 0))
+
+
+def _page_callout_cache_entry(set_num: str, page: int, *, rebuild: bool = False) -> Dict[str, Any]:
+    key = _page_callout_cache_key(set_num, page)
+    if rebuild:
+        _PAGE_CALLOUT_DETECTION_CACHE.pop(key, None)
+    return _PAGE_CALLOUT_DETECTION_CACHE.setdefault(key, {})
 
 
 def _coerce_label_filename(set_num: str, bag: int) -> str:
@@ -510,6 +528,911 @@ def _detect_callout_rect_by_edges(
         return None
 
 
+def _quantized_bgr_keys(img: Any, bin_size: int = 24) -> Any:
+    arr = np.asarray(img, dtype=np.uint16)
+    quantized = np.minimum(arr // max(1, int(bin_size)), 255)
+    return (
+        (quantized[:, :, 0].astype(np.uint32) << 16)
+        | (quantized[:, :, 1].astype(np.uint32) << 8)
+        | quantized[:, :, 2].astype(np.uint32)
+    )
+
+
+def _quantized_color_counts(img: Any, bin_size: int = 24) -> Dict[int, int]:
+    try:
+        if img is None or getattr(img, "size", 0) == 0:
+            return {}
+        keys = _quantized_bgr_keys(img, bin_size=bin_size).reshape(-1)
+        values, counts = np.unique(keys, return_counts=True)
+        return {int(value): int(count) for value, count in zip(values.tolist(), counts.tolist())}
+    except Exception:
+        return {}
+
+
+def _dominant_color_key_and_pct(counts: Dict[int, int], total: int) -> Tuple[Optional[int], float]:
+    if not counts or total <= 0:
+        return None, 0.0
+    key, count = max(counts.items(), key=lambda item: int(item[1]))
+    return int(key), float(count) / float(max(1, total))
+
+
+def _page_background_colour_stats(
+    img: Any,
+    *,
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> Dict[str, Any]:
+    cache_entry: Optional[Dict[str, Any]] = None
+    if set_num is not None and page is not None:
+        cache_entry = _page_callout_cache_entry(str(set_num), int(page), rebuild=rebuild)
+        cached = cache_entry.get("page_background_colour_stats")
+        if isinstance(cached, dict):
+            return cached
+    page_height, page_width = img.shape[:2]
+    page_total = int(page_width) * int(page_height)
+    page_counts = _quantized_color_counts(img)
+    main_key, main_pct = _dominant_color_key_and_pct(page_counts, page_total)
+    stats = {
+        "page_counts": page_counts,
+        "page_total": page_total,
+        "main_page_key": main_key,
+        "main_page_pct": main_pct,
+    }
+    if cache_entry is not None:
+        cache_entry["page_background_colour_stats"] = stats
+    return stats
+
+
+def _panel_colour_contrast_stats(
+    crop_img: Any,
+    page_counts: Dict[int, int],
+    page_total: int,
+    main_page_key: Optional[int],
+    main_page_pct: float,
+    *,
+    bin_size: int = 24,
+) -> Dict[str, float]:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return {"ok": 0.0, "local_pct": 0.0, "page_pct": 1.0}
+        counts = _quantized_color_counts(crop_img, bin_size=bin_size)
+        crop_total = int(crop_img.shape[0]) * int(crop_img.shape[1])
+        local_key, local_pct = _dominant_color_key_and_pct(counts, crop_total)
+        if local_key is None:
+            return {"ok": 0.0, "local_pct": 0.0, "page_pct": 1.0}
+        page_pct = float(page_counts.get(int(local_key), 0)) / float(max(1, page_total))
+        ok = (
+            int(local_key) != int(main_page_key or -1)
+            and float(local_pct) >= 0.24
+            and float(page_pct) < max(float(main_page_pct) * 0.82, 0.035)
+        )
+        return {"ok": 1.0 if ok else 0.0, "local_pct": float(local_pct), "page_pct": float(page_pct)}
+    except Exception:
+        return {"ok": 0.0, "local_pct": 0.0, "page_pct": 1.0}
+
+
+def _page_panel_colour_mask(
+    img: Any,
+    page_counts: Dict[int, int],
+    page_total: int,
+    main_page_key: Optional[int],
+    main_page_pct: float,
+    *,
+    bin_size: int = 24,
+) -> Any:
+    keys = _quantized_bgr_keys(img, bin_size=bin_size)
+    allowed_keys = {
+        int(key)
+        for key, count in page_counts.items()
+        if int(key) != int(main_page_key or -1)
+        and (float(count) / float(max(1, page_total))) < max(float(main_page_pct) * 0.82, 0.035)
+        and count >= max(120, int(page_total * 0.00025))
+    }
+    if not allowed_keys:
+        return np.zeros(keys.shape, dtype=np.uint8)
+    mask = np.isin(keys, np.array(sorted(allowed_keys), dtype=np.uint32)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((17, 17), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+    return mask
+
+
+def _pale_blue_callout_ratio_bgr(crop_img: Any) -> float:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return 0.0
+        hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+        bgr = crop_img
+        mask = (
+            (
+                (hsv[:, :, 0] >= 80)
+                & (hsv[:, :, 0] <= 132)
+                & (hsv[:, :, 1] <= 150)
+                & (hsv[:, :, 2] >= 135)
+            )
+            | (
+                (bgr[:, :, 0] >= 150)
+                & (bgr[:, :, 1] >= 150)
+                & (bgr[:, :, 2] >= 130)
+                & ((bgr[:, :, 0].astype(np.int16) - bgr[:, :, 2].astype(np.int16)) >= 8)
+            )
+        )
+        return float(mask.mean())
+    except Exception:
+        return 0.0
+
+
+def _box_contains_box(outer: List[int], inner: List[int], pad: int = 0) -> bool:
+    ox, oy, ow, oh = [int(value) for value in outer]
+    ix, iy, iw, ih = [int(value) for value in inner]
+    return (
+        ox - int(pad) <= ix
+        and oy - int(pad) <= iy
+        and ox + ow + int(pad) >= ix + iw
+        and oy + oh + int(pad) >= iy + ih
+    )
+
+
+def _repair_callout_box_candidate_crop(
+    img: Any,
+    candidate: Dict[str, Any],
+    *,
+    page_width: int,
+    page_height: int,
+) -> Optional[Dict[str, Any]]:
+    """Conservatively expand a narrow fallback candidate to the full callout.
+
+    This is only for material-pipeline `callout_box_candidate` rows. It never
+    creates a replacement unless the larger box still contains the original
+    candidate and known qty token boxes.
+    """
+    try:
+        if str(candidate.get("candidate_origin") or "") != "callout_box_candidate":
+            return None
+        if str(candidate.get("source") or "").strip().startswith("edge_detect"):
+            return None
+        crop_box = _coerce_box_list(candidate.get("coords_xywh"))
+        if crop_box is None:
+            return None
+        x, y, w, h = [int(value) for value in crop_box]
+        if w <= 0 or h <= 0:
+            return None
+        aspect = w / float(max(1, h))
+        if w >= 340 and h >= 120 and aspect <= 3.9:
+            return None
+
+        search_pad_left = max(80, int(round(w * 0.45)))
+        search_pad_right = max(180, int(round(w * 0.95)))
+        search_pad_y = max(70, int(round(h * 0.70)))
+        search_bounds = _safe_crop_bounds(
+            x - search_pad_left,
+            y - search_pad_y,
+            x + w + search_pad_right,
+            y + h + search_pad_y,
+            page_width,
+            page_height,
+        )
+        if search_bounds is None:
+            return None
+        sx1, sy1, sx2, sy2 = search_bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return None
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        bgr = roi
+        pale_mask = (
+            (
+                (hsv[:, :, 0] >= 80)
+                & (hsv[:, :, 0] <= 132)
+                & (hsv[:, :, 1] <= 155)
+                & (hsv[:, :, 2] >= 130)
+            )
+            | (
+                (bgr[:, :, 0] >= 145)
+                & (bgr[:, :, 1] >= 145)
+                & (bgr[:, :, 2] >= 120)
+                & ((bgr[:, :, 0].astype(np.int16) - bgr[:, :, 2].astype(np.int16)) >= 6)
+            )
+        ).astype(np.uint8) * 255
+        pale_mask = cv2.morphologyEx(pale_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=1)
+        pale_mask = cv2.morphologyEx(pale_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(pale_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        token_boxes = [
+            dict(item)
+            for item in list(candidate.get("qty_token_boxes") or [])
+            if isinstance(item, dict)
+        ]
+        token_page_boxes = []
+        for token in token_boxes:
+            tx = int(token.get("x", 0) or 0)
+            ty = int(token.get("y", 0) or 0)
+            tw = max(1, int(token.get("w", 0) or 0))
+            th = max(1, int(token.get("h", 0) or 0))
+            token_page_boxes.append([x + tx, y + ty, tw, th])
+
+        best_box: Optional[List[int]] = None
+        best_score = -1.0
+        for contour in contours:
+            cx, cy, cw, ch = cv2.boundingRect(contour)
+            if cw <= 0 or ch <= 0:
+                continue
+            # Include the dark rounded border around the pale-blue interior.
+            pad = 4
+            repaired = [
+                max(0, sx1 + cx - pad),
+                max(0, sy1 + cy - pad),
+                min(page_width, sx1 + cx + cw + pad) - max(0, sx1 + cx - pad),
+                min(page_height, sy1 + cy + ch + pad) - max(0, sy1 + cy - pad),
+            ]
+            rx, ry, rw, rh = [int(value) for value in repaired]
+            if rw <= w or rh < h:
+                continue
+            if rw < 160 or rh < 55:
+                continue
+            if not _box_contains_box(repaired, crop_box, pad=2):
+                continue
+            if any(not _box_contains_box(repaired, token_box, pad=2) for token_box in token_page_boxes):
+                continue
+            repaired_crop = img[ry : ry + rh, rx : rx + rw]
+            if repaired_crop is None or repaired_crop.size == 0:
+                continue
+            if _yellow_ratio_bgr(repaired_crop) > 0.18:
+                continue
+            pale_ratio = _pale_blue_callout_ratio_bgr(repaired_crop)
+            if pale_ratio < 0.38:
+                continue
+            gray = cv2.cvtColor(repaired_crop, cv2.COLOR_BGR2GRAY)
+            dark = gray < 100
+            band = max(2, min(7, min(rw, rh) // 14))
+            border_dark = (
+                int(dark[:band, :].sum())
+                + int(dark[rh - band :, :].sum())
+                + int(dark[:, :band].sum())
+                + int(dark[:, rw - band :].sum())
+            )
+            if border_dark < max(24, int((rw + rh) * 0.12)):
+                continue
+            score = float(rw * rh) + (pale_ratio * 10000.0) + float(border_dark)
+            if score > best_score:
+                best_score = score
+                best_box = repaired
+
+        if best_box is None:
+            return None
+        repaired_candidate = dict(candidate)
+        repaired_candidate["coords_xywh"] = [int(value) for value in best_box]
+        repaired_candidate["coords_label"] = "callout_box_candidate repaired"
+        repaired_candidate["source"] = "callout_box_candidate_repaired"
+        repaired_candidate["edge_rect"] = [int(value) for value in best_box]
+        return repaired_candidate
+    except Exception:
+        return None
+
+
+def _detect_page_step_number_boxes(
+    img: Any,
+    step_boxes: List[Dict[str, Any]],
+    *,
+    page_width: int,
+    page_height: int,
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> List[Dict[str, Any]]:
+    cache_entry: Optional[Dict[str, Any]] = None
+    if set_num is not None and page is not None:
+        cache_entry = _page_callout_cache_entry(str(set_num), int(page), rebuild=rebuild)
+        cached_boxes = cache_entry.get("detected_step_number_boxes")
+        if not rebuild and isinstance(cached_boxes, list):
+            return [dict(item) for item in cached_boxes if isinstance(item, dict)]
+
+    detected: List[Dict[str, Any]] = []
+    for step_box in step_boxes or []:
+        try:
+            value = int(step_box.get("step_number", 0) or 0)
+            x = int(step_box.get("x", 0) or 0)
+            y = int(step_box.get("y", 0) or 0)
+            w = int(step_box.get("w", 0) or 0)
+            h = int(step_box.get("h", 0) or 0)
+        except Exception:
+            continue
+        if value <= 0 or w <= 0 or h <= 0:
+            continue
+        detected.append({"step_number": value, "x": x, "y": y, "w": w, "h": h, "source": step_box.get("source") or "step_detector"})
+
+    if not detected:
+        try:
+            import pytesseract
+
+            data = pytesseract.image_to_data(
+                img,
+                config="--psm 11 -c tessedit_char_whitelist=0123456789",
+                output_type=pytesseract.Output.DICT,
+            )
+            ocr_tokens: List[Dict[str, Any]] = []
+            for idx in range(len(data.get("text", []) or [])):
+                text = re.sub(r"\D+", "", str((data.get("text", [""])[idx] or "")).strip())
+                if not text:
+                    continue
+                value = int(text)
+                if value <= 0 or value >= 1000:
+                    continue
+                try:
+                    conf = float((data.get("conf", ["-1"])[idx] or -1))
+                except Exception:
+                    conf = -1.0
+                if conf < 25:
+                    continue
+                x = int(data.get("left", [0])[idx] or 0)
+                y = int(data.get("top", [0])[idx] or 0)
+                w = int(data.get("width", [0])[idx] or 0)
+                h = int(data.get("height", [0])[idx] or 0)
+                ocr_tokens.append({"text": text, "x": x, "y": y, "w": w, "h": h, "conf": conf})
+                if w < 8 or h < 16 or w > int(page_width * 0.16) or h > int(page_height * 0.16):
+                    continue
+                detected.append({"step_number": value, "x": x, "y": y, "w": w, "h": h, "source": "page_ocr"})
+            if cache_entry is not None:
+                cache_entry["ocr_tokens"] = ocr_tokens
+        except Exception:
+            pass
+
+    deduped: List[Dict[str, Any]] = []
+    for item in sorted(detected, key=lambda row: (int(row.get("step_number", 0) or 0), int(row.get("y", 0) or 0), int(row.get("x", 0) or 0))):
+        ix = int(item.get("x", 0) or 0)
+        iy = int(item.get("y", 0) or 0)
+        iw = int(item.get("w", 0) or 0)
+        ih = int(item.get("h", 0) or 0)
+        value = int(item.get("step_number", 0) or 0)
+        duplicate = False
+        for existing in deduped:
+            if int(existing.get("step_number", 0) or 0) != value:
+                continue
+            ex = int(existing.get("x", 0) or 0)
+            ey = int(existing.get("y", 0) or 0)
+            if abs((ix + iw // 2) - (ex + int(existing.get("w", 0) or 0) // 2)) <= 28 and abs((iy + ih // 2) - (ey + int(existing.get("h", 0) or 0) // 2)) <= 28:
+                duplicate = True
+                break
+        if not duplicate:
+            deduped.append(item)
+    if cache_entry is not None:
+        cache_entry["detected_step_number_boxes"] = [dict(item) for item in deduped]
+    return deduped
+
+
+def _detect_step_number_below_panel(
+    img: Any,
+    panel_box: List[int],
+    *,
+    page_width: int,
+    page_height: int,
+) -> List[Dict[str, Any]]:
+    try:
+        import pytesseract
+
+        px, py, pw, ph = [int(value) for value in panel_box]
+        bounds = _safe_crop_bounds(
+            px - max(130, int(pw * 0.50)),
+            py + ph - 8,
+            px + max(170, int(pw * 0.45)),
+            py + ph + max(170, int(ph * 1.20)),
+            page_width,
+            page_height,
+        )
+        if bounds is None:
+            return []
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return []
+        original_roi = roi
+        roi = cv2.resize(original_roi, None, fx=2.8, fy=2.8, interpolation=cv2.INTER_CUBIC)
+        data = pytesseract.image_to_data(
+            roi,
+            config="--psm 11 -c tessedit_char_whitelist=0123456789",
+            output_type=pytesseract.Output.DICT,
+        )
+        steps: List[Dict[str, Any]] = []
+        ocr_tokens: List[Dict[str, Any]] = []
+        scale = 2.8
+        for idx in range(len(data.get("text", []) or [])):
+            text = re.sub(r"\D+", "", str((data.get("text", [""])[idx] or "")).strip())
+            if not text:
+                continue
+            value = int(text)
+            if value <= 0 or value >= 1000:
+                continue
+            try:
+                conf = float((data.get("conf", ["-1"])[idx] or -1))
+            except Exception:
+                conf = -1.0
+            if conf < 15:
+                continue
+            x = sx1 + int(float(data.get("left", [0])[idx] or 0) / scale)
+            y = sy1 + int(float(data.get("top", [0])[idx] or 0) / scale)
+            w = max(1, int(float(data.get("width", [0])[idx] or 0) / scale))
+            h = max(1, int(float(data.get("height", [0])[idx] or 0) / scale))
+            ocr_tokens.append({"text": text, "x": x, "y": y, "w": w, "h": h, "conf": conf, "source": "panel_below_ocr"})
+            if w < 7 or h < 14:
+                continue
+            steps.append({"step_number": value, "x": x, "y": y, "w": w, "h": h, "source": "panel_below_ocr"})
+        if steps:
+            return [{"_ocr_tokens": ocr_tokens}, *steps]
+
+        gray = cv2.cvtColor(original_roi, cv2.COLOR_BGR2GRAY)
+        dark = (gray < 70).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 8 or h < 28 or w > int((sx2 - sx1) * 0.30) or h > int((sy2 - sy1) * 0.60):
+                continue
+            pad = 8
+            bounds = _safe_crop_bounds(x - pad, y - pad, x + w + pad, y + h + pad, sx2 - sx1, sy2 - sy1)
+            if bounds is None:
+                continue
+            x1, y1, x2, y2 = bounds
+            crop = original_roi[y1:y2, x1:x2]
+            if crop is None or crop.size == 0:
+                continue
+            crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+            text = pytesseract.image_to_string(
+                crop,
+                config="--psm 10 -c tessedit_char_whitelist=0123456789",
+            )
+            text = re.sub(r"\D+", "", str(text or ""))
+            if not text:
+                continue
+            value = int(text)
+            if value <= 0 or value >= 1000:
+                continue
+            token = {"text": text, "x": sx1 + x, "y": sy1 + y, "w": w, "h": h, "conf": None, "source": "panel_below_component_ocr"}
+            ocr_tokens.append(token)
+            steps.append({"step_number": value, "x": sx1 + x, "y": sy1 + y, "w": w, "h": h, "source": "panel_below_component_ocr"})
+        return ([{"_ocr_tokens": ocr_tokens}] if ocr_tokens else []) + steps
+    except Exception:
+        return []
+
+
+def _callout_panel_has_boundary(crop_img: Any) -> bool:
+    try:
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            return False
+        h, w = crop_img.shape[:2]
+        if h <= 0 or w <= 0:
+            return False
+        gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+        dark = gray < 95
+        band = max(2, min(8, min(w, h) // 12))
+        border_dark = (
+            int(dark[:band, :].sum())
+            + int(dark[h - band :, :].sum())
+            + int(dark[:, :band].sum())
+            + int(dark[:, w - band :].sum())
+        )
+        if border_dark >= max(28, int((w + h) * 0.13)):
+            return True
+        edges = cv2.Canny(gray, 60, 150)
+        edge_band = (
+            int(edges[:band, :].sum() // 255)
+            + int(edges[h - band :, :].sum() // 255)
+            + int(edges[:, :band].sum() // 255)
+            + int(edges[:, w - band :].sum() // 255)
+        )
+        return edge_band >= max(34, int((w + h) * 0.20))
+    except Exception:
+        return False
+
+
+def _dark_line_group_centers(values: Any, threshold: int) -> List[int]:
+    centers: List[int] = []
+    start: Optional[int] = None
+    for idx, value in enumerate(list(values)):
+        if int(value) >= int(threshold):
+            if start is None:
+                start = int(idx)
+        elif start is not None:
+            centers.append((start + int(idx) - 1) // 2)
+            start = None
+    if start is not None:
+        centers.append((start + len(values) - 1) // 2)
+    return centers
+
+
+def _expand_panel_box_to_dark_boundary(
+    img: Any,
+    box: List[int],
+    *,
+    page_width: int,
+    page_height: int,
+) -> List[int]:
+    try:
+        x, y, w, h = [int(value) for value in box]
+        bounds = _safe_crop_bounds(
+            x - max(90, int(w * 0.75)),
+            y - max(35, int(h * 0.35)),
+            x + w + max(45, int(w * 0.18)),
+            y + h + max(70, int(h * 0.70)),
+            page_width,
+            page_height,
+        )
+        if bounds is None:
+            return box
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return box
+        roi_h, roi_w = roi.shape[:2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        dark = (gray < 100).astype(np.uint8)
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        col_counts = dark.sum(axis=0)
+        row_counts = dark.sum(axis=1)
+        vertical_threshold = max(10, int(roi_h * 0.12))
+        horizontal_threshold = max(18, int(roi_w * 0.16))
+        col_centers = _dark_line_group_centers(col_counts, vertical_threshold)
+        row_centers = _dark_line_group_centers(row_counts, horizontal_threshold)
+
+        local_left = x - sx1
+        local_right = x + w - sx1
+        local_top = y - sy1
+        local_bottom = y + h - sy1
+
+        left_options = [value for value in col_centers if value <= local_left + 8]
+        right_options = [value for value in col_centers if value >= local_right - 8]
+        top_options = [value for value in row_centers if value <= local_top + 8]
+        bottom_options = [value for value in row_centers if value >= local_bottom - 8]
+        if not left_options or not right_options or not top_options or not bottom_options:
+            return box
+
+        left = max(left_options)
+        right = min(right_options)
+        top = max(top_options)
+        bottom = min(bottom_options)
+        pad = 3
+        expanded = [
+            max(0, sx1 + left - pad),
+            max(0, sy1 + top - pad),
+            min(page_width, sx1 + right + pad) - max(0, sx1 + left - pad),
+            min(page_height, sy1 + bottom + pad) - max(0, sy1 + top - pad),
+        ]
+        ex, ey, ew, eh = [int(value) for value in expanded]
+        if ew <= w or eh < max(35, int(h * 0.65)):
+            return box
+        if ew > int(page_width * 0.60) or eh > int(page_height * 0.35):
+            return box
+        if not _box_contains_box(expanded, box, pad=2):
+            return box
+        return expanded
+    except Exception:
+        return box
+
+
+def _refine_page_level_panel_with_step_geometry(
+    img: Any,
+    panel_box: List[int],
+    *,
+    step_y: int,
+    page_width: int,
+    page_height: int,
+) -> Optional[List[int]]:
+    try:
+        px, py, pw, ph = [int(value) for value in panel_box]
+        bounds = _safe_crop_bounds(
+            px - max(45, int(pw * 0.20)),
+            py - max(28, int(ph * 0.25)),
+            px + pw + max(45, int(pw * 0.20)),
+            min(page_height, int(step_y) - 1),
+            page_width,
+            page_height,
+        )
+        if bounds is None:
+            return None
+        sx1, sy1, sx2, sy2 = bounds
+        roi = img[sy1:sy2, sx1:sx2]
+        if roi is None or roi.size == 0:
+            return None
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 35, 110)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180.0,
+            threshold=35,
+            minLineLength=max(70, min(180, int(pw * 0.35))),
+            maxLineGap=14,
+        )
+        if lines is None:
+            return None
+
+        groups: List[Dict[str, int]] = []
+        for raw in lines:
+            x1, y1, x2, y2 = [int(v) for v in raw[0]]
+            if abs(y1 - y2) > 5:
+                continue
+            length = abs(x2 - x1)
+            if length < 70:
+                continue
+            y = int(round((y1 + y2) / 2.0))
+            lx = min(x1, x2)
+            rx = max(x1, x2)
+            matched = False
+            for group in groups:
+                if abs(group["y"] - y) <= 7:
+                    group["y"] = int(round((group["y"] + y) / 2.0))
+                    group["x1"] = min(group["x1"], lx)
+                    group["x2"] = max(group["x2"], rx)
+                    matched = True
+                    break
+            if not matched:
+                groups.append({"y": y, "x1": lx, "x2": rx})
+
+        groups.sort(key=lambda item: item["y"])
+        best: Optional[List[int]] = None
+        best_score = 10**9
+        for top_idx, top in enumerate(groups):
+            for bottom in groups[top_idx + 1 :]:
+                box_h = int(bottom["y"] - top["y"])
+                if box_h < 38 or box_h > 240:
+                    continue
+                left = max(0, min(int(top["x1"]), int(bottom["x1"])) - 3)
+                right = min(roi.shape[1], max(int(top["x2"]), int(bottom["x2"])) + 3)
+                box_w = int(right - left)
+                if box_w < 110 or box_w > 700:
+                    continue
+                top_y = max(0, int(top["y"]) - 3)
+                bottom_y = min(roi.shape[0], int(bottom["y"]) + 3)
+                ax = int(sx1 + left)
+                ay = int(sy1 + top_y)
+                bx = int(sx1 + right)
+                by = int(sy1 + bottom_y)
+                if by > int(step_y) - 5:
+                    by = int(step_y) - 5
+                if bx <= ax or by <= ay:
+                    continue
+                candidate = [ax, ay, bx - ax, by - ay]
+                if not _box_contains_box(candidate, panel_box, pad=14):
+                    continue
+                crop = img[ay:by, ax:bx]
+                if crop is None or crop.size == 0:
+                    continue
+                if _yellow_ratio_bgr(crop) > 0.18:
+                    continue
+                score = abs(int(step_y) - by) + abs((ax + bx) // 2 - (px + pw // 2)) // 5
+                if score < best_score:
+                    best_score = score
+                    best = candidate
+        return best
+    except Exception:
+        return None
+
+
+def _detect_page_level_callout_panels(
+    img: Any,
+    *,
+    page_width: int,
+    page_height: int,
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> List[Dict[str, Any]]:
+    try:
+        stats = _page_background_colour_stats(img, set_num=set_num, page=page, rebuild=rebuild)
+        page_total = int(stats.get("page_total") or (int(page_width) * int(page_height)))
+        page_counts = dict(stats.get("page_counts") or {})
+        main_key = stats.get("main_page_key")
+        main_pct = float(stats.get("main_page_pct") or 0.0)
+        mask = _page_panel_colour_mask(img, page_counts, page_total, main_key, main_pct)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        panels: List[Dict[str, Any]] = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 95 or h < 45:
+                continue
+            if w > int(page_width * 0.55) or h > int(page_height * 0.28):
+                continue
+            if w * h > int(page_total * 0.16):
+                continue
+            aspect = w / float(max(1, h))
+            if aspect < 1.15 or aspect > 7.0:
+                continue
+            pad = 5
+            bounds = _safe_crop_bounds(x - pad, y - pad, x + w + pad, y + h + pad, page_width, page_height)
+            if bounds is None:
+                continue
+            x1, y1, x2, y2 = bounds
+            expanded_box = _expand_panel_box_to_dark_boundary(
+                img,
+                [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                page_width=page_width,
+                page_height=page_height,
+            )
+            x1, y1, ew, eh = [int(value) for value in expanded_box]
+            x2 = min(page_width, x1 + ew)
+            y2 = min(page_height, y1 + eh)
+            crop = img[y1:y2, x1:x2]
+            if crop is None or crop.size == 0:
+                continue
+            if _yellow_ratio_bgr(crop) > 0.18:
+                continue
+            colour_stats = _panel_colour_contrast_stats(crop, page_counts, page_total, main_key, main_pct)
+            if float(colour_stats.get("ok", 0.0)) <= 0.0:
+                continue
+            if not _callout_panel_has_boundary(crop):
+                continue
+            qty_payload = _auto_qty_payload_for_crop(crop, 0)
+            qty_tokens = list(qty_payload.get("qty_token_boxes") or [])
+            if not qty_tokens:
+                continue
+            panels.append(
+                {
+                    "coords_xywh": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                    "detected_qty_text": qty_payload.get("detected_qty_text", []),
+                    "detected_qty_numbers": qty_payload.get("detected_qty_numbers", []),
+                    "qty_token_boxes": qty_tokens,
+                    "panel_colour_local_pct": colour_stats.get("local_pct"),
+                    "panel_colour_page_pct": colour_stats.get("page_pct"),
+                }
+            )
+
+        deduped: List[Dict[str, Any]] = []
+        for panel in sorted(panels, key=lambda item: (int(item["coords_xywh"][1]), int(item["coords_xywh"][0]), -(int(item["coords_xywh"][2]) * int(item["coords_xywh"][3])))):
+            box = panel["coords_xywh"]
+            duplicate = False
+            for existing in deduped:
+                existing_box = existing["coords_xywh"]
+                if _box_contains_box(existing_box, box, pad=10) or _box_contains_box(box, existing_box, pad=10):
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append(panel)
+        return deduped
+    except Exception:
+        return []
+
+
+def _page_level_callout_candidates_for_fallback(
+    img: Any,
+    *,
+    page_width: int,
+    page_height: int,
+    step_boxes: List[Dict[str, Any]],
+    set_num: Optional[str] = None,
+    page: Optional[int] = None,
+    rebuild: bool = False,
+) -> List[Dict[str, Any]]:
+    panels = _detect_page_level_callout_panels(
+        img,
+        page_width=page_width,
+        page_height=page_height,
+        set_num=set_num,
+        page=page,
+        rebuild=rebuild,
+    )
+    if not panels:
+        return []
+    steps = _detect_page_step_number_boxes(
+        img,
+        step_boxes,
+        page_width=page_width,
+        page_height=page_height,
+        set_num=set_num,
+        page=page,
+        rebuild=False,
+    )
+    if not steps:
+        cache_entry = _page_callout_cache_entry(str(set_num), int(page), rebuild=False) if set_num is not None and page is not None else None
+        cached_panel_steps = cache_entry.get("panel_step_number_boxes") if cache_entry is not None else None
+        used_cached_panel_steps = False
+        if not rebuild and isinstance(cached_panel_steps, list):
+            steps = [dict(item) for item in cached_panel_steps if isinstance(item, dict)]
+            used_cached_panel_steps = True
+        panel_ocr_tokens: List[Dict[str, Any]] = []
+        if not used_cached_panel_steps:
+            for panel in panels:
+                panel_box = _coerce_box_list(panel.get("coords_xywh"))
+                if panel_box is None:
+                    continue
+                detected_rows = _detect_step_number_below_panel(
+                    img,
+                    panel_box,
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+                for row in detected_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if isinstance(row.get("_ocr_tokens"), list):
+                        panel_ocr_tokens.extend([dict(item) for item in row.get("_ocr_tokens", []) if isinstance(item, dict)])
+                        continue
+                    steps.append(row)
+            if cache_entry is not None:
+                cache_entry["panel_step_number_boxes"] = [dict(item) for item in steps]
+                existing_tokens = list(cache_entry.get("ocr_tokens") or [])
+                cache_entry["ocr_tokens"] = existing_tokens + panel_ocr_tokens
+    if not steps:
+        return []
+
+    assigned: Dict[int, Dict[str, Any]] = {}
+    for panel in panels:
+        px, py, pw, ph = [int(value) for value in panel.get("coords_xywh", [])]
+        panel_bottom = py + ph
+        best_step: Optional[Dict[str, Any]] = None
+        best_score: Optional[float] = None
+        for step in steps:
+            sx = int(step.get("x", 0) or 0)
+            sy = int(step.get("y", 0) or 0)
+            sw = int(step.get("w", 0) or 0)
+            sh = int(step.get("h", 0) or 0)
+            step_left = sx
+            step_mid_y = sy + sh // 2
+            if step_mid_y < panel_bottom - 4:
+                continue
+            if step_left > px + max(85, int(pw * 0.20)):
+                continue
+            horizontal_gap = abs(step_left - px)
+            if horizontal_gap > max(180, int(pw * 0.55)):
+                continue
+            vertical_gap = max(0, step_mid_y - panel_bottom)
+            score = float(vertical_gap) + float(horizontal_gap) * 0.45
+            if best_score is None or score < best_score:
+                best_score = score
+                best_step = step
+        if best_step is None or best_score is None:
+            continue
+        step_number = int(best_step.get("step_number", 0) or 0)
+        if step_number <= 0:
+            continue
+        refined_box = _refine_page_level_panel_with_step_geometry(
+            img,
+            [px, py, pw, ph],
+            step_y=int(best_step.get("y", 0) or 0),
+            page_width=page_width,
+            page_height=page_height,
+        )
+        if refined_box is not None:
+            px, py, pw, ph = [int(value) for value in refined_box]
+        current = assigned.get(step_number)
+        if current is not None and float(current.get("_assignment_score", 999999.0)) <= best_score:
+            continue
+        crop_img = img[py : py + ph, px : px + pw]
+        if crop_img is None or crop_img.size == 0:
+            continue
+        try:
+            data_uri = _encode_debug_image_data_uri(crop_img, max_width=420)
+        except Exception:
+            continue
+        qty_payload = _qty_payload_for_page_level_callout_crop(crop_img, step_number, "page_level_callout_assignment")
+        candidate = {
+            "candidate_origin": "callout_box_candidate",
+            "source": "page_level_callout_assignment",
+            "match_enabled": True,
+            "data_uri": data_uri,
+            "coords_xywh": [px, py, pw, ph],
+            "coords_label": "page-level assigned callout",
+            "edge_rect": [px, py, pw, ph],
+            "confidence": 0.44,
+            "step_number": step_number,
+            "qty_source": qty_payload.get("qty_source") or "page_level_callout_assignment",
+            "detected_qty_text": qty_payload.get("detected_qty_text", []),
+            "detected_qty_numbers": qty_payload.get("detected_qty_numbers", []),
+            "qty_token_boxes": qty_payload.get("qty_token_boxes"),
+            "qty_ocr_source_regions": qty_payload.get("qty_ocr_source_regions", []),
+            "qty_ocr_ordered_qty_list": qty_payload.get("qty_ocr_ordered_qty_list", []),
+            "_assignment_score": float(best_score),
+        }
+        assigned[step_number] = candidate
+
+    cleaned: List[Dict[str, Any]] = []
+    for candidate in sorted(assigned.values(), key=lambda item: (int(item.get("step_number", 0) or 0), int(item.get("coords_xywh", [0, 0])[1]), int(item.get("coords_xywh", [0, 0])[0]))):
+        item = dict(candidate)
+        item.pop("_assignment_score", None)
+        cleaned.append(item)
+    return cleaned
+
+
 def _estimate_visible_part_count_from_crop(crop_img: Any) -> int:
     """Estimate visible part count from contrast against callout background.
 
@@ -619,6 +1542,224 @@ def _dedupe_qty_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         deduped.append(normalized_token)
     return deduped
+
+
+def _dedupe_qty_tokens_high_overlap_only(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    for token in sorted(
+        list(tokens or []),
+        key=lambda item: (
+            int(item.get("cy", 0) or 0),
+            int(item.get("x", 0) or 0),
+            int(item.get("w", 0) or 0) * int(item.get("h", 0) or 0),
+        ),
+    ):
+        normalized = _normalize_qty_token_text(token.get("text"))
+        if not normalized:
+            continue
+        normalized_token = {
+            "text": normalized,
+            "x": int(token.get("x", 0) or 0),
+            "y": int(token.get("y", 0) or 0),
+            "w": int(token.get("w", 0) or 0),
+            "h": int(token.get("h", 0) or 0),
+            "cx": int(token.get("cx", 0) or 0),
+            "cy": int(token.get("cy", 0) or 0),
+        }
+        if "source_region" in token:
+            normalized_token["source_region"] = str(token.get("source_region") or "")
+        if "confidence" in token:
+            normalized_token["confidence"] = token.get("confidence")
+        if any(
+            _normalize_qty_token_text(existing.get("text")) == normalized
+            and _token_overlap_ratio(existing, normalized_token) >= 0.75
+            for existing in deduped
+        ):
+            continue
+        deduped.append(normalized_token)
+    return deduped
+
+
+def _final_crop_qty_token_is_valid(token: Dict[str, Any], crop_width: int, crop_height: int) -> bool:
+    try:
+        x = int(token.get("x", 0) or 0)
+        y = int(token.get("y", 0) or 0)
+        w = int(token.get("w", 0) or 0)
+        h = int(token.get("h", 0) or 0)
+    except Exception:
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    if x < 0 or y < 0 or x + w > int(crop_width) or y + h > int(crop_height):
+        return False
+    if y < max(4, int(crop_height * 0.14)):
+        return False
+    if w > max(48, int(crop_width * 0.16)) or h > max(30, int(crop_height * 0.20)):
+        return False
+    return True
+
+
+def _order_qty_tokens_by_rows(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[List[Dict[str, Any]]] = []
+    for token in sorted(list(tokens or []), key=lambda item: (int(item.get("cy", 0) or 0), int(item.get("x", 0) or 0))):
+        cy = int(token.get("cy", 0) or 0)
+        placed = False
+        for row in rows:
+            row_cy = int(round(sum(int(item.get("cy", 0) or 0) for item in row) / max(1, len(row))))
+            row_h = max(int(item.get("h", 0) or 0) for item in row)
+            token_h = int(token.get("h", 0) or 0)
+            if abs(cy - row_cy) <= max(18, int(max(row_h, token_h) * 1.8)):
+                row.append(token)
+                placed = True
+                break
+        if not placed:
+            rows.append([token])
+
+    ordered: List[Dict[str, Any]] = []
+    for row in sorted(rows, key=lambda items: sum(int(item.get("cy", 0) or 0) for item in items) / max(1, len(items))):
+        ordered.extend(sorted(row, key=lambda item: int(item.get("x", 0) or 0)))
+    return ordered
+
+
+def _qty_payload_for_page_level_callout_crop(crop_img: Any, step_number: int, source_label: str = "page_level_callout_assignment") -> Dict[str, Any]:
+    payload = _auto_qty_payload_for_crop(crop_img, step_number)
+    debug_regions: List[Dict[str, Any]] = []
+    if crop_img is None or getattr(crop_img, "size", 0) == 0:
+        payload["qty_ocr_source_regions"] = debug_regions
+        payload["qty_ocr_ordered_qty_list"] = list(payload.get("detected_qty_text", []) or [])
+        return payload
+
+    height, width = crop_img.shape[:2]
+    region_specs = [
+        ("final_crop_full", 0, 0, width, height),
+        ("final_crop_up_right", 0, 0, width, min(height, max(1, int(height * 0.72)))),
+        ("final_crop_lower_expanded_up_right", 0, max(0, int(height * 0.38)), width, height),
+        ("final_crop_right_expanded", max(0, int(width * 0.22)), 0, width, height),
+    ]
+
+    tokens: List[Dict[str, Any]] = []
+    for name, x1, y1, x2, y2 in region_specs:
+        if x2 <= x1 or y2 <= y1:
+            continue
+        region_img = crop_img[y1:y2, x1:x2]
+        if region_img is None or region_img.size == 0:
+            continue
+        debug_regions.append({"name": name, "x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1)})
+        for token in _extract_qty_tokens_from_image(region_img) or []:
+            normalized = _normalize_qty_token_text(token.get("text"))
+            if not normalized:
+                continue
+            tx = int(token.get("x", 0) or 0) + int(x1)
+            ty = int(token.get("y", 0) or 0) + int(y1)
+            tw = int(token.get("w", 0) or 0)
+            th = int(token.get("h", 0) or 0)
+            tokens.append(
+                {
+                    "text": normalized,
+                    "x": tx,
+                    "y": ty,
+                    "w": tw,
+                    "h": th,
+                    "cx": tx + (tw // 2),
+                    "cy": ty + (th // 2),
+                    "source_region": name,
+                    "confidence": None,
+                }
+            )
+        try:
+            import pytesseract
+
+            gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
+            for scale, psm_values in ((4.0, (6, 11, 12)), (5.0, (6, 11, 12))):
+                enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                thresholded = cv2.adaptiveThreshold(
+                    enlarged,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    31,
+                    6,
+                )
+                for psm in psm_values:
+                    data = pytesseract.image_to_data(
+                        thresholded,
+                        config=f"--psm {psm} -c tessedit_char_whitelist=0123456789xX",
+                        output_type=pytesseract.Output.DICT,
+                    )
+                    for idx in range(len(data.get("text", []) or [])):
+                        normalized = _normalize_qty_token_text(data.get("text", [""])[idx])
+                        if not normalized:
+                            continue
+                        try:
+                            confidence = float(data.get("conf", ["-1"])[idx] or -1)
+                        except Exception:
+                            confidence = -1.0
+                        if confidence < 25:
+                            continue
+                        tw = max(1, int(float(data.get("width", [0])[idx] or 0) / scale))
+                        th = max(1, int(float(data.get("height", [0])[idx] or 0) / scale))
+                        if tw < 8 or tw > 42 or th < 7 or th > 30:
+                            continue
+                        tx = int(x1 + (float(data.get("left", [0])[idx] or 0) / scale))
+                        ty = int(y1 + (float(data.get("top", [0])[idx] or 0) / scale))
+                        if ty < 0 or tx < 0:
+                            continue
+                        tokens.append(
+                            {
+                                "text": normalized,
+                                "x": tx,
+                                "y": ty,
+                                "w": tw,
+                                "h": th,
+                                "cx": tx + (tw // 2),
+                                "cy": ty + (th // 2),
+                                "source_region": f"{name}:adaptive_s{int(scale)}_psm{psm}",
+                                "confidence": confidence,
+                            }
+                        )
+        except Exception:
+            pass
+
+    filtered_tokens = [
+        token
+        for token in _dedupe_qty_tokens_high_overlap_only(tokens)
+        if _final_crop_qty_token_is_valid(token, int(width), int(height))
+    ]
+    ordered_tokens = _order_qty_tokens_by_rows(
+        filtered_tokens,
+    )
+    if ordered_tokens:
+        detected_qty_text: List[str] = []
+        detected_qty_numbers: List[int] = []
+        for token in ordered_tokens:
+            text = str(token.get("text") or "")
+            number_match = re.search(r"(\d{1,2})", text)
+            qty_val = int(number_match.group(1)) if number_match else None
+            detected_qty_text.append(text)
+            if qty_val is not None:
+                detected_qty_numbers.append(qty_val)
+        payload["detected_qty_text"] = detected_qty_text
+        payload["detected_qty_numbers"] = detected_qty_numbers
+        payload["qty_token_boxes"] = [
+            token
+            for token in ordered_tokens
+        ]
+
+    payload["qty_source"] = str(source_label or "page_level_callout_assignment")
+    payload["qty_ocr_source_regions"] = debug_regions
+    payload["qty_ocr_ordered_qty_list"] = list(payload.get("detected_qty_text", []) or [])
+    print(
+        f"[qty-ocr] source={source_label}",
+        "step=",
+        int(step_number or 0),
+        "regions=",
+        debug_regions,
+        "tokens=",
+        payload.get("qty_token_boxes") or [],
+        "ordered=",
+        payload.get("qty_ocr_ordered_qty_list") or [],
+    )
+    return payload
 
 
 def _extract_detected_qty_details_from_crop(crop_img) -> Dict[str, Any]:
@@ -922,7 +2063,17 @@ def _crop_qty_slot_state(crop_record: Dict[str, Any], qty_values: Any, qty_text_
         }
 
     assigned_counts: Dict[str, int] = {}
+    filled_by_slot_index = {
+        int(slot_index)
+        for slot_index in (
+            _coerce_int(part.get("selected_slot_index"))
+            for part in parts
+        )
+        if slot_index is not None and int(slot_index) >= 0
+    }
     for part in parts:
+        if _coerce_int(part.get("selected_slot_index")) is not None:
+            continue
         signature = _qty_slot_signature(part.get("qty"), part.get("qty_text"))
         if not signature:
             continue
@@ -933,6 +2084,9 @@ def _crop_qty_slot_state(crop_record: Dict[str, Any], qty_values: Any, qty_text_
     next_slot: Optional[Dict[str, Any]] = None
     next_qty_index = len(sequence)
     for slot_index, slot in enumerate(sequence):
+        if int(slot_index) in filled_by_slot_index:
+            filled_slots += 1
+            continue
         signature = _qty_slot_signature(slot.get("qty"), slot.get("qty_text"))
         if signature and assigned_counts.get(signature, 0) > consumed_counts.get(signature, 0):
             consumed_counts[signature] = consumed_counts.get(signature, 0) + 1
@@ -1074,8 +2228,10 @@ def _normalize_part_entry(data: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "qty": qty,
         "qty_text": qty_text,
+        "selected_slot_index": _coerce_int(data.get("selected_slot_index")),
         "part_bbox": _coerce_box_list(data.get("part_bbox")),
         "confidence": _coerce_float(data.get("confidence")),
+        "ai_snap_input_path": _coerce_str(data.get("ai_snap_input_path")),
     }
 
 
@@ -1146,6 +2302,398 @@ def _prepare_instruction_parts_for_display(parts: List[Dict[str, Any]]) -> List[
 
 def _candidate_part_key(part_num: Any, color_id: Any) -> str:
     return f"{str(part_num or '').strip()}::{int(color_id or 0)}"
+
+
+def _debug_bag_specific_part_rows(set_num: str, bag: int) -> List[Dict[str, Any]]:
+    db_path = Path("/Users/olly/aim2build-instruction/bag_inspector.db")
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT part_num, color_id, qty_total
+            FROM set_bag_parts
+            WHERE set_num = ? AND bag_number = ?
+            ORDER BY part_num, color_id
+            """,
+            (str(set_num or "").strip(), int(bag or 1)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        part_num = str(row["part_num"] or "").strip()
+        color_id = _coerce_int(row["color_id"])
+        if not part_num or color_id is None:
+            continue
+        out.append(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "qty": int(row["qty_total"] or 0),
+            }
+        )
+    return out
+
+
+def _slot_mask_candidate_pool(set_num: str, bag: int) -> Tuple[List[Dict[str, Any]], str]:
+    parts_payload = load_instruction_set_parts(str(set_num))
+    set_parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
+    set_by_key = {
+        _candidate_part_key(part.get("part_num"), part.get("color_id")): dict(part or {})
+        for part in set_parts
+    }
+    bag_rows = _debug_bag_specific_part_rows(str(set_num), int(bag or 1))
+    source = "bag_specific" if bag_rows else "set_fallback"
+    seed_rows = bag_rows if bag_rows else set_parts
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in seed_rows:
+        part_num = str(row.get("part_num") or "").strip()
+        color_id = _coerce_int(row.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        key = _candidate_part_key(part_num, color_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        meta = dict(set_by_key.get(key, {}) or {})
+        candidate = dict(meta)
+        candidate.update(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "qty": int(row.get("qty", meta.get("qty", 0)) or 0),
+            }
+        )
+        if not str(candidate.get("img_url") or "").strip():
+            candidate["img_url"] = str(meta.get("img_url") or "").strip()
+        if not str(candidate.get("color_name") or "").strip():
+            candidate["color_name"] = str(meta.get("color_name") or "n/a")
+        if not str(candidate.get("element_id") or "").strip():
+            candidate["element_id"] = str(meta.get("element_id") or "")
+        candidates.append(candidate)
+    return candidates, source
+
+
+def _slot_mask_resolve_local_image_path(img_url: Any) -> Optional[Path]:
+    text = str(img_url or "").strip()
+    if not text:
+        return None
+    if text.startswith(("http://", "https://")):
+        return None
+    if text.startswith("file://"):
+        text = text[7:]
+    path = Path(text).expanduser()
+    if path.exists():
+        return path
+    repo_path = Path("/Users/olly/aim2build-instruction") / text
+    if repo_path.exists():
+        return repo_path
+    return None
+
+
+def _slot_mask_read_rgba(path_value: Any) -> Optional[np.ndarray]:
+    path = Path(str(path_value or "").strip()).expanduser()
+    if not path.exists() or not path.is_file():
+        return None
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+    if img.ndim == 2:
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        alpha = np.full(img.shape, 255, dtype=np.uint8)
+        return np.dstack([bgr, alpha])
+    if img.shape[2] == 3:
+        alpha = np.full(img.shape[:2], 255, dtype=np.uint8)
+        return np.dstack([img, alpha])
+    return img[:, :, :4]
+
+
+def _slot_mask_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    x0 = int(xs.min())
+    y0 = int(ys.min())
+    x1 = int(xs.max()) + 1
+    y1 = int(ys.max()) + 1
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def _slot_mask_normalized(mask: np.ndarray, size: int = 64) -> np.ndarray:
+    bbox = _slot_mask_bbox(mask)
+    canvas = np.zeros((size, size), dtype=np.uint8)
+    if bbox is None:
+        return canvas
+    x, y, w, h = bbox
+    crop = (mask[y : y + h, x : x + w] > 0).astype(np.uint8) * 255
+    scale = min(size / max(1, w), size / max(1, h))
+    nw = max(1, min(size, int(round(w * scale))))
+    nh = max(1, min(size, int(round(h * scale))))
+    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
+    ox = (size - nw) // 2
+    oy = (size - nh) // 2
+    canvas[oy : oy + nh, ox : ox + nw] = resized
+    return canvas
+
+
+def _slot_mask_profile_from_rgba(rgba: np.ndarray, mask_override: Optional[np.ndarray] = None) -> Optional[Dict[str, Any]]:
+    bgr = rgba[:, :, :3]
+    alpha = rgba[:, :, 3]
+    if mask_override is not None:
+        mask = (mask_override > 20).astype(np.uint8) * 255
+    else:
+        mask = (alpha > 20).astype(np.uint8) * 255
+        if int(np.count_nonzero(mask)) >= int(mask.size * 0.96):
+            border = np.concatenate(
+                [
+                    bgr[:2, :, :].reshape(-1, 3),
+                    bgr[-2:, :, :].reshape(-1, 3),
+                    bgr[:, :2, :].reshape(-1, 3),
+                    bgr[:, -2:, :].reshape(-1, 3),
+                ],
+                axis=0,
+            )
+            bg = np.median(border, axis=0)
+            delta = np.linalg.norm(bgr.astype(np.float32) - bg.reshape(1, 1, 3), axis=2)
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            sat = hsv[:, :, 1]
+            val = hsv[:, :, 2]
+            mask = ((delta > 22) & (val < 248) & ~((sat < 18) & (val > 235))).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    bbox = _slot_mask_bbox(mask)
+    if bbox is None:
+        return None
+    pixels = bgr[mask > 0]
+    if pixels.size == 0:
+        return None
+    median_bgr = np.median(pixels.reshape(-1, 3), axis=0).astype(np.float32)
+    x, y, w, h = bbox
+    aspect = float(w) / float(max(1, h))
+    return {
+        "bgr": median_bgr,
+        "aspect": aspect,
+        "mask": _slot_mask_normalized(mask),
+        "area_ratio": float(np.count_nonzero(mask)) / float(max(1, mask.size)),
+    }
+
+
+def _slot_mask_query_profile(part_cutout_path: Any, shape_mask_path: Any) -> Optional[Dict[str, Any]]:
+    cutout = _slot_mask_read_rgba(part_cutout_path)
+    if cutout is None:
+        return None
+    mask_override: Optional[np.ndarray] = None
+    mask_path = Path(str(shape_mask_path or "").strip()).expanduser()
+    if mask_path.exists() and mask_path.is_file():
+        mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask_img is not None and getattr(mask_img, "size", 0) != 0:
+            if mask_img.shape[:2] != cutout.shape[:2]:
+                mask_img = cv2.resize(mask_img, (cutout.shape[1], cutout.shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask_override = mask_img
+    return _slot_mask_profile_from_rgba(cutout, mask_override=mask_override)
+
+
+def _slot_mask_candidate_profile(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    image_path = _slot_mask_resolve_local_image_path(part.get("img_url"))
+    if image_path is None:
+        return None
+    rgba = _slot_mask_read_rgba(image_path)
+    if rgba is None:
+        return None
+    return _slot_mask_profile_from_rgba(rgba)
+
+
+def _slot_mask_hex_to_bgr(value: Any) -> Optional[np.ndarray]:
+    rgb_hex = _normalize_rgb_hex(value)
+    if not rgb_hex:
+        return None
+    return np.array(
+        [
+            int(rgb_hex[4:6], 16),
+            int(rgb_hex[2:4], 16),
+            int(rgb_hex[0:2], 16),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _slot_mask_score_candidate(
+    query: Dict[str, Any],
+    candidate: Dict[str, Any],
+    color_bgr_by_id: Dict[int, np.ndarray],
+) -> Dict[str, float]:
+    candidate_profile = _slot_mask_candidate_profile(candidate)
+    if candidate_profile is not None:
+        candidate_bgr = candidate_profile["bgr"]
+        aspect_score = 1.0 - min(
+            1.0,
+            abs(float(query["aspect"]) - float(candidate_profile["aspect"]))
+            / max(float(query["aspect"]), float(candidate_profile["aspect"]), 0.01),
+        )
+        query_mask = (query["mask"] > 20).astype(np.uint8)
+        candidate_mask = (candidate_profile["mask"] > 20).astype(np.uint8)
+        intersection = int(np.count_nonzero(query_mask & candidate_mask))
+        union = int(np.count_nonzero(query_mask | candidate_mask))
+        silhouette_score = float(intersection) / float(union) if union else 0.0
+    else:
+        candidate_bgr = color_bgr_by_id.get(int(candidate.get("color_id", 0) or 0))
+        aspect_score = 0.0
+        silhouette_score = 0.0
+    if candidate_bgr is None:
+        colour_score = 0.0
+    else:
+        distance = float(np.linalg.norm(np.asarray(query["bgr"], dtype=np.float32) - candidate_bgr))
+        colour_score = max(0.0, 1.0 - distance / 441.7)
+    confidence = (0.50 * colour_score) + (0.25 * aspect_score) + (0.25 * silhouette_score)
+    return {
+        "colour": round(float(colour_score), 4),
+        "aspect": round(float(aspect_score), 4),
+        "silhouette": round(float(silhouette_score), 4),
+        "confidence": round(float(confidence), 4),
+        "candidate_image_available": 1.0 if candidate_profile is not None else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Confirmed-label visual memory — local, deterministic, no FAISS/CLIP needed.
+# ---------------------------------------------------------------------------
+
+_CONFIRMED_MEMORY_THRESHOLD = 0.72
+
+
+def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
+    """Build a list of visual memory entries from confirmed slot labels in this bag.
+
+    Each entry carries:
+        profile  – same dict as _slot_mask_profile_from_rgba (bgr, aspect, mask, area_ratio)
+        part_num, color_id, element_id, color_name
+        source_crop_id, source_slot_index
+    Only entries whose ai_snap_input_path file still exists on disk are included.
+    """
+    labels_path = _label_store_path(str(set_num), int(bag))
+    labels_payload = _load_existing_labels(labels_path)
+    memory: List[Dict[str, Any]] = []
+    for crop_id, saved_crop in dict(labels_payload.get("crops") or {}).items():
+        if not isinstance(saved_crop, dict):
+            continue
+        for part in list(saved_crop.get("parts") or []):
+            if not isinstance(part, dict):
+                continue
+            part_num = str(part.get("part_num") or "").strip()
+            color_id = _coerce_int(part.get("color_id"))
+            if not part_num or color_id is None:
+                continue
+            ai_snap_path = str(part.get("ai_snap_input_path") or "").strip()
+            if not ai_snap_path:
+                continue
+            profile = _slot_mask_query_profile(ai_snap_path, "")
+            if profile is None:
+                continue
+            memory.append(
+                {
+                    "profile": profile,
+                    "part_num": part_num,
+                    "color_id": int(color_id),
+                    "element_id": str(part.get("element_id") or ""),
+                    "color_name": str(part.get("color_name") or ""),
+                    "source_crop_id": str(crop_id),
+                    "source_slot_index": _coerce_int(part.get("selected_slot_index")),
+                }
+            )
+    return memory
+
+
+def _compare_slot_profiles(q: Dict[str, Any], m: Dict[str, Any]) -> float:
+    """Combined similarity between two slot profiles (both from _slot_mask_profile_from_rgba).
+
+    Weights: 50 % colour, 25 % aspect, 25 % mask-IoU — identical to _slot_mask_score_candidate
+    so thresholds are directly comparable.
+    Returns a float in [0.0, 1.0].
+    """
+    q_bgr = np.asarray(q["bgr"], dtype=np.float32)
+    m_bgr = np.asarray(m["bgr"], dtype=np.float32)
+    colour_score = max(0.0, 1.0 - float(np.linalg.norm(q_bgr - m_bgr)) / 441.7)
+
+    q_asp = float(q.get("aspect") or 1.0)
+    m_asp = float(m.get("aspect") or 1.0)
+    aspect_score = 1.0 - min(1.0, abs(q_asp - m_asp) / max(q_asp, m_asp, 0.01))
+
+    q_mask = (np.asarray(q["mask"]) > 20).astype(np.uint8)
+    m_mask = (np.asarray(m["mask"]) > 20).astype(np.uint8)
+    intersection = int(np.count_nonzero(q_mask & m_mask))
+    union = int(np.count_nonzero(q_mask | m_mask))
+    silhouette_score = float(intersection) / float(union) if union else 0.0
+
+    return round(
+        (0.50 * colour_score) + (0.25 * aspect_score) + (0.25 * silhouette_score), 4
+    )
+
+
+def _apply_confirmed_memory_predictions(
+    slots: List[Dict[str, Any]],
+    set_num: str,
+    bag: int,
+) -> None:
+    """Annotate masked slots with predictions from confirmed visual memory.
+
+    Mutates slot dicts in-place; adds three optional keys when a match is found:
+        predicted_part        – {part_num, color_id, element_id, color_name}
+        prediction_source     – "predicted_from_confirmed"
+        prediction_similarity – float score that triggered the match
+
+    Only masked slots with a part_cutout_path are considered.
+    Does not overwrite any previously set predicted_part.
+    """
+    masked = [
+        s for s in (slots or [])
+        if str(s.get("status") or "") == "masked" and s.get("part_cutout_path")
+    ]
+    if not masked:
+        return
+
+    memory = _confirmed_label_memory(set_num, bag)
+    if not memory:
+        return
+
+    for slot in masked:
+        if slot.get("predicted_part"):
+            continue  # already predicted (e.g. from a previous pass)
+        query = _slot_mask_query_profile(
+            str(slot["part_cutout_path"]),
+            str(slot.get("shape_mask_path") or ""),
+        )
+        if query is None:
+            continue
+        best_score = 0.0
+        best_entry: Optional[Dict[str, Any]] = None
+        for entry in memory:
+            score = _compare_slot_profiles(query, entry["profile"])
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+        if best_entry is not None and best_score >= _CONFIRMED_MEMORY_THRESHOLD:
+            slot["predicted_part"] = {
+                "part_num": best_entry["part_num"],
+                "color_id": best_entry["color_id"],
+                "element_id": best_entry["element_id"],
+                "color_name": best_entry["color_name"],
+            }
+            slot["prediction_source"] = "predicted_from_confirmed"
+            slot["prediction_similarity"] = round(best_score, 4)
+            print(
+                "[confirmed-memory] "
+                f"crop_id={slot.get('slot_index')} slot_index={slot.get('slot_index')} "
+                f"predicted={best_entry['part_num']}:{best_entry['color_id']} "
+                f"similarity={best_score:.4f} "
+                f"source_crop={best_entry['source_crop_id']}"
+            )
 
 
 def _ai_snap_crop_from_saved_record(crop_id: str, saved_crop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1821,8 +3369,14 @@ def _build_instruction_callout_crops(
     bag: int,
     ai_enabled: bool = False,
     step_filter: Optional[int] = None,
+    page_filter: Optional[int] = None,
+    rebuild: bool = False,
 ) -> List[Dict[str, Any]]:
     rendered_pages, start_page, end_page = _resolve_bag_page_range(str(set_num), int(bag))
+    if page_filter is not None:
+        rendered_pages = [int(page_filter)]
+        start_page = min(int(start_page), int(page_filter))
+        end_page = max(int(end_page), int(page_filter))
     crops: List[Dict[str, Any]] = []
 
     def _recover_right_half_missing_steps(
@@ -1953,20 +3507,30 @@ def _build_instruction_callout_crops(
         if edge_callout_candidates:
             callout_candidates = edge_callout_candidates
         else:
-            crop_candidates = _build_material_crop_candidates(
+            callout_candidates = _page_level_callout_candidates_for_fallback(
                 img,
                 page_width=page_width,
                 page_height=page_height,
                 step_boxes=step_boxes,
-                include_minifig=False,
+                set_num=str(set_num),
+                page=int(page),
+                rebuild=bool(rebuild),
             )
+            if not callout_candidates:
+                crop_candidates = _build_material_crop_candidates(
+                    img,
+                    page_width=page_width,
+                    page_height=page_height,
+                    step_boxes=step_boxes,
+                    include_minifig=False,
+                )
 
-            callout_candidates = [
-                item
-                for item in crop_candidates
-                if str(item.get("candidate_origin", "")) == "callout_box_candidate"
-                and bool(item.get("match_enabled"))
-            ]
+                callout_candidates = [
+                    item
+                    for item in crop_candidates
+                    if str(item.get("candidate_origin", "")) == "callout_box_candidate"
+                    and bool(item.get("match_enabled"))
+                ]
 
         for idx, candidate in enumerate(callout_candidates, start=1):
             step_number = int(candidate.get("step_number", 0) or 0)
@@ -1975,12 +3539,28 @@ def _build_instruction_callout_crops(
             qty_payload: Dict[str, Any] = {
                 "detected_qty_text": list(candidate.get("detected_qty_text", []) or []),
                 "detected_qty_numbers": list(candidate.get("detected_qty_numbers", []) or []),
-                "qty_source": "local",
+                "qty_source": str(candidate.get("qty_source") or "local"),
+                "qty_ocr_source_regions": list(candidate.get("qty_ocr_source_regions", []) or []),
+                "qty_ocr_ordered_qty_list": list(candidate.get("qty_ocr_ordered_qty_list", []) or []),
                 "ai_part_count": None,
                 "ai_issues": [],
                 "ai_crop_box": None,
                 "ai_suggested_fix": False,
             }
+            candidate_source = str(candidate.get("source") or candidate.get("candidate_origin") or "")
+            if candidate_source in {"edge_detect", "page_level_callout_assignment"}:
+                crop_box = _coerce_box_list(candidate.get("coords_xywh"))
+                if crop_box is not None:
+                    x = int(crop_box[0] or 0)
+                    y = int(crop_box[1] or 0)
+                    w = int(crop_box[2] or 0)
+                    h = int(crop_box[3] or 0)
+                    if w > 0 and h > 0:
+                        qty_payload = _qty_payload_for_page_level_callout_crop(
+                            img[y : y + h, x : x + w],
+                            int(step_number),
+                            candidate_source,
+                        )
             if ai_enabled:
                 crop_box = _coerce_box_list(candidate.get("coords_xywh"))
                 if crop_box is not None:
@@ -2008,7 +3588,7 @@ def _build_instruction_callout_crops(
                 if str(value).strip()
             ]
             # Final safety: do not allow OCR to turn the step number into a qty.
-            if step_number and str(qty_payload.get("qty_source") or "local") != "openai":
+            if step_number and str(qty_payload.get("qty_source") or "local") not in {"openai", "page_level_callout_assignment", "edge_detect"}:
                 clean_pairs = [
                     (text, number)
                     for text, number in zip(detected_qty_text, detected_qty_numbers)
@@ -2016,6 +3596,17 @@ def _build_instruction_callout_crops(
                 ]
                 detected_qty_text = [text for text, _ in clean_pairs]
                 detected_qty_numbers = [number for _, number in clean_pairs]
+            qty_missing = not detected_qty_text and not detected_qty_numbers
+            if qty_missing:
+              candidate_box = _coerce_box_list(candidate.get("coords_xywh"))
+              visible_part_estimate = 0
+              if candidate_box is not None:
+                cx, cy, cw, ch = [int(value) for value in candidate_box]
+                if cw > 0 and ch > 0:
+                  candidate_crop = img[cy : cy + ch, cx : cx + cw]
+                  visible_part_estimate = _estimate_visible_part_count_from_crop(candidate_crop)
+              if int(visible_part_estimate) <= 0:
+                continue
             crop_id = f"p{int(page)}_s{max(step_number, 0)}_c{idx}"
             crops.append(
                 {
@@ -2040,6 +3631,8 @@ def _build_instruction_callout_crops(
                     "crop_image_path": str(image_path),
                     "confidence": _coerce_float(candidate.get("confidence")),
                     "qty_token_boxes": qty_payload.get("qty_token_boxes") or candidate.get("qty_token_boxes"),
+                    "qty_ocr_source_regions": qty_payload.get("qty_ocr_source_regions") or candidate.get("qty_ocr_source_regions"),
+                    "qty_ocr_ordered_qty_list": qty_payload.get("qty_ocr_ordered_qty_list") or candidate.get("qty_ocr_ordered_qty_list"),
                     "edge_rect": candidate.get("edge_rect"),
                 }
             )
@@ -2259,21 +3852,48 @@ async def save_label(req: Request):
         adjustments=data.get("adjustments"),
         notes=data.get("notes"),
     )
-    already_present = any(
-        _same_part_entry(existing_part, part_entry) for existing_part in crop_record["parts"]
+    selected_slot_index = _coerce_int(data.get("selected_slot_index"))
+    sequence = _build_qty_sequence(
+        data.get("crop_qty", data.get("qty", [])),
+        data.get("crop_qty_text", data.get("qty_text", [])),
     )
-    if not already_present:
-        assigned_qty = _pick_qty_assignment(
-            crop_record,
-            data.get("crop_qty", data.get("qty", [])),
-            data.get("crop_qty_text", data.get("qty_text", [])),
-            allow_extra_part=allow_extra_part,
+    has_explicit_slot = selected_slot_index is not None and 0 <= int(selected_slot_index) < len(sequence)
+    if has_explicit_slot:
+        slot = dict(sequence[int(selected_slot_index)] or {})
+        part_entry["qty"] = slot.get("qty")
+        part_entry["qty_text"] = slot.get("qty_text")
+        part_entry["selected_slot_index"] = int(selected_slot_index)
+        replaced = False
+        for index, existing_part in enumerate(list(crop_record["parts"] or [])):
+            if _coerce_int((existing_part or {}).get("selected_slot_index")) == int(selected_slot_index):
+                crop_record["parts"][index] = part_entry
+                replaced = True
+                break
+        if (
+            not replaced
+            and int(selected_slot_index) < len(crop_record["parts"] or [])
+            and _coerce_int((crop_record["parts"][int(selected_slot_index)] or {}).get("selected_slot_index")) is None
+        ):
+            crop_record["parts"][int(selected_slot_index)] = part_entry
+            replaced = True
+        if not replaced:
+            crop_record["parts"].append(part_entry)
+    else:
+        already_present = any(
+            _same_part_entry(existing_part, part_entry) for existing_part in crop_record["parts"]
         )
-        if assigned_qty.get("slots_full"):
-            raise HTTPException(status_code=400, detail="All qty slots filled")
-        part_entry["qty"] = assigned_qty.get("qty")
-        part_entry["qty_text"] = assigned_qty.get("qty_text")
-        crop_record["parts"].append(part_entry)
+        if not already_present:
+            assigned_qty = _pick_qty_assignment(
+                crop_record,
+                data.get("crop_qty", data.get("qty", [])),
+                data.get("crop_qty_text", data.get("qty_text", [])),
+                allow_extra_part=allow_extra_part,
+            )
+            if assigned_qty.get("slots_full"):
+                raise HTTPException(status_code=400, detail="All qty slots filled")
+            part_entry["qty"] = assigned_qty.get("qty")
+            part_entry["qty_text"] = assigned_qty.get("qty_text")
+            crop_record["parts"].append(part_entry)
     _refresh_crop_next_qty_index(crop_record)
     crop_record["annotated_at"] = _iso_now()
     _write_labels(path, existing)
@@ -2426,6 +4046,10 @@ async def ai_rank_slot(req: Request):
     ai_failure_reason = ""
     candidate_count = len(mock_ranked_candidates)
     ai_snap_input_path = ""
+    shape_mask_path = ""
+    part_cutout_path = ""
+    mask_slot_index: Optional[int] = None
+    cutout_slot_index: Optional[int] = None
     normalized_path = ""
     component_path = ""
     selected_box: Optional[Dict[str, Any]] = None
@@ -2454,6 +4078,27 @@ async def ai_rank_slot(req: Request):
             else:
                 normalization_fallback_reason = "selected_qty_box_unavailable"
             ai_snap_input_path = rank_input_path
+            if ai_snap_input_path:
+                shape_input_path = ai_snap_input_path
+                shape_qty_box: Optional[Dict[str, Any]] = None
+                if 0 <= int(slot_index) < len(qty_token_boxes):
+                    shape_qty_box = dict(qty_token_boxes[int(slot_index)])
+                if temp_crop_path is not None and shape_qty_box is not None:
+                    shape_normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), shape_qty_box)
+                    if bool(shape_normalized_result.get("ok")) and str(shape_normalized_result.get("normalized_path") or "").strip():
+                        shape_input_path = str(shape_normalized_result.get("normalized_path") or "").strip()
+                shape_result = create_shape_mask_for_slot_crop(
+                    shape_input_path,
+                    set_num=set_num,
+                    bag=int(bag),
+                    crop_id=crop_id,
+                    slot_index=int(slot_index),
+                )
+                if bool(shape_result.get("ok")):
+                    shape_mask_path = str(shape_result.get("shape_mask_path") or "")
+                    part_cutout_path = str(shape_result.get("part_cutout_path") or "")
+                    mask_slot_index = _coerce_int(shape_result.get("mask_slot_index"))
+                    cutout_slot_index = _coerce_int(shape_result.get("cutout_slot_index"))
             if not normalized_path and not normalization_fallback_reason:
                 normalization_fallback_reason = "normalized_path_unavailable"
             print(
@@ -2562,8 +4207,13 @@ async def ai_rank_slot(req: Request):
             "crop_step": int(crop.get("step", 0) or 0),
             "slot_qty": slot_qty,
             "slot_qty_text": slot_qty_text,
+            "selected_slot_index": int(slot_index),
             "sequence_length": len(sequence),
             "ai_snap_input_path": ai_snap_input_path,
+            "shape_mask_path": shape_mask_path,
+            "part_cutout_path": part_cutout_path,
+            "mask_slot_index": mask_slot_index,
+            "cutout_slot_index": cutout_slot_index,
             "normalized_path": normalized_path,
             "component_path": component_path,
             "selected_qty_box": selected_qty_box,
@@ -2587,6 +4237,183 @@ async def ai_rank_slot(req: Request):
             "model": model_name,
             "labels_path": str(labels_path),
         },
+    }
+
+
+@router.get("/debug/ai-snap-artifact")
+def ai_snap_artifact(path: str = Query(...)):
+    requested = Path(str(path or "").strip()).expanduser()
+    allowed_root = (Path("/Users/olly/aim2build-instruction") / "debug" / "ai_training").resolve()
+    try:
+        resolved = requested.resolve()
+    except Exception:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if allowed_root not in resolved.parents or not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return FileResponse(str(resolved))
+
+
+@router.post("/debug/auto-mask-slots")
+async def auto_mask_slots(req: Request):
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag"))
+    crop_id = str(data.get("crop_id") or "").strip()
+    sam_refine_flag = int(data.get("sam_refine") or 0) == 1
+    fast_map_flag = int(data.get("fast_map") or 0) == 1
+    if bag is None or bag < 1:
+        bag = 1
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+
+    crop = _load_crop_for_ai_snap(set_num, int(bag), crop_id)
+    if not crop:
+        raise HTTPException(status_code=404, detail="crop not found")
+    qty_token_boxes = [
+        dict(item)
+        for item in list(crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+    temp_crop_path: Optional[Path] = None
+    try:
+        temp_crop_path = _write_ai_snap_temp_crop_image(crop)
+        if temp_crop_path is None:
+            raise HTTPException(status_code=400, detail="crop image unavailable")
+        result = create_shape_masks_for_callout_slots(
+            str(temp_crop_path),
+            qty_token_boxes,
+            set_num=set_num,
+            bag=int(bag),
+            crop_id=crop_id,
+            desktop_overlays=not fast_map_flag,
+        )
+    finally:
+        if temp_crop_path is not None:
+            try:
+                temp_crop_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # Optional SAM refinement: runs only when sam_refine=1 is in the request.
+    # The core extraction result is never modified; SAM adds two optional fields.
+    if sam_refine_flag:
+        for slot in list(result.get("slots") or []):
+            if str(slot.get("status") or "") != "masked":
+                continue
+            cutout = str(slot.get("part_cutout_path") or "")
+            if not cutout:
+                slot["sam_refine_status"] = "skipped_no_cutout"
+                slot["sam_refined_path"] = ""
+                continue
+            refine_result = refine_slot_cutout_with_sam(
+                cutout,
+                set_num=set_num,
+                bag=int(bag),
+                crop_id=crop_id,
+                slot_index=int(slot.get("slot_index", 0)),
+            )
+            slot["sam_refined_path"] = refine_result.get("sam_refined_path", "")
+            slot["sam_refine_status"] = refine_result.get("sam_refine_status", "")
+
+    # Confirmed-label memory: auto-predict parts for new slots from prior confirmed labels.
+    # Runs after extraction and SAM (if any); never overwrites confirmed parts — that check
+    # happens on the frontend using crop.parts.
+    _apply_confirmed_memory_predictions(list(result.get("slots") or []), set_num, int(bag))
+
+    return {
+        "ok": bool(result.get("ok")),
+        "crop_id": crop_id,
+        "slots": list(result.get("slots") or []),
+        "slot_count": int(result.get("slot_count") or 0),
+        "full_crop_mask_path": str(result.get("full_crop_mask_path") or ""),
+        "full_crop_mask_overlay_path": str(result.get("full_crop_mask_overlay_path") or ""),
+        "full_crop_mask_error": str(result.get("full_crop_mask_error") or ""),
+        "generated_at": str(result.get("generated_at") or ""),
+        "error": str(result.get("error") or ""),
+    }
+
+
+@router.post("/debug/slot-mask-candidates")
+async def slot_mask_candidates(req: Request):
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    bag = _coerce_int(data.get("bag"))
+    crop_id = str(data.get("crop_id") or "").strip()
+    slot_index = _coerce_int(data.get("slot_index"))
+    part_cutout_path = str(data.get("part_cutout_path") or "").strip()
+    shape_mask_path = str(data.get("shape_mask_path") or "").strip()
+    _raw_clip_k = _coerce_int(data.get("clip_k"))
+    clip_k = max(1, min(200, _raw_clip_k)) if _raw_clip_k is not None and _raw_clip_k > 0 else 5
+    if bag is None or bag < 1:
+        bag = 1
+    if slot_index is None or slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+    if not part_cutout_path:
+        raise HTTPException(status_code=400, detail="part_cutout_path is required")
+
+    query_profile = _slot_mask_query_profile(part_cutout_path, shape_mask_path)
+    if query_profile is None:
+        raise HTTPException(status_code=400, detail="slot mask/cutout unavailable")
+
+    candidate_rows, pool_source = _slot_mask_candidate_pool(set_num, int(bag))
+    color_ids = [int(part.get("color_id", 0) or 0) for part in candidate_rows]
+    color_bgr_by_id = {
+        int(item["color_id"]): _slot_mask_hex_to_bgr(item.get("rgb"))
+        for item in _load_catalog_colors_for_ids(color_ids)
+    }
+    color_bgr_by_id = {
+        color_id: bgr
+        for color_id, bgr in color_bgr_by_id.items()
+        if bgr is not None
+    }
+
+    ranked: List[Dict[str, Any]] = []
+    for candidate in candidate_rows:
+        part_num = str(candidate.get("part_num") or "").strip()
+        color_id = _coerce_int(candidate.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        scores = _slot_mask_score_candidate(query_profile, candidate, color_bgr_by_id)
+        ranked.append(
+            {
+                "part_num": part_num,
+                "color_id": int(color_id),
+                "color_name": str(candidate.get("color_name") or "n/a"),
+                "element_id": str(candidate.get("element_id") or ""),
+                "image_url": str(candidate.get("img_url") or "").strip(),
+                "image_path": str(_slot_mask_resolve_local_image_path(candidate.get("img_url")) or ""),
+                "confidence": scores["confidence"],
+                "score_breakdown": {
+                    "colour": scores["colour"],
+                    "aspect": scores["aspect"],
+                    "silhouette": scores["silhouette"],
+                    "candidate_image_available": bool(scores["candidate_image_available"]),
+                },
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("confidence", 0.0) or 0.0),
+            float((item.get("score_breakdown") or {}).get("colour", 0.0) or 0.0),
+            str(item.get("part_num") or ""),
+        ),
+        reverse=True,
+    )
+    top = ranked[:clip_k]
+    print(
+        "[slot-mask-candidates] "
+        f"set={set_num} bag={int(bag)} crop_id={crop_id} slot_index={int(slot_index)} "
+        f"pool={pool_source} candidates={len(candidate_rows)} clip_k={clip_k} returned={len(top)}"
+    )
+    return {
+        "ok": True,
+        "set_num": set_num,
+        "bag": int(bag),
+        "crop_id": crop_id,
+        "slot_index": int(slot_index),
+        "candidate_pool_source": pool_source,
+        "candidate_count": len(candidate_rows),
+        "ranked_candidates": top,
     }
 
 
@@ -3426,7 +5253,12 @@ def instruction_buildability(
     bag: Optional[int] = Query(None, ge=1),
     ai: Optional[int] = Query(0),
     step: Optional[int] = Query(None),
+    page: Optional[int] = Query(None, ge=1),
+    rebuild: Optional[int] = Query(0),
     v: Optional[str] = Query(None),
+    sam_refine: Optional[int] = Query(0),
+    clip_k: Optional[int] = Query(None),
+    fast_map: Optional[int] = Query(0),
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
@@ -3456,6 +5288,8 @@ def instruction_buildability(
         bag_number,
         ai_enabled=int(ai or 0) == 1,
         step_filter=step,
+        page_filter=page,
+        rebuild=int(rebuild or 0) == 1,
     )
     manual_pages = _build_manual_crop_pages(str(set_num), bag_number)
     parts_by_key = {
@@ -3774,6 +5608,12 @@ def instruction_buildability(
     lego_colors_json = json.dumps(lego_colors)
     training_examples_json = json.dumps(training_examples)
     buildability_variant_json = json.dumps(str(v or "").strip())
+    _sam_refine_flag = 1 if int(sam_refine or 0) == 1 else 0
+    _clip_k_val = max(1, min(200, int(clip_k))) if clip_k is not None else 5
+    _fast_map_flag = 1 if int(fast_map or 0) == 1 else 0
+    sam_refine_json = json.dumps(_sam_refine_flag)
+    clip_k_json = json.dumps(_clip_k_val)
+    fast_map_json = json.dumps(_fast_map_flag)
     html = f"""
     <!doctype html>
     <html>
@@ -4142,6 +5982,39 @@ def instruction_buildability(
           color: #9b5b09;
           font-weight: 800;
         }}
+        .ai-snap-debug {{
+          margin-top: 8px;
+          display: flex;
+          gap: 10px;
+          align-items: flex-start;
+          flex-wrap: wrap;
+        }}
+        .ai-snap-debug-figure {{
+          margin: 0;
+          font-size: 11px;
+          color: #627283;
+        }}
+        .ai-snap-debug-figure img {{
+          display: block;
+          width: 82px;
+          max-height: 82px;
+          object-fit: contain;
+          border: 1px solid #d6dee8;
+          border-radius: 8px;
+          background-color: #fff;
+          background-image:
+            linear-gradient(45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(-45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #edf1f5 75%),
+            linear-gradient(-45deg, transparent 75%, #edf1f5 75%);
+          background-size: 14px 14px;
+          background-position: 0 0, 0 7px, 7px -7px, -7px 0;
+        }}
+        .ai-snap-debug-figure figcaption {{
+          margin-top: 4px;
+          max-width: 82px;
+          word-break: break-word;
+        }}
         .suggested-part-actions {{
           margin-top: 10px;
           display: flex;
@@ -4201,6 +6074,151 @@ def instruction_buildability(
           border-color: #7db28a;
           color: #2f6c41;
         }}
+        .picker-slot-mask {{
+          margin-top: 4px;
+          display: flex;
+          justify-content: center;
+        }}
+        .picker-slot-mask img {{
+          width: 54px;
+          height: 54px;
+          object-fit: contain;
+          border: 1px solid #d6dee8;
+          border-radius: 8px;
+          background-color: #fff;
+          background-image:
+            linear-gradient(45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(-45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #edf1f5 75%),
+            linear-gradient(-45deg, transparent 75%, #edf1f5 75%);
+          background-size: 12px 12px;
+          background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+        }}
+        .picker-slot-review {{
+          margin-top: 4px;
+          color: #8a5a00;
+          font-size: 11px;
+        }}
+        .picker-slot-candidates {{
+          display: grid;
+          grid-template-columns: repeat(5, minmax(34px, 1fr));
+          gap: 4px;
+          margin-top: 6px;
+          width: 100%;
+        }}
+        .picker-slot-candidate {{
+          appearance: none;
+          border: 0;
+          background: transparent;
+          padding: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 2px;
+          min-width: 0;
+          color: #536576;
+          font-size: 9px;
+          font-weight: 700;
+          line-height: 1.1;
+        }}
+        .picker-slot-candidate img {{
+          width: 30px;
+          height: 30px;
+          object-fit: contain;
+          border: 1px solid #d6dee8;
+          border-radius: 6px;
+          background: #fff;
+        }}
+        .picker-slot-candidate span {{
+          max-width: 42px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }}
+        .picker-slot-debug {{
+          margin-top: 6px;
+          color: #6c7c8d;
+          font-size: 9px;
+          font-weight: 600;
+          line-height: 1.2;
+          text-align: left;
+          word-break: break-word;
+          max-width: 150px;
+        }}
+        .picker-slot-color {{
+          display: block;
+          font-size: 10px;
+          color: #555;
+          margin-top: 2px;
+          line-height: 1.3;
+        }}
+        .picker-slot-color-swatch {{
+          display: inline-block;
+          width: 10px;
+          height: 10px;
+          border: 1px solid #999;
+          border-radius: 2px;
+          vertical-align: middle;
+          margin-right: 3px;
+        }}
+        .picker-slot-low-alpha {{
+          display: block;
+          background: #fff3cd;
+          color: #856404;
+          font-size: 10px;
+          padding: 1px 4px;
+          border-radius: 3px;
+          margin-top: 2px;
+        }}
+        .picker-slot-confidence {{
+          display: block;
+          font-size: 10px;
+          font-weight: 600;
+          margin-top: 2px;
+        }}
+        .picker-slot-confidence-high {{ color: #155724; }}
+        .picker-slot-confidence-medium {{ color: #856404; }}
+        .picker-slot-confidence-low {{ color: #721c24; }}
+        .picker-slot-btn.predicted {{
+          border-color: #fd7e14;
+        }}
+        .picker-slot-predicted {{
+          display: block;
+          margin-top: 4px;
+          padding: 3px 5px;
+          background: #fff3cd;
+          border: 1px solid #ffc107;
+          border-radius: 3px;
+          color: #856404;
+          font-size: 0.7em;
+          line-height: 1.3;
+          word-break: break-all;
+        }}
+        .picker-slot-predicted-actions {{
+          display: flex;
+          gap: 4px;
+          margin-top: 3px;
+        }}
+        .predicted-accept-btn,
+        .predicted-reject-btn {{
+          border: 1px solid transparent;
+          border-radius: 3px;
+          cursor: pointer;
+          font-size: 0.72em;
+          padding: 2px 7px;
+        }}
+        .predicted-accept-btn {{
+          background: #d4edda;
+          border-color: #c3e6cb;
+          color: #155724;
+        }}
+        .predicted-accept-btn:hover {{ background: #c3e6cb; }}
+        .predicted-reject-btn {{
+          background: #f8d7da;
+          border-color: #f5c6cb;
+          color: #721c24;
+        }}
+        .predicted-reject-btn:hover {{ background: #f5c6cb; }}
         .picker-slot-name {{
           font-size: 12px;
           font-weight: 700;
@@ -4707,6 +6725,8 @@ def instruction_buildability(
                     </div>
                     <div class="picker-slot-toolbar">
                       <button type="button" class="remove-btn" id="ai-snap-btn" onclick="runAiSnap()">AI Snap</button>
+                      <button type="button" class="remove-btn" id="auto-mask-slots-btn" onclick="runAutoMaskSlots()">Auto Mask Slots</button>
+                      <button type="button" class="remove-btn" id="next-unfilled-btn" onclick="goToNextUnfilledCrop()">Next Unfilled</button>
                       <div id="ai-snap-status" class="save-note"></div>
                     </div>
                   </div>
@@ -4799,6 +6819,10 @@ def instruction_buildability(
           partRecords.map(item => [partKey(item.part_num, item.color_id), item])
         );
         const buildabilityVariant = {buildability_variant_json};
+        const SHOW_SLOT_MATCHES = false;
+        const SAM_REFINE = {sam_refine_json};
+        const SLOT_MATCH_K = {clip_k_json};
+        const FAST_MAP = {fast_map_json};
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
@@ -5209,7 +7233,13 @@ def instruction_buildability(
           }}
 
           const assignedCounts = new Map();
+          const filledBySlotIndex = new Set();
           parts.forEach((part) => {{
+            const explicitSlotIndex = Number(part && part.selected_slot_index);
+            if (Number.isInteger(explicitSlotIndex) && explicitSlotIndex >= 0) {{
+              filledBySlotIndex.add(explicitSlotIndex);
+              return;
+            }}
             const signature = qtySlotSignature(part.qty, part.qty_text);
             if (!signature) {{
               return;
@@ -5220,7 +7250,12 @@ def instruction_buildability(
           const consumedCounts = new Map();
           let filledSlots = 0;
           let nextSlot = null;
-          for (const slot of sequence) {{
+          for (let currentIndex = 0; currentIndex < sequence.length; currentIndex += 1) {{
+            const slot = sequence[currentIndex];
+            if (filledBySlotIndex.has(currentIndex)) {{
+              filledSlots += 1;
+              continue;
+            }}
             const signature = qtySlotSignature(slot.qty, slot.qty_text);
             const assignedCount = Number(assignedCounts.get(signature) || 0);
             const consumedCount = Number(consumedCounts.get(signature) || 0);
@@ -5248,6 +7283,15 @@ def instruction_buildability(
           if (!crop || slotState.noQtyDetected || slotState.totalSlots <= 0 || slotState.slotsFull) {{
             return null;
           }}
+          const explicitSlotIndex = Number(crop.ai_snap_selected_slot_index);
+          if (
+            Number.isInteger(explicitSlotIndex)
+            && explicitSlotIndex >= 0
+            && explicitSlotIndex < slotState.totalSlots
+            && explicitSlotIndex >= slotState.filledSlots
+          ) {{
+            return explicitSlotIndex;
+          }}
           return Math.max(0, Math.min(slotState.filledSlots, slotState.totalSlots - 1));
         }}
 
@@ -5264,8 +7308,168 @@ def instruction_buildability(
             : null;
         }}
 
+        function aiSnapArtifactUrl(pathValue, cacheKey = "") {{
+          const path = String(pathValue || "").trim();
+          if (!path) {{
+            return "";
+          }}
+          const version = String(cacheKey || path).trim();
+          return "/debug/ai-snap-artifact?path=" + encodeURIComponent(path)
+            + "&v=" + encodeURIComponent(version || String(Date.now()));
+        }}
+
+        function pathBasename(pathValue) {{
+          const parts = String(pathValue || "").split(/[\\\\/]/).filter(Boolean);
+          return parts.length ? parts[parts.length - 1] : "";
+        }}
+
+        function formatDebugBox(box) {{
+          if (Array.isArray(box)) {{
+            return box.map((value) => Number(value) || 0).join(",");
+          }}
+          if (box && typeof box === "object") {{
+            return [
+              Number(box.x) || 0,
+              Number(box.y) || 0,
+              Number(box.w) || 0,
+              Number(box.h) || 0
+            ].join(",");
+          }}
+          return "";
+        }}
+
+        function renderSlotMaskDebug(maskSlot) {{
+          if (FAST_MAP) {{
+            return "";
+          }}
+          if (!maskSlot) {{
+            return "";
+          }}
+          const generatedAt = String(maskSlot.generated_at || "");
+          const cutoutBase = String(maskSlot.cutout_basename || pathBasename(maskSlot.part_cutout_path));
+          const sourceBase = String(maskSlot.source_mask_basename || pathBasename(maskSlot.source_mask_path));
+          const cropBase = String(maskSlot.source_crop_basename || pathBasename(maskSlot.source_crop_path));
+          const overlayBase = String(maskSlot.slot_window_overlay_basename || pathBasename(maskSlot.slot_window_overlay_path));
+          return '<span class="picker-slot-debug">'
+            + 'slot_index: ' + escapeHtml(String(maskSlot.slot_index ?? "")) + '<br/>'
+            + 'path: ' + escapeHtml(String(maskSlot.function_path_used || "")) + '<br/>'
+            + 'source crop: ' + escapeHtml(cropBase) + '<br/>'
+            + 'master mask: ' + escapeHtml(String(maskSlot.master_mask_basename || sourceBase)) + '<br/>'
+            + 'qty_box: ' + escapeHtml(formatDebugBox(maskSlot.qty_box || maskSlot.qty_token_box)) + '<br/>'
+            + 'slot_window: ' + escapeHtml(formatDebugBox(maskSlot.slot_window || maskSlot.slot_crop_box)) + '<br/>'
+            + 'cutout: ' + escapeHtml(cutoutBase) + '<br/>'
+            + 'cutout size: ' + escapeHtml(formatDebugBox(maskSlot.actual_saved_cutout_size)) + '<br/>'
+            + 'alpha bbox: ' + escapeHtml(formatDebugBox(maskSlot.non_transparent_bbox)) + '<br/>'
+            + 'alpha pixels: ' + escapeHtml(String(maskSlot.alpha_pixel_count ?? "")) + '<br/>'
+            + 'generated_at: ' + escapeHtml(generatedAt) + '<br/>'
+            + 'using_master_mask: ' + escapeHtml(String(Boolean(maskSlot.using_master_mask))) + '<br/>'
+            + 'overwritten: ' + escapeHtml(String(Boolean(maskSlot.existing_file_overwritten))) + '<br/>'
+            + 'reused: ' + escapeHtml(String(Boolean(maskSlot.existing_file_reused))) + '<br/>'
+            + 'candidate before save: ' + escapeHtml(String(Boolean(maskSlot.candidate_matching_started_before_cutout_save))) + '<br/>'
+            + 'candidate after save: ' + escapeHtml(String(maskSlot.candidate_matching_started_after_cutout_save ?? "")) + '<br/>'
+            + 'slot overlay: ' + escapeHtml(overlayBase)
+            + '</span>';
+        }}
+
+        function renderSlotMaskCandidates(maskSlot) {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return "";
+          }}
+          const candidates = Array.isArray(maskSlot && maskSlot.ranked_candidates)
+            ? maskSlot.ranked_candidates
+            : [];
+          if (!candidates.length) {{
+            if (maskSlot && maskSlot.candidates_loading) {{
+              return '<span class="picker-slot-review">matching...</span>';
+            }}
+            if (maskSlot && maskSlot.candidates_error) {{
+              return '<span class="picker-slot-review">' + escapeHtml(String(maskSlot.candidates_error)) + '</span>';
+            }}
+            return "";
+          }}
+          return '<span class="picker-slot-candidates">' + candidates.slice(0, SLOT_MATCH_K).map((candidate) => {{
+            const imageUrl = String(candidate && (candidate.image_url || candidate.img_url || "") || "");
+            const confidence = Number(candidate && candidate.confidence);
+            const label = String(candidate && candidate.part_num || "") + ":" + String(candidate && candidate.color_id || "");
+            return '<span role="button" tabindex="0" class="picker-slot-candidate" data-slot-suggestion="true" data-slot-index="' + escapeHtml(String(maskSlot.slot_index ?? "")) + '" data-part-num="' + escapeHtml(String(candidate && candidate.part_num || "")) + '" data-color-id="' + escapeHtml(String(candidate && candidate.color_id || 0)) + '" data-element-id="' + escapeHtml(String(candidate && candidate.element_id || "")) + '" data-color-name="' + escapeHtml(String(candidate && candidate.color_name || "")) + '" title="' + escapeHtml(label + (Number.isFinite(confidence) ? " " + confidence.toFixed(2) : "")) + '">'
+              + (imageUrl ? '<img src="' + escapeHtml(imageUrl) + '" alt="' + escapeHtml(label) + '" loading="lazy" />' : '')
+              + '<span>' + escapeHtml(label) + '</span>'
+              + '</span>';
+          }}).join("") + '</span>';
+        }}
+
+        function confirmedPartForSlot(crop, slotIndex) {{
+          const parts = Array.isArray(crop && crop.parts) ? crop.parts : [];
+          const explicit = parts.find((part) => Number(part && part.selected_slot_index) === Number(slotIndex));
+          if (explicit) {{
+            return explicit;
+          }}
+          return Number.isInteger(Number(slotIndex)) && Number(slotIndex) >= 0 && Number(slotIndex) < parts.length
+            ? parts[Number(slotIndex)]
+            : null;
+        }}
+
+        function renderFullCropMaskDebug(crop) {{
+          const cacheKey = String(crop && crop.full_crop_mask_generated_at || "");
+          const maskUrl = aiSnapArtifactUrl(crop && crop.full_crop_mask_path, cacheKey);
+          const overlayUrl = aiSnapArtifactUrl(crop && crop.full_crop_mask_overlay_path, cacheKey);
+          if (!maskUrl && !overlayUrl) {{
+            return "";
+          }}
+          return `
+            <div class="ai-snap-debug">
+              ${{maskUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(maskUrl)}}" alt="Full crop mask" loading="lazy" />
+                  <figcaption>full crop mask</figcaption>
+                </figure>
+              ` : ""}}
+              ${{overlayUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(overlayUrl)}}" alt="Full crop mask overlay" loading="lazy" />
+                  <figcaption>full crop mask overlay</figcaption>
+                </figure>
+              ` : ""}}
+            </div>
+          `;
+        }}
+
+        function renderAiSnapArtifactDebug(result) {{
+          const debug = result && result.debug ? result.debug : {{}};
+          const cacheKey = String(debug.generated_at || debug.ai_snap_input_path || "");
+          const cutoutUrl = aiSnapArtifactUrl(debug.part_cutout_path, cacheKey);
+          const maskUrl = aiSnapArtifactUrl(debug.shape_mask_path, cacheKey);
+          if (!cutoutUrl && !maskUrl) {{
+            return "";
+          }}
+          return `
+            <div class="ai-snap-debug">
+              <div class="ai-snap-debug-figure">
+                <figcaption>
+                  selected slot: ${{escapeHtml(String(debug.selected_slot_index ?? ""))}}<br/>
+                  cutout slot: ${{escapeHtml(String(debug.cutout_slot_index ?? ""))}}<br/>
+                  mask slot: ${{escapeHtml(String(debug.mask_slot_index ?? ""))}}
+                </figcaption>
+              </div>
+              ${{cutoutUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(cutoutUrl)}}" alt="AI Snap part cutout" loading="lazy" />
+                  <figcaption>part cutout</figcaption>
+                </figure>
+              ` : ""}}
+              ${{maskUrl ? `
+                <figure class="ai-snap-debug-figure">
+                  <img src="${{escapeHtml(maskUrl)}}" alt="AI Snap shape mask" loading="lazy" />
+                  <figcaption>shape mask</figcaption>
+                </figure>
+              ` : ""}}
+            </div>
+          `;
+        }}
+
         function renderAiSnapStatus(crop) {{
           const button = document.getElementById("ai-snap-btn");
+          const autoMaskButton = document.getElementById("auto-mask-slots-btn");
           const status = document.getElementById("ai-snap-status");
           if (!button || !status) {{
             return;
@@ -5274,32 +7478,47 @@ def instruction_buildability(
           const aiSnapResult = activeAiSnapResultForCrop(crop);
           if (!crop) {{
             button.disabled = true;
+            button.style.display = SHOW_SLOT_MATCHES ? "" : "none";
+            if (autoMaskButton) {{
+              autoMaskButton.disabled = true;
+            }}
             button.textContent = "AI Snap";
             status.textContent = "Select a crop to rank the current open slot.";
             return;
           }}
           if (crop.ai_snap_loading) {{
             button.disabled = true;
+            button.style.display = SHOW_SLOT_MATCHES ? "" : "none";
+            if (autoMaskButton) {{
+              autoMaskButton.disabled = true;
+            }}
             button.textContent = "AI Snap...";
             status.textContent = "Ranking remaining candidates for this slot...";
             return;
           }}
           button.textContent = "AI Snap";
+          button.style.display = SHOW_SLOT_MATCHES ? "" : "none";
           button.disabled = slotIndex === null;
+          if (autoMaskButton) {{
+            autoMaskButton.disabled = Boolean(crop.auto_mask_loading) || !Array.isArray(buildClientQtySequence(crop)) || buildClientQtySequence(crop).length === 0;
+            autoMaskButton.textContent = crop.auto_mask_loading ? "Masking..." : "Auto Mask Slots";
+          }}
           if (slotIndex === null) {{
             status.textContent = "No open slot available for AI Snap.";
             return;
           }}
           if (crop.ai_snap_error) {{
-            status.textContent = String(crop.ai_snap_error);
+            status.innerHTML = escapeHtml(String(crop.ai_snap_error)) + renderFullCropMaskDebug(crop);
             return;
           }}
-          if (aiSnapResult && Array.isArray(aiSnapResult.ranked_candidates)) {{
-            status.textContent = "AI Snap ranked " + aiSnapResult.ranked_candidates.length + " candidates for slot " + (slotIndex + 1)
-              + (aiSnapResult.model ? " using " + aiSnapResult.model : "") + ".";
+          if (SHOW_SLOT_MATCHES && aiSnapResult && Array.isArray(aiSnapResult.ranked_candidates)) {{
+            status.innerHTML = escapeHtml(
+              "AI Snap ranked " + aiSnapResult.ranked_candidates.length + " candidates for slot " + (slotIndex + 1)
+                + (aiSnapResult.model ? " using " + aiSnapResult.model : "") + "."
+            ) + renderAiSnapArtifactDebug(aiSnapResult) + renderFullCropMaskDebug(crop);
             return;
           }}
-          status.textContent = "Run AI Snap for slot " + (slotIndex + 1) + ".";
+          status.innerHTML = escapeHtml("Run AI Snap for slot " + (slotIndex + 1) + ".") + renderFullCropMaskDebug(crop);
         }}
 
         function renderBuildabilitySlots(cropId) {{
@@ -5321,17 +7540,111 @@ def instruction_buildability(
             return;
           }}
           const selectedIndex = currentBuildabilitySlotIndex(crop);
+          const autoMaskSlots = new Map();
+          (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).forEach((slot) => {{
+            autoMaskSlots.set(Number(slot && slot.slot_index), slot);
+          }});
+          // Returns the maskSlot if a confirmed-memory prediction is available and
+          // no confirmed part has been saved for this slot yet.
+          function _maskSlotPrediction(idx) {{
+            const ms = autoMaskSlots.get(Number(idx));
+            return (!confirmedPartForSlot(crop, idx) && ms && ms.predicted_part) ? ms : null;
+          }}
           list.innerHTML = sequence.map((slot, idx) => `
             <button
               type="button"
-              class="picker-slot-btn${{idx < slotState.filledSlots ? " assigned" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
+              class="picker-slot-btn${{confirmedPartForSlot(crop, idx) ? " assigned" : ""}}${{_maskSlotPrediction(idx) ? " predicted" : ""}}${{selectedIndex !== null && idx === selectedIndex ? " selected" : ""}}"
               data-picker-slot-index="${{idx}}"
-              title="${{idx < slotState.filledSlots ? "Filled slot" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot")}}"
+              title="${{confirmedPartForSlot(crop, idx) ? "Filled slot" : (_maskSlotPrediction(idx) ? "Predicted slot — accept or reject" : (selectedIndex !== null && idx === selectedIndex ? "Current assignment slot" : "Waiting for earlier slot"))}}"
             >
               <span class="picker-slot-name">Slot ${{idx + 1}}</span>
               <span class="picker-slot-qty">${{escapeHtml(String((slot && (slot.qty_text || slot.qty)) || "none"))}}</span>
+              ${{confirmedPartForSlot(crop, idx) ? '<span class="picker-slot-review">confirmed: ' + escapeHtml(String(confirmedPartForSlot(crop, idx).part_num || "")) + ':' + escapeHtml(String(confirmedPartForSlot(crop, idx).color_id || "")) + '</span>' : ''}}
+              ${{(() => {{
+                const maskSlot = autoMaskSlots.get(Number(idx));
+                const cutoutUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.part_cutout_path, maskSlot.generated_at) : "";
+                const slotOverlayUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.slot_window_overlay_path, maskSlot.generated_at) : "";
+                // Predicted badge — shown only when no confirmed part exists for this slot.
+                const predSlot = _maskSlotPrediction(idx);
+                const predictedHtml = predSlot
+                  ? '<span class="picker-slot-predicted">'
+                    + 'predicted: ' + escapeHtml(String(predSlot.predicted_part.part_num || ""))
+                    + ':' + escapeHtml(String(predSlot.predicted_part.color_id || ""))
+                    + ' • sim ' + escapeHtml(String((predSlot.prediction_similarity || 0).toFixed(2)))
+                    + '<span class="picker-slot-predicted-actions">'
+                    + '<button type="button" class="predicted-accept-btn" onclick="acceptPredictedSlot(event,' + idx + ')">Accept</button>'
+                    + '<button type="button" class="predicted-reject-btn" onclick="rejectSlotPrediction(event,' + idx + ')">Reject</button>'
+                    + '</span>'
+                    + '</span>'
+                  : '';
+                let colorHtml = "";
+                if (maskSlot && maskSlot.slot_rgb_median) {{
+                  const [r, g, b] = maskSlot.slot_rgb_median;
+                  const colorMatch = closestLegoColorId({{r, g, b}});
+                  const colorName = (colorMatch && colorMatch.color_name) || String((colorMatch && colorMatch.color_id) || "");
+                  const dist = (colorMatch && Number.isFinite(colorMatch.distance)) ? colorMatch.distance.toFixed(0) : "";
+                  colorHtml = '<span class="picker-slot-color">'
+                    + '<span class="picker-slot-color-swatch" style="background:rgb(' + r + ',' + g + ',' + b + ')"></span>'
+                    + escapeHtml(colorName) + (dist ? " (" + dist + ")" : "")
+                    + '</span>';
+                }}
+                let lowAlphaHtml = "";
+                if (maskSlot && String(maskSlot.status || "") === "needs_review_low_alpha") {{
+                  lowAlphaHtml = '<span class="picker-slot-low-alpha">⚠ low alpha</span>';
+                }}
+                let confidenceHtml = "";
+                if (maskSlot && maskSlot.slot_confidence) {{
+                  const conf = String(maskSlot.slot_confidence);
+                  confidenceHtml = '<span class="picker-slot-confidence picker-slot-confidence-' + escapeHtml(conf) + '">Confidence: ' + escapeHtml(conf) + '</span>';
+                }}
+                if (cutoutUrl) {{
+                  return '<span class="picker-slot-mask"><img src="' + escapeHtml(cutoutUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' cutout" loading="lazy" /></span>'
+                    + (slotOverlayUrl ? '<span class="picker-slot-mask"><img src="' + escapeHtml(slotOverlayUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' window overlay" loading="lazy" /></span>' : '')
+                    + renderSlotMaskDebug(maskSlot)
+                    + renderSlotMaskCandidates(maskSlot)
+                    + predictedHtml
+                    + colorHtml + lowAlphaHtml + confidenceHtml;
+                }}
+                if (maskSlot && String(maskSlot.status || "") === "needs_review") {{
+                  return '<span class="picker-slot-review">needs review</span>'
+                    + (slotOverlayUrl ? '<span class="picker-slot-mask"><img src="' + escapeHtml(slotOverlayUrl) + '" alt="Slot ' + escapeHtml(String(idx + 1)) + ' window overlay" loading="lazy" /></span>' : '')
+                    + renderSlotMaskDebug(maskSlot)
+                    + predictedHtml
+                    + colorHtml + lowAlphaHtml + confidenceHtml;
+                }}
+                return predictedHtml + colorHtml + lowAlphaHtml + confidenceHtml;
+              }})()}}
             </button>
           `).join("");
+          list.querySelectorAll("[data-picker-slot-index]").forEach((button) => {{
+            button.addEventListener("click", () => {{
+              const nextIndex = Number(button.dataset.pickerSlotIndex);
+              if (!Number.isInteger(nextIndex) || nextIndex < slotState.filledSlots || nextIndex >= slotState.totalSlots) {{
+                return;
+              }}
+              crop.ai_snap_selected_slot_index = nextIndex;
+              if (crop.ai_snap_result && Number(crop.ai_snap_result.slot_index) !== Number(nextIndex)) {{
+                crop.ai_snap_result = null;
+              }}
+              crop.ai_snap_error = "";
+              renderBuildabilitySlots(crop.crop_id);
+              renderSuggestedParts(crop.crop_id);
+            }});
+          }});
+          list.querySelectorAll("[data-slot-suggestion]").forEach((el) => {{
+            el.addEventListener("click", (event) => {{
+              event.stopPropagation();
+              acceptSlotSuggestion(event, el);
+            }});
+            el.addEventListener("keydown", (event) => {{
+              if (event.key !== "Enter" && event.key !== " ") {{
+                return;
+              }}
+              event.preventDefault();
+              event.stopPropagation();
+              acceptSlotSuggestion(event, el);
+            }});
+          }});
           renderAiSnapStatus(crop);
         }}
 
@@ -5349,6 +7662,7 @@ def instruction_buildability(
             img_url: part.img_url || meta.img_url || "",
             qty: part.qty ?? null,
             qty_text: part.qty_text ?? null,
+            selected_slot_index: Number.isInteger(Number(part.selected_slot_index)) ? Number(part.selected_slot_index) : null,
             part_bbox: Array.isArray(part.part_bbox) ? part.part_bbox : null,
             confidence: part.confidence ?? null,
             selected_qty_label: part.selected_qty_label || selectedQtyLabel(part.qty, part.qty_text)
@@ -5488,6 +7802,26 @@ def instruction_buildability(
           if (nextCropId) {{
             selectCrop(nextCropId);
           }}
+        }}
+
+        function nextUnfilledCropId(fromCropId) {{
+          const ids = cropRecords
+            .filter((c) => cropMap.has(c.crop_id) && isCropVisibleInCurrentView(c))
+            .map((c) => c.crop_id);
+          const start = ids.indexOf(String(fromCropId));
+          for (let i = start + 1; i < ids.length; i++) {{
+            const c = cropMap.get(ids[i]);
+            if (!c) continue;
+            const st = computeCropSlotState(c);
+            if (!st.noQtyDetected && st.filledSlots < st.totalSlots) return ids[i];
+          }}
+          return null;
+        }}
+
+        function goToNextUnfilledCrop() {{
+          const nxt = nextUnfilledCropId(activeCropId);
+          if (nxt) selectCrop(nxt);
+          else alert("No unfilled crops remaining.");
         }}
 
         function setShowHiddenCrops(showHidden) {{
@@ -5913,7 +8247,15 @@ def instruction_buildability(
 
         async function renderSuggestedParts(cropId) {{
           const panel = document.getElementById("suggested-parts-grid");
+          const suggestedPanel = document.getElementById("suggested-parts-panel");
+          if (suggestedPanel) {{
+            suggestedPanel.style.display = SHOW_SLOT_MATCHES ? "" : "none";
+          }}
           if (!panel) {{
+            return;
+          }}
+          if (!SHOW_SLOT_MATCHES) {{
+            panel.innerHTML = "";
             return;
           }}
           if (!cropId) {{
@@ -6459,6 +8801,9 @@ def instruction_buildability(
         }}
 
         async function runAiSnap() {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return;
+          }}
           const crop = activeCropId ? cropMap.get(activeCropId) : null;
           if (!crop) {{
             return;
@@ -6545,6 +8890,137 @@ def instruction_buildability(
           }} finally {{
             crop.ai_snap_loading = false;
             renderAiSnapStatus(crop);
+          }}
+        }}
+
+        async function runAutoMaskSlots() {{
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          crop.auto_mask_loading = true;
+          crop.ai_snap_error = "";
+          renderAiSnapStatus(crop);
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            sam_refine: SAM_REFINE,
+            fast_map: FAST_MAP,
+          }};
+          try {{
+            const res = await fetch("/debug/auto-mask-slots", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify(payload)
+            }});
+            if (!res.ok) {{
+              let detail = "Auto mask failed";
+              try {{
+                const errorPayload = await res.json();
+                detail = errorPayload.detail || detail;
+              }} catch (_error) {{
+                detail = "Auto mask failed";
+              }}
+              crop.ai_snap_error = detail;
+              crop.auto_mask_slots = [];
+              renderBuildabilitySlots(crop.crop_id);
+              return;
+            }}
+            const result = await res.json();
+            crop.auto_mask_slots = Array.isArray(result && result.slots) ? result.slots : [];
+            crop.full_crop_mask_path = String(result && result.full_crop_mask_path || "");
+            crop.full_crop_mask_overlay_path = String(result && result.full_crop_mask_overlay_path || "");
+            crop.full_crop_mask_error = String(result && result.full_crop_mask_error || "");
+            crop.full_crop_mask_generated_at = String(result && result.generated_at || "");
+            const maskedCount = crop.auto_mask_slots.filter((slot) => String(slot && slot.status || "") === "masked").length;
+            crop.ai_snap_error = "";
+            const status = document.getElementById("ai-snap-status");
+            if (status) {{
+              status.innerHTML = escapeHtml(
+                "Auto masked " + maskedCount + " / " + crop.auto_mask_slots.length + " slots."
+                + (SHOW_SLOT_MATCHES ? " Matching candidates..." : "")
+              )
+                + renderFullCropMaskDebug(crop);
+            }}
+            renderBuildabilitySlots(crop.crop_id);
+            const maskedSlots = crop.auto_mask_slots.filter((slot) => String(slot && slot.status || "") === "masked");
+            if (SHOW_SLOT_MATCHES) {{
+              await Promise.all(maskedSlots.map((slot) => loadSlotMaskCandidates(crop, slot)));
+            }}
+            const readyCount = maskedSlots.filter((slot) => Array.isArray(slot && slot.ranked_candidates)).length;
+            if (status) {{
+              status.innerHTML = escapeHtml(
+                SHOW_SLOT_MATCHES
+                  ? ("Auto masked " + maskedCount + " / " + crop.auto_mask_slots.length + " slots; candidates ready for " + readyCount + ".")
+                  : ("Auto masked " + maskedCount + " / " + crop.auto_mask_slots.length + " slots.")
+              )
+                + renderFullCropMaskDebug(crop);
+            }}
+            renderBuildabilitySlots(crop.crop_id);
+          }} catch (_error) {{
+            crop.ai_snap_error = "Auto mask failed";
+            crop.auto_mask_slots = [];
+            renderBuildabilitySlots(crop.crop_id);
+          }} finally {{
+            crop.auto_mask_loading = false;
+            renderAiSnapStatus(crop);
+          }}
+        }}
+
+        async function loadSlotMaskCandidates(crop, maskSlot) {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return;
+          }}
+          if (!crop || !maskSlot || String(maskSlot.status || "") !== "masked") {{
+            return;
+          }}
+          if (!maskSlot.part_cutout_path || maskSlot.ranked_candidates) {{
+            return;
+          }}
+          maskSlot.candidate_matching_started_at = new Date().toISOString();
+          maskSlot.candidate_matching_started_before_cutout_save = false;
+          maskSlot.candidate_matching_started_after_cutout_save = true;
+          console.log("slot mask candidate matching started", {{
+            crop_id: crop.crop_id,
+            slot_index: Number(maskSlot.slot_index),
+            generated_at: String(maskSlot.generated_at || ""),
+            started_at: maskSlot.candidate_matching_started_at,
+            cutout_path: String(maskSlot.part_cutout_path || ""),
+            function_path_used: String(maskSlot.function_path_used || "")
+          }});
+          maskSlot.candidates_loading = true;
+          maskSlot.candidates_error = "";
+          renderBuildabilitySlots(crop.crop_id);
+          try {{
+            const res = await fetch("/debug/slot-mask-candidates", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{
+                set_num: {json.dumps(str(set_num))},
+                bag: {bag_number},
+                crop_id: crop.crop_id,
+                slot_index: Number(maskSlot.slot_index),
+                part_cutout_path: String(maskSlot.part_cutout_path || ""),
+                shape_mask_path: String(maskSlot.shape_mask_path || ""),
+                clip_k: SLOT_MATCH_K,
+              }})
+            }});
+            if (!res.ok) {{
+              maskSlot.candidates_error = "match failed";
+              return;
+            }}
+            const result = await res.json();
+            maskSlot.ranked_candidates = Array.isArray(result && result.ranked_candidates)
+              ? result.ranked_candidates
+              : [];
+            maskSlot.candidate_pool_source = String(result && result.candidate_pool_source || "");
+            maskSlot.candidate_count = Number(result && result.candidate_count || 0);
+          }} catch (_error) {{
+            maskSlot.candidates_error = "match failed";
+          }} finally {{
+            maskSlot.candidates_loading = false;
+            renderBuildabilitySlots(crop.crop_id);
           }}
         }}
 
@@ -7196,6 +9672,196 @@ def instruction_buildability(
         async function addSuggestedPart(event, partNum, colorId, elementId, colorName) {{
           event.stopPropagation();
           await selectTile(partNum, colorId, elementId, colorName);
+        }}
+
+        async function acceptSlotSuggestion(event, el) {{
+          if (!SHOW_SLOT_MATCHES) {{
+            return;
+          }}
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop || !el || !el.dataset) {{
+            return;
+          }}
+          const slotIndex = Number(el.dataset.slotIndex);
+          const sequence = buildClientQtySequence(crop);
+          const slot = Number.isInteger(slotIndex) ? sequence[slotIndex] : null;
+          if (!slot) {{
+            return;
+          }}
+          const partNum = String(el.dataset.partNum || "");
+          const colorId = Number(el.dataset.colorId || 0);
+          const elementId = String(el.dataset.elementId || "");
+          const colorName = String(el.dataset.colorName || "");
+          const maskSlotForSave = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          const aiSnapInputPath = (maskSlotForSave && maskSlotForSave.part_cutout_path) || null;
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.qty_numbers,
+            crop_qty_text: crop.qty_text,
+            crop_box: crop.crop_box,
+            crop_box_format: crop.crop_box_format,
+            crop_image_path: crop.crop_image_path,
+            crop_confidence: crop.confidence,
+            part_num: partNum,
+            color_id: colorId,
+            color_name: colorName || null,
+            element_id: elementId || null,
+            ai_snap_input_path: aiSnapInputPath,
+            qty: slot.qty ?? null,
+            qty_text: slot.qty_text || null,
+            selected_slot_index: slotIndex,
+            adjustments: [{{ type: "auto_mask_slot_suggestion", slot_index: slotIndex }}],
+            allow_extra_part: true
+          }};
+          const res = await fetch("/debug/save-label", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload)
+          }});
+          const status = document.getElementById("save-status");
+          if (!res.ok) {{
+            let detail = "Save failed";
+            try {{
+              const errorPayload = await res.json();
+              detail = errorPayload.detail || detail;
+            }} catch (_error) {{}}
+            if (status) {{
+              status.textContent = detail;
+            }}
+            return;
+          }}
+          const result = await res.json();
+          syncCropFromResponse(crop, result.crop);
+          const maskSlot = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find((slotItem) => Number(slotItem && slotItem.slot_index) === Number(slotIndex));
+          if (maskSlot) {{
+            maskSlot.accepted_part = {{
+              part_num: partNum,
+              color_id: colorId,
+              element_id: elementId,
+              color_name: colorName,
+            }};
+          }}
+          crop.ai_snap_result = null;
+          crop.ai_snap_error = "";
+          renderAssignedParts(crop.crop_id);
+          renderBuildabilitySlots(crop.crop_id);
+          renderSuggestedParts(crop.crop_id);
+          updatePartTileAssignmentState();
+          if (status) {{
+            status.textContent = "Saved slot " + (slotIndex + 1) + " -> " + partNum + " / color " + colorId;
+          }}
+        }}
+
+        // Accept a confirmed-memory prediction for a slot.
+        // Saves it as a real label then clears predicted_part so the tile
+        // re-renders as confirmed.  Independent of SHOW_SLOT_MATCHES.
+        async function acceptPredictedSlot(event, slotIndex) {{
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          const maskSlot = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          if (!maskSlot || !maskSlot.predicted_part) {{
+            return;
+          }}
+          const p = maskSlot.predicted_part;
+          const sequence = buildClientQtySequence(crop);
+          const seqSlot = Number.isInteger(Number(slotIndex)) ? sequence[Number(slotIndex)] : null;
+          if (!seqSlot) {{
+            return;
+          }}
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.qty_numbers,
+            crop_qty_text: crop.qty_text,
+            crop_box: crop.crop_box,
+            crop_box_format: crop.crop_box_format,
+            crop_image_path: crop.crop_image_path,
+            crop_confidence: crop.confidence,
+            part_num: String(p.part_num || ""),
+            color_id: Number(p.color_id || 0),
+            color_name: p.color_name || null,
+            element_id: p.element_id || null,
+            ai_snap_input_path: maskSlot.part_cutout_path || null,
+            qty: seqSlot.qty ?? null,
+            qty_text: seqSlot.qty_text || null,
+            selected_slot_index: Number(slotIndex),
+            adjustments: [{{
+              type: "predicted_from_confirmed",
+              slot_index: Number(slotIndex),
+              similarity: maskSlot.prediction_similarity || 0,
+            }}],
+            allow_extra_part: true,
+          }};
+          const res = await fetch("/debug/save-label", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+          }});
+          const status = document.getElementById("save-status");
+          if (!res.ok) {{
+            let detail = "Save failed";
+            try {{
+              const errPayload = await res.json();
+              detail = errPayload.detail || detail;
+            }} catch (_err) {{}}
+            if (status) {{
+              status.textContent = detail;
+            }}
+            return;
+          }}
+          const result = await res.json();
+          syncCropFromResponse(crop, result.crop);
+          // Clear the prediction so the slot now renders as confirmed.
+          maskSlot.predicted_part = null;
+          maskSlot.prediction_source = null;
+          maskSlot.prediction_similarity = null;
+          renderAssignedParts(crop.crop_id);
+          renderBuildabilitySlots(crop.crop_id);
+          updatePartTileAssignmentState();
+          if (status) {{
+            status.textContent = "Accepted prediction: slot " + (Number(slotIndex) + 1)
+              + " → " + String(p.part_num || "") + " / color " + Number(p.color_id || 0);
+          }}
+        }}
+
+        // Dismiss a confirmed-memory prediction without saving.
+        function rejectSlotPrediction(event, slotIndex) {{
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const crop = activeCropId ? cropMap.get(activeCropId) : null;
+          if (!crop) {{
+            return;
+          }}
+          const maskSlot = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          if (!maskSlot) {{
+            return;
+          }}
+          maskSlot.predicted_part = null;
+          maskSlot.prediction_source = null;
+          maskSlot.prediction_similarity = null;
+          renderBuildabilitySlots(crop.crop_id);
         }}
 
         async function selectTile(partNum, colorId, elementId, colorName) {{

@@ -811,6 +811,8 @@ def _detect_callout_box_candidate_specs(
         step_h = int(anchor.get("h", 0) or 0)
         step_center_x = step_x + (step_w // 2)
         step_top_y = step_y
+        step_bottom_y = step_y + step_h
+        step_left_x = step_x
         region_img = page_analyzer.crop(img, region_coords)
         if region_img is None or region_img.size == 0:
             continue
@@ -1191,6 +1193,7 @@ def _detect_callout_box_candidate_specs(
             token_cy = int(token.get("cy", ty + (th // 2)) or 0)
 
             local_best: Optional[Dict[str, Any]] = None
+            used_fallback_seed = False
             proposal_specs = [
                 [
                     max(0, tx - max(165, tw * 10)),
@@ -1246,20 +1249,47 @@ def _detect_callout_box_candidate_specs(
                         continue
                     if local_best is None or float(validated["score"]) > float(local_best["score"]):
                         local_best = validated
+                        used_fallback_seed = False
 
             if local_best is None:
-                fallback_box = _clamp_contact_sheet_box(
+                local_step_x = max(0, min(pw - 1, step_x - px))
+                local_step_y = max(0, min(ph - 1, step_y - py))
+                fallback_specs = [
                     [
-                        max(0, tx - max(150, tw * 10)),
-                        max(0, ty - max(92, th * 8)),
-                        max(140, tw * 11),
-                        max(108, th * 10),
+                        max(0, local_step_x - max(34, tw * 2)),
+                        max(0, local_step_y - max(172, th * 13)),
+                        max(190, tw * 15),
+                        max(130, th * 11),
                     ],
-                    page_width=pw,
-                    page_height=ph,
-                )
-                if fallback_box is not None:
-                    local_best = _validate_local_candidate(fallback_box)
+                    [
+                        max(0, tx - max(168, tw * 11)),
+                        max(0, ty - max(98, th * 8)),
+                        max(170, tw * 13),
+                        max(112, th * 10),
+                    ],
+                ]
+                for fallback_spec in fallback_specs:
+                    fallback_box = _clamp_contact_sheet_box(
+                        fallback_spec,
+                        page_width=pw,
+                        page_height=ph,
+                    )
+                    if fallback_box is None:
+                        continue
+                    fallback_validated = _validate_local_candidate(fallback_box)
+                    if fallback_validated is None:
+                        continue
+                    fallback_abs_box = list(fallback_validated.get("abs_box", []) or [])
+                    if len(fallback_abs_box) < 4:
+                        continue
+                    fallback_bottom = int(fallback_abs_box[1]) + int(fallback_abs_box[3])
+                    fallback_left = int(fallback_abs_box[0])
+                    bottom_left_distance = abs(int(step_left_x) - fallback_left) + abs(int(step_bottom_y) - fallback_bottom)
+                    fallback_score = float(fallback_validated.get("score", 0.0) or 0.0) - (float(bottom_left_distance) / 640.0)
+                    if local_best is None or fallback_score > float(local_best.get("score", 0.0) or 0.0):
+                        local_best = fallback_validated
+                        local_best["score"] = fallback_score
+                        used_fallback_seed = True
 
             if local_best is None:
                 _append_rejection(
@@ -1306,9 +1336,11 @@ def _detect_callout_box_candidate_specs(
                 continue
 
             box_bottom = abs_box[1] + abs_box[3]
+            box_left = abs_box[0]
             box_center_x = abs_box[0] + (abs_box[2] // 2)
             vertical_gap = abs(step_top_y - box_bottom)
             horizontal_gap = abs(step_center_x - box_center_x)
+            bottom_left_distance = abs(step_left_x - box_left) + abs(step_bottom_y - box_bottom)
             above_step = box_bottom <= (step_top_y + 26)
             if not above_step and abs_box[1] > (step_top_y + 90):
                 _append_rejection(region, abs_box, "too_far_below_step")
@@ -1318,6 +1350,7 @@ def _detect_callout_box_candidate_specs(
             candidate_score += (1.2 if above_step else 0.0)
             candidate_score -= (vertical_gap / 120.0)
             candidate_score -= (horizontal_gap / 480.0)
+            candidate_score -= (bottom_left_distance / 720.0)
 
             candidate_specs.append(
                 {
@@ -1332,11 +1365,15 @@ def _detect_callout_box_candidate_specs(
                     "step_anchor": anchor,
                     "search_zone": region_coords,
                     "above_step_preferred": above_step,
+                    "fallback_seed_used": bool(used_fallback_seed),
+                    "bottom_left_distance": float(bottom_left_distance),
                     "distance_score": vertical_gap + (horizontal_gap * 0.35),
                 }
             )
 
     best_candidates: List[Dict[str, Any]] = []
+    fallback_candidates: List[Dict[str, Any]] = []
+    used_fallback_steps: set = set()
     for region in search_regions:
         region_step = int(region.get("step_number", 0) or 0)
         region_anchor = dict(region.get("anchor", {}) or {})
@@ -1349,19 +1386,116 @@ def _detect_callout_box_candidate_specs(
             and int((item.get("step_anchor", {}) or {}).get("y", -1) or -1)
             == int(region_anchor.get("y", -2) or -2)
         ]
-        if not matching:
-            continue
-        matching = sorted(
-            matching,
-            key=lambda item: (
-                0 if bool(item.get("above_step_preferred")) else 1,
-                float(item.get("distance_score", 99999.0) or 99999.0),
-                -float(item.get("candidate_score", 0.0) or 0.0),
-            ),
-        )
-        best_candidates.append(matching[0])
-        for rejected in matching[1:]:
-            _append_rejection(region, list(rejected.get("coords", []) or []), "not_nearest_to_step")
+        if matching:
+            matching = sorted(
+                matching,
+                key=lambda item: (
+                    0 if bool(item.get("above_step_preferred")) else 1,
+                    float(item.get("bottom_left_distance", 99999.0) or 99999.0),
+                    float(item.get("distance_score", 99999.0) or 99999.0),
+                    -float(item.get("candidate_score", 0.0) or 0.0),
+                ),
+            )
+            best_candidates.append(matching[0])
+            for rejected in matching[1:]:
+                _append_rejection(region, list(rejected.get("coords", []) or []), "not_nearest_to_step")
+        else:
+            # --- Fallback: scan a generous region (or full page) for blue callout box near this step anchor ---
+            px, py, pw, ph = [int(value or 0) for value in list(region.get("coords", []) or [0,0,0,0])[:4]]
+            anchor = dict(region.get("anchor", {}) or {})
+            step_x = int(anchor.get("x", 0) or 0)
+            step_y = int(anchor.get("y", 0) or 0)
+            step_w = int(anchor.get("w", 0) or 0)
+            step_h = int(anchor.get("h", 0) or 0)
+            # Use a generous region around the step anchor, or fallback to the whole page if needed
+            fallback_box = _clamp_contact_sheet_box(
+                [
+                    max(0, step_x - 260),
+                    max(0, step_y - 320),
+                    max(340, step_w + 520),
+                    max(220, step_h + 340),
+                ],
+                page_width=page_width,
+                page_height=page_height,
+            )
+            if fallback_box is None:
+                fallback_box = [0, 0, page_width, page_height]
+            region_img = page_analyzer.crop(img, fallback_box)
+            if region_img is not None and region_img.size > 0:
+                hsv = cv2.cvtColor(region_img, cv2.COLOR_BGR2HSV)
+                gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
+                # Find blue-ish regions with pale fill and dark border
+                mask_blue = cv2.inRange(hsv, (82, 20, 120), (132, 140, 255))
+                mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
+                edges = cv2.Canny(gray, 40, 120)
+                contours, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                fallback_found = False
+                for contour in contours:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    if w < 40 or h < 24:
+                        continue
+                    # Check border darkness
+                    border = gray[y:y+h, x:x+w]
+                    if border.size == 0:
+                        continue
+                    mean_val = float(border.mean())
+                    if mean_val > 210.0:
+                        continue
+                    # Check proximity to step anchor
+                    abs_x = fallback_box[0] + x
+                    abs_y = fallback_box[1] + y
+                    center_dist = abs((abs_x + w//2) - (step_x + step_w//2)) + abs((abs_y + h//2) - (step_y + step_h//2))
+                    # Prefer above/beside
+                    above = (abs_y + h) <= (step_y + 26)
+                    if not above and abs_y > (step_y + 90):
+                        continue
+                    # Extract qty tokens in this region
+                    crop_img = page_analyzer.crop(img, [abs_x, abs_y, w, h])
+                    qty_payload = _extract_crop_qty_status(crop_img)
+                    qty_tokens = _extract_qty_tokens_from_image(crop_img)
+                    qty_texts = [re.sub(r"\\s+", "", str(token.get("text", "")).lower()) for token in qty_tokens if str(token.get("text", "")).strip()]
+                    if qty_payload.get("qty") is not None:
+                        qty_texts.append(f"x{int(qty_payload['qty'])}")
+                    qty_texts = sorted(set([t for t in qty_texts if t]))
+                    if not qty_texts:
+                        continue
+                    candidate_score = 1.0
+                    candidate_score += 1.2 if above else 0.0
+                    candidate_score -= (center_dist / 480.0)
+                    fallback_candidates.append({
+                        "step_number": region_step,
+                        "label": "callout_box_fallback",
+                        "coords": [abs_x, abs_y, w, h],
+                        "candidate_origin": "callout_box_fallback",
+                        "qty_text": qty_texts,
+                        "search_region": "fallback_step_anchor_zone",
+                        "candidate_score": candidate_score,
+                        "step_anchor": anchor,
+                        "search_zone": fallback_box,
+                        "above_step_preferred": above,
+                        "fallback_seed_used": True,
+                        "bottom_left_distance": center_dist,
+                        "distance_score": center_dist,
+                    })
+                    fallback_found = True
+                if fallback_found:
+                    used_fallback_steps.add(region_step)
+    # For each step with no candidate, pick best fallback if available
+    for region in search_regions:
+        region_step = int(region.get("step_number", 0) or 0)
+        if region_step in used_fallback_steps:
+            matching = [c for c in fallback_candidates if int(c.get("step_number", 0) or 0) == region_step]
+            if matching:
+                matching = sorted(
+                    matching,
+                    key=lambda item: (
+                        0 if bool(item.get("above_step_preferred")) else 1,
+                        float(item.get("bottom_left_distance", 99999.0) or 99999.0),
+                        float(item.get("distance_score", 99999.0) or 99999.0),
+                        -float(item.get("candidate_score", 0.0) or 0.0),
+                    ),
+                )
+                best_candidates.append(matching[0])
 
     accepted_candidates = sorted(
         _dedupe_callout_candidates(best_candidates),
