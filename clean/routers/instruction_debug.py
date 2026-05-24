@@ -18,6 +18,7 @@ def _filter_invalid_step_anchor_boxes(step_boxes):
 
 import base64
 from html import escape
+import hashlib
 import json
 import os
 import sqlite3
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote as _url_quote
 
 import cv2
 import numpy as np
@@ -57,6 +59,8 @@ from clean.services.instruction_buildability_source import load_instruction_set_
 router = APIRouter()
 
 _PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+_AUTO_MASK_CACHE_DIR = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "auto_mask_cache"
 
 
 def _page_callout_cache_key(set_num: str, page: int) -> Tuple[str, int]:
@@ -2562,6 +2566,56 @@ def _slot_mask_score_candidate(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Auto-mask disk cache — avoids re-running extraction for unchanged crops.
+# Cache key = SHA1(crop_image_bytes + \x00 + canonical_json(qty_token_boxes)).
+# A cached entry is invalidated if any part_cutout_path file is missing.
+# ---------------------------------------------------------------------------
+
+
+def _auto_mask_cache_key(crop_image_bytes: bytes, qty_token_boxes: list) -> str:
+    """Return a hex SHA1 that uniquely identifies this (image, boxes) pair."""
+    _GEOM_KEYS = ("x", "y", "w", "h", "cx", "cy")
+    canonical = json.dumps(
+        sorted(
+            [
+                {k: b[k] for k in _GEOM_KEYS if k in b}
+                for b in qty_token_boxes
+                if isinstance(b, dict)
+            ],
+            key=lambda item: (item.get("y", 0), item.get("x", 0)),
+        )
+    ).encode()
+    return hashlib.sha1(crop_image_bytes + b"\x00" + canonical).hexdigest()
+
+
+def _read_auto_mask_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Load a cached auto-mask result; return None on miss or if any cutout file is gone."""
+    path = _AUTO_MASK_CACHE_DIR / f"{cache_key}.json"
+    if not path.exists():
+        return None
+    try:
+        payload: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        for slot in list(payload.get("slots") or []):
+            cp = str(slot.get("part_cutout_path") or "").strip()
+            if cp and not Path(cp).exists():
+                return None  # stale — cutout deleted; regenerate
+        return payload
+    except Exception:
+        return None
+
+
+def _write_auto_mask_cache(cache_key: str, payload: Dict[str, Any]) -> None:
+    """Persist an auto-mask result to disk; silently swallows write errors."""
+    try:
+        _AUTO_MASK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _AUTO_MASK_CACHE_DIR / f"{cache_key}.json"
+        path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Confirmed-label visual memory — local, deterministic, no FAISS/CLIP needed.
 # ---------------------------------------------------------------------------
 
@@ -2605,6 +2659,7 @@ def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
                     "color_name": str(part.get("color_name") or ""),
                     "source_crop_id": str(crop_id),
                     "source_slot_index": _coerce_int(part.get("selected_slot_index")),
+                    "ai_snap_input_path": ai_snap_path,
                 }
             )
     return memory
@@ -2687,6 +2742,7 @@ def _apply_confirmed_memory_predictions(
             }
             slot["prediction_source"] = "predicted_from_confirmed"
             slot["prediction_similarity"] = round(best_score, 4)
+            slot["prediction_reference_path"] = best_entry.get("ai_snap_input_path", "")
             print(
                 "[confirmed-memory] "
                 f"crop_id={slot.get('slot_index')} slot_index={slot.get('slot_index')} "
@@ -3656,16 +3712,13 @@ def _build_manual_crop_pages(set_num: str, bag: int) -> List[Dict[str, Any]]:
             continue
 
         page_height, page_width = img.shape[:2]
-        try:
-            data_uri = _encode_debug_image_data_uri(img, max_width=1200)
-        except Exception:
-            continue
+        # data_uri intentionally omitted — page images are lazy-loaded via
+        # /debug/ai-snap-artifact when the Manual Crop tab is first opened.
 
         pages.append(
             {
                 "page": int(page),
                 "image_path": str(image_path),
-                "data_uri": data_uri,
                 "width": int(page_width),
                 "height": int(page_height),
             }
@@ -4253,6 +4306,28 @@ def ai_snap_artifact(path: str = Query(...)):
     return FileResponse(str(resolved))
 
 
+@router.get("/debug/manual-page-image")
+def manual_page_image(path: str = Query(...)):
+    """Serve a manual-crop page image (PNG) from inside the debug tree.
+
+    Only paths whose resolved location is under
+    /Users/olly/aim2build-instruction/debug/ are allowed.
+    """
+    requested = Path(str(path or "").strip()).expanduser()
+    allowed_root = Path("/Users/olly/aim2build-instruction/debug").resolve()
+    try:
+        resolved = requested.resolve()
+    except Exception:
+        raise HTTPException(status_code=404, detail="page image not found")
+    if (
+        allowed_root not in resolved.parents
+        or not resolved.exists()
+        or not resolved.is_file()
+    ):
+        raise HTTPException(status_code=404, detail="page image not found")
+    return FileResponse(str(resolved), media_type="image/png")
+
+
 @router.post("/debug/auto-mask-slots")
 async def auto_mask_slots(req: Request):
     data = await req.json()
@@ -4275,18 +4350,30 @@ async def auto_mask_slots(req: Request):
         if isinstance(item, dict)
     ]
     temp_crop_path: Optional[Path] = None
+    cache_hit = False
     try:
         temp_crop_path = _write_ai_snap_temp_crop_image(crop)
         if temp_crop_path is None:
             raise HTTPException(status_code=400, detail="crop image unavailable")
-        result = create_shape_masks_for_callout_slots(
-            str(temp_crop_path),
-            qty_token_boxes,
-            set_num=set_num,
-            bag=int(bag),
-            crop_id=crop_id,
-            desktop_overlays=not fast_map_flag,
-        )
+        # --- Disk cache check ---
+        # Key = SHA1(raw crop bytes + canonical qty_token_boxes geometry).
+        # A cache entry is discarded if any part_cutout_path file is gone.
+        crop_image_bytes = temp_crop_path.read_bytes()
+        _cache_key = _auto_mask_cache_key(crop_image_bytes, qty_token_boxes)
+        _cached = _read_auto_mask_cache(_cache_key)
+        if _cached is not None:
+            result = _cached
+            cache_hit = True
+        else:
+            result = create_shape_masks_for_callout_slots(
+                str(temp_crop_path),
+                qty_token_boxes,
+                set_num=set_num,
+                bag=int(bag),
+                crop_id=crop_id,
+                desktop_overlays=not fast_map_flag,
+            )
+            _write_auto_mask_cache(_cache_key, result)
     finally:
         if temp_crop_path is not None:
             try:
@@ -4294,9 +4381,8 @@ async def auto_mask_slots(req: Request):
             except Exception:
                 pass
 
-    # Optional SAM refinement: runs only when sam_refine=1 is in the request.
-    # The core extraction result is never modified; SAM adds two optional fields.
-    if sam_refine_flag:
+    # Optional SAM refinement: runs only on fresh results (cache already applied it).
+    if sam_refine_flag and not cache_hit:
         for slot in list(result.get("slots") or []):
             if str(slot.get("status") or "") != "masked":
                 continue
@@ -4330,6 +4416,7 @@ async def auto_mask_slots(req: Request):
         "full_crop_mask_error": str(result.get("full_crop_mask_error") or ""),
         "generated_at": str(result.get("generated_at") or ""),
         "error": str(result.get("error") or ""),
+        "cache_hit": cache_hit,
     }
 
 
@@ -5259,6 +5346,8 @@ def instruction_buildability(
     sam_refine: Optional[int] = Query(0),
     clip_k: Optional[int] = Query(None),
     fast_map: Optional[int] = Query(0),
+    show_slot_matches: Optional[int] = Query(0),
+    strong_match_threshold: Optional[float] = Query(0.72),
 ):
     bag_number = int(bag or 1)
     parts_payload = load_instruction_set_parts(set_num)
@@ -5583,9 +5672,9 @@ def instruction_buildability(
             data-image-height="{int(page_item['height'])}"
           >
             <img
-              src="{escape(str(page_item['data_uri']))}"
+              data-lazy-src="{escape('/debug/manual-page-image?path=' + _url_quote(str(page_item['image_path']), safe='') + '&v=1')}"
+              class="manual-page-lazy"
               alt="Full page {int(page_item['page'])}"
-              loading="lazy"
               draggable="false"
             />
             <div class="manual-selection-box" id="manual-selection-box-{int(page_item['page'])}"></div>
@@ -5611,9 +5700,13 @@ def instruction_buildability(
     _sam_refine_flag = 1 if int(sam_refine or 0) == 1 else 0
     _clip_k_val = max(1, min(200, int(clip_k))) if clip_k is not None else 5
     _fast_map_flag = 1 if int(fast_map or 0) == 1 else 0
+    _show_slot_matches_flag = 1 if int(show_slot_matches or 0) == 1 else 0
+    _strong_match_threshold_val = max(0.0, min(1.0, float(strong_match_threshold if strong_match_threshold is not None else 0.72)))
     sam_refine_json = json.dumps(_sam_refine_flag)
     clip_k_json = json.dumps(_clip_k_val)
     fast_map_json = json.dumps(_fast_map_flag)
+    show_slot_matches_json = json.dumps(bool(_show_slot_matches_flag))
+    strong_match_threshold_json = json.dumps(_strong_match_threshold_val)
     html = f"""
     <!doctype html>
     <html>
@@ -5652,6 +5745,48 @@ def instruction_buildability(
           background: #eef5ff;
           border-radius: 12px;
           font-weight: 700;
+        }}
+        /* ── Tab navigation ──────────────────────────────────────── */
+        .tab-bar {{
+          display: flex;
+          gap: 6px;
+          margin-bottom: 14px;
+          border-bottom: 2px solid #d6dee8;
+          padding-bottom: 0;
+        }}
+        .tab-btn {{
+          border: 1px solid transparent;
+          border-bottom: none;
+          background: #f4f7fb;
+          color: #536576;
+          border-radius: 10px 10px 0 0;
+          padding: 8px 20px;
+          font-size: 13px;
+          font-weight: 700;
+          cursor: pointer;
+          position: relative;
+          bottom: -2px;
+          transition: background 0.1s, color 0.1s;
+        }}
+        .tab-btn:hover {{
+          background: #eaf1fb;
+          color: #2f4153;
+        }}
+        .tab-btn.active {{
+          background: #fff;
+          color: #1947a6;
+          border-color: #d6dee8;
+          border-bottom-color: #fff;
+        }}
+        .tab-panel[hidden] {{
+          display: none;
+        }}
+        /* ── Manual-page lazy placeholder ────────────────────────── */
+        .manual-page-lazy {{
+          display: block;
+          width: 100%;
+          background: #f0f4f8;
+          min-height: 120px;
         }}
         .manual-pages-grid {{
           display: grid;
@@ -6121,6 +6256,13 @@ def instruction_buildability(
           font-weight: 700;
           line-height: 1.1;
         }}
+        .picker-slot-candidate.strong {{
+          color: #155724;
+        }}
+        .picker-slot-candidate.weak {{
+          color: #856404;
+          opacity: 0.72;
+        }}
         .picker-slot-candidate img {{
           width: 30px;
           height: 30px;
@@ -6134,6 +6276,10 @@ def instruction_buildability(
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }}
+        .picker-slot-candidate-score {{
+          font-size: 8px;
+          font-weight: 700;
         }}
         .picker-slot-debug {{
           margin-top: 6px;
@@ -6219,6 +6365,27 @@ def instruction_buildability(
           color: #721c24;
         }}
         .predicted-reject-btn:hover {{ background: #f5c6cb; }}
+        .picker-slot-predicted-thumbs {{
+          display: flex;
+          gap: 4px;
+          justify-content: center;
+          margin-bottom: 3px;
+        }}
+        .picker-slot-ref-img {{
+          width: 48px;
+          height: 48px;
+          object-fit: contain;
+          border: 1px solid #ffc107;
+          border-radius: 6px;
+          background-color: #fff;
+          background-image:
+            linear-gradient(45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(-45deg, #edf1f5 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #edf1f5 75%),
+            linear-gradient(-45deg, transparent 75%, #edf1f5 75%);
+          background-size: 12px 12px;
+          background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+        }}
         .picker-slot-name {{
           font-size: 12px;
           font-weight: 700;
@@ -6676,14 +6843,41 @@ def instruction_buildability(
           <div id="save-status" class="save-note"></div>
         </section>
 
-        <section class="panel">
-          <h2>Manual Crop Mode</h2>
-          <p class="save-note">Drag a rectangle on any page, enter the step number, then save the manual crop as training ground truth.</p>
-          <div class="manual-pages-grid">
-            {manual_pages_html}
-          </div>
-        </section>
+        <!-- Tab navigation bar -->
+        <div class="tab-bar" role="tablist">
+          <button
+            type="button"
+            class="tab-btn active"
+            id="tab-btn-mapping"
+            role="tab"
+            aria-selected="true"
+            aria-controls="tab-mapping"
+            onclick="switchTab('mapping')"
+          >Mapping</button>
+          <button
+            type="button"
+            class="tab-btn"
+            id="tab-btn-manual"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tab-manual"
+            onclick="switchTab('manual')"
+          >Manual Crop Mode</button>
+        </div>
 
+        <!-- Tab B: Manual Crop Mode (hidden until activated) -->
+        <div id="tab-manual" class="tab-panel" hidden>
+          <section class="panel">
+            <h2>Manual Crop Mode</h2>
+            <p class="save-note">Drag a rectangle on any page, enter the step number, then save the manual crop as training ground truth.</p>
+            <div class="manual-pages-grid">
+              {manual_pages_html}
+            </div>
+          </section>
+        </div>
+
+        <!-- Tab A: Detected Callout Crops + Part Library (default) -->
+        <div id="tab-mapping" class="tab-panel">
         <section class="panel">
           <div class="crop-panel-head">
             <h2>Detected Callout Crops</h2>
@@ -6782,6 +6976,7 @@ def instruction_buildability(
             {parts_tiles_html}
           </div>
         </section>
+        </div><!-- end #tab-mapping -->
       </div>
 
       <div id="crop-zoom-modal" class="zoom-modal" onclick="closeCropZoom()">
@@ -6819,10 +7014,11 @@ def instruction_buildability(
           partRecords.map(item => [partKey(item.part_num, item.color_id), item])
         );
         const buildabilityVariant = {buildability_variant_json};
-        const SHOW_SLOT_MATCHES = false;
+        const SHOW_SLOT_MATCHES = {show_slot_matches_json};
         const SAM_REFINE = {sam_refine_json};
         const SLOT_MATCH_K = {clip_k_json};
         const FAST_MAP = {fast_map_json};
+        const SLOT_MATCH_STRONG_THRESHOLD = {strong_match_threshold_json};
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
@@ -6834,6 +7030,40 @@ def instruction_buildability(
         let showHiddenCrops = false;
         let colourPickerImage = null;
         let showAllManualColours = false;
+        let manualTabLoaded = false;
+
+        // ── Tab switching ──────────────────────────────────────────────────
+        function activateManualTab() {{
+          if (manualTabLoaded) return;
+          let count = 0;
+          document.querySelectorAll("img.manual-page-lazy").forEach(function(img) {{
+            const lazySrc = img.dataset.lazySrc || "";
+            if (lazySrc) {{
+              img.src = lazySrc;
+              count++;
+            }}
+          }});
+          console.log("manual lazy images loaded", count);
+          manualTabLoaded = true;
+        }}
+
+        function switchTab(name) {{
+          const tabs = ["mapping", "manual"];
+          tabs.forEach(function(t) {{
+            const panel = document.getElementById("tab-" + t);
+            const btn   = document.getElementById("tab-btn-" + t);
+            if (!panel || !btn) return;
+            const active = (t === name);
+            if (active) {{
+              panel.removeAttribute("hidden");
+            }} else {{
+              panel.setAttribute("hidden", "");
+            }}
+            btn.classList.toggle("active", active);
+            btn.setAttribute("aria-selected", active ? "true" : "false");
+          }});
+          if (name === "manual") activateManualTab();
+        }}
 
         function partKey(partNum, colorId) {{
           return String(partNum || "") + "::" + Number(colorId || 0);
@@ -7391,9 +7621,11 @@ def instruction_buildability(
             const imageUrl = String(candidate && (candidate.image_url || candidate.img_url || "") || "");
             const confidence = Number(candidate && candidate.confidence);
             const label = String(candidate && candidate.part_num || "") + ":" + String(candidate && candidate.color_id || "");
-            return '<span role="button" tabindex="0" class="picker-slot-candidate" data-slot-suggestion="true" data-slot-index="' + escapeHtml(String(maskSlot.slot_index ?? "")) + '" data-part-num="' + escapeHtml(String(candidate && candidate.part_num || "")) + '" data-color-id="' + escapeHtml(String(candidate && candidate.color_id || 0)) + '" data-element-id="' + escapeHtml(String(candidate && candidate.element_id || "")) + '" data-color-name="' + escapeHtml(String(candidate && candidate.color_name || "")) + '" title="' + escapeHtml(label + (Number.isFinite(confidence) ? " " + confidence.toFixed(2) : "")) + '">'
+            const isStrong = Number.isFinite(confidence) && confidence >= SLOT_MATCH_STRONG_THRESHOLD;
+            return '<span role="button" tabindex="0" class="picker-slot-candidate ' + (isStrong ? 'strong' : 'weak') + '" data-slot-suggestion="true" data-slot-index="' + escapeHtml(String(maskSlot.slot_index ?? "")) + '" data-part-num="' + escapeHtml(String(candidate && candidate.part_num || "")) + '" data-color-id="' + escapeHtml(String(candidate && candidate.color_id || 0)) + '" data-element-id="' + escapeHtml(String(candidate && candidate.element_id || "")) + '" data-color-name="' + escapeHtml(String(candidate && candidate.color_name || "")) + '" title="' + escapeHtml(label + (Number.isFinite(confidence) ? " " + confidence.toFixed(2) : "") + (isStrong ? " strong" : " weak")) + '">'
               + (imageUrl ? '<img src="' + escapeHtml(imageUrl) + '" alt="' + escapeHtml(label) + '" loading="lazy" />' : '')
               + '<span>' + escapeHtml(label) + '</span>'
+              + (Number.isFinite(confidence) ? '<span class="picker-slot-candidate-score">' + escapeHtml(confidence.toFixed(2)) + (isStrong ? ' strong' : '') + '</span>' : '')
               + '</span>';
           }}).join("") + '</span>';
         }}
@@ -7567,15 +7799,25 @@ def instruction_buildability(
                 // Predicted badge — shown only when no confirmed part exists for this slot.
                 const predSlot = _maskSlotPrediction(idx);
                 const predictedHtml = predSlot
-                  ? '<span class="picker-slot-predicted">'
-                    + 'predicted: ' + escapeHtml(String(predSlot.predicted_part.part_num || ""))
-                    + ':' + escapeHtml(String(predSlot.predicted_part.color_id || ""))
-                    + ' • sim ' + escapeHtml(String((predSlot.prediction_similarity || 0).toFixed(2)))
-                    + '<span class="picker-slot-predicted-actions">'
-                    + '<button type="button" class="predicted-accept-btn" onclick="acceptPredictedSlot(event,' + idx + ')">Accept</button>'
-                    + '<button type="button" class="predicted-reject-btn" onclick="rejectSlotPrediction(event,' + idx + ')">Reject</button>'
-                    + '</span>'
-                    + '</span>'
+                  ? (() => {{
+                      const refPath = String((predSlot && predSlot.prediction_reference_path) || "").trim();
+                      const refUrl = refPath ? aiSnapArtifactUrl(refPath) : "";
+                      const thumbHtml = refUrl
+                        ? '<span class="picker-slot-predicted-thumbs">'
+                          + '<img class="picker-slot-ref-img" src="' + escapeHtml(refUrl) + '" alt="reference" loading="lazy" />'
+                          + '</span>'
+                        : '';
+                      return '<span class="picker-slot-predicted">'
+                        + thumbHtml
+                        + escapeHtml(String(predSlot.predicted_part.part_num || ""))
+                        + ':' + escapeHtml(String(predSlot.predicted_part.color_id || ""))
+                        + ' sim ' + escapeHtml(String((predSlot.prediction_similarity || 0).toFixed(2)))
+                        + '<span class="picker-slot-predicted-actions">'
+                        + '<button type="button" class="predicted-accept-btn" onclick="acceptPredictedSlot(event,' + idx + ')">Accept</button>'
+                        + '<button type="button" class="predicted-reject-btn" onclick="rejectSlotPrediction(event,' + idx + ')">Reject</button>'
+                        + '</span>'
+                        + '</span>';
+                    }})()
                   : '';
                 let colorHtml = "";
                 if (maskSlot && maskSlot.slot_rgb_median) {{
