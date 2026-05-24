@@ -112,6 +112,48 @@ def _catalog_db_path() -> Path:
     return Path("/Users/olly/aim2build-instruction/debug/server_catalog/lego_catalog.db")
 
 
+# ---------------------------------------------------------------------------
+# Persistent crop-detection disk cache
+# Caches the raw output of _build_instruction_callout_crops() (incl. data_uri)
+# so that OCR / step-detection is only re-run when rebuild=1 or cache is absent.
+# ---------------------------------------------------------------------------
+
+def _crop_cache_path(set_num: str, bag: int) -> Path:
+    safe_set = "".join(ch for ch in str(set_num or "").strip() if ch.isalnum() or ch in "-_") or "unknown"
+    safe_bag = max(1, int(bag or 1))
+    return Path("/Users/olly/aim2build-instruction/debug/crop_cache") / f"{safe_set}_bag{safe_bag}.json"
+
+
+def _load_crop_detection_cache(set_num: str, bag: int) -> Optional[List[Dict[str, Any]]]:
+    """Return cached crop list or None if cache is absent / invalid."""
+    path = _crop_cache_path(set_num, bag)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    # Basic validity: every entry must be a dict with a non-empty crop_id.
+    if not all(isinstance(item, dict) and str(item.get("crop_id") or "").strip() for item in data):
+        return None
+    return data
+
+
+def _write_crop_detection_cache(set_num: str, bag: int, crops: List[Dict[str, Any]]) -> None:
+    """Atomically write crop list to disk cache."""
+    path = _crop_cache_path(set_num, bag)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(crops, default=str), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        print(f"[crop-cache] wrote set={set_num} bag={bag} crops={len(crops)}")
+    except Exception as exc:
+        print(f"[crop-cache] write error set={set_num} bag={bag}: {exc}")
+
+
 VALID_CROP_STATUSES = {"good", "bad", "needs_adjust", "hidden"}
 VALID_REVIEW_STATUSES = {"unreviewed", "reviewed", "needs_review"}
 
@@ -2073,7 +2115,7 @@ def _crop_qty_slot_state(crop_record: Dict[str, Any], qty_values: Any, qty_text_
             _coerce_int(part.get("selected_slot_index"))
             for part in parts
         )
-        if slot_index is not None and int(slot_index) >= 0
+        if slot_index is not None and 0 <= int(slot_index) < len(sequence)
     }
     for part in parts:
         if _coerce_int(part.get("selected_slot_index")) is not None:
@@ -2084,26 +2126,28 @@ def _crop_qty_slot_state(crop_record: Dict[str, Any], qty_values: Any, qty_text_
         assigned_counts[signature] = assigned_counts.get(signature, 0) + 1
 
     consumed_counts: Dict[str, int] = {}
-    filled_slots = 0
-    next_slot: Optional[Dict[str, Any]] = None
-    next_qty_index = len(sequence)
+    filled_slot_indices = set(filled_by_slot_index)
     for slot_index, slot in enumerate(sequence):
         if int(slot_index) in filled_by_slot_index:
-            filled_slots += 1
             continue
         signature = _qty_slot_signature(slot.get("qty"), slot.get("qty_text"))
         if signature and assigned_counts.get(signature, 0) > consumed_counts.get(signature, 0):
             consumed_counts[signature] = consumed_counts.get(signature, 0) + 1
-            filled_slots += 1
+            filled_slot_indices.add(int(slot_index))
             continue
-        next_slot = dict(slot)
-        next_qty_index = slot_index
-        break
+
+    next_slot: Optional[Dict[str, Any]] = None
+    next_qty_index = len(sequence)
+    for slot_index, slot in enumerate(sequence):
+        if int(slot_index) not in filled_slot_indices:
+            next_slot = dict(slot)
+            next_qty_index = slot_index
+            break
 
     return {
         "sequence": sequence,
         "total_slots": len(sequence),
-        "filled_slots": filled_slots,
+        "filled_slots": len(filled_slot_indices),
         "slots_full": next_slot is None,
         "no_qty_detected": False,
         "next_slot": next_slot,
@@ -2504,14 +2548,40 @@ def _slot_mask_query_profile(part_cutout_path: Any, shape_mask_path: Any) -> Opt
     return _slot_mask_profile_from_rgba(cutout, mask_override=mask_override)
 
 
+# Module-level cache for candidate part image profiles.
+# Key: "<absolute_path>:<mtime_float>" — mtime ensures stale entries are rebuilt
+# if a file is replaced on disk, while static part images (the common case) are
+# returned immediately on every subsequent call within the same process lifetime.
+_CANDIDATE_PROFILE_CACHE: Dict[str, Any] = {}
+
+
 def _slot_mask_candidate_profile(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     image_path = _slot_mask_resolve_local_image_path(part.get("img_url"))
     if image_path is None:
         return None
+
+    # Build a cache key that incorporates mtime so replaced files are detected.
+    try:
+        cache_key = f"{image_path}:{image_path.stat().st_mtime}"
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        cached = _CANDIDATE_PROFILE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     rgba = _slot_mask_read_rgba(image_path)
     if rgba is None:
         return None
-    return _slot_mask_profile_from_rgba(rgba)
+
+    profile = _slot_mask_profile_from_rgba(rgba)
+    # Only cache successful profiles; failures (None) are not stored so a
+    # transient read error doesn't permanently poison the cache.
+    if profile is not None and cache_key is not None:
+        _CANDIDATE_PROFILE_CACHE[cache_key] = profile
+
+    return profile
 
 
 def _slot_mask_hex_to_bgr(value: Any) -> Optional[np.ndarray]:
@@ -2620,6 +2690,36 @@ def _write_auto_mask_cache(cache_key: str, payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 _CONFIRMED_MEMORY_THRESHOLD = 0.72
+# Lower bar for surfacing memory entries as suggestions (vs. the auto-predict threshold).
+_CONFIRMED_MEMORY_SUGGEST_THRESHOLD = 0.50
+# Max LEGO-colour L2 distance (BGR space, range 0-441) between a memory candidate's confirmed
+# colour and the slot's best colour evidence before the candidate is colour-filtered out.
+# ~110 allows Black ↔ Dark Bluish Gray but rejects Black ↔ Reddish Brown (~145).
+_MEMORY_COLOUR_COMPAT_DISTANCE = 110
+
+# In-process cache for confirmed-memory profiles.
+# Key: "set_num:bag:<labels_mtime>" — rebuilt whenever the labels file changes.
+_CONFIRMED_MEMORY_PROFILE_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _confirmed_label_memory_cached(set_num: str, bag: int) -> List[Dict[str, Any]]:
+    """Return confirmed-memory entries, reusing a cached result when labels are unchanged."""
+    labels_path = _label_store_path(str(set_num), int(bag))
+    try:
+        mtime = str(labels_path.stat().st_mtime) if labels_path.exists() else "0"
+    except OSError:
+        mtime = "0"
+    cache_key = f"{set_num}:{bag}:{mtime}"
+    cached = _CONFIRMED_MEMORY_PROFILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    result = _confirmed_label_memory(set_num, bag)
+    _CONFIRMED_MEMORY_PROFILE_CACHE[cache_key] = result
+    # Evict stale entries for this set+bag so the dict doesn't grow unboundedly.
+    prefix = f"{set_num}:{bag}:"
+    for stale in [k for k in list(_CONFIRMED_MEMORY_PROFILE_CACHE) if k.startswith(prefix) and k != cache_key]:
+        _CONFIRMED_MEMORY_PROFILE_CACHE.pop(stale, None)
+    return result
 
 
 def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
@@ -2634,12 +2734,16 @@ def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
     labels_path = _label_store_path(str(set_num), int(bag))
     labels_payload = _load_existing_labels(labels_path)
     memory: List[Dict[str, Any]] = []
+    total_parts = 0
+    with_snap_path = 0
+    profiles_built = 0
     for crop_id, saved_crop in dict(labels_payload.get("crops") or {}).items():
         if not isinstance(saved_crop, dict):
             continue
         for part in list(saved_crop.get("parts") or []):
             if not isinstance(part, dict):
                 continue
+            total_parts += 1
             part_num = str(part.get("part_num") or "").strip()
             color_id = _coerce_int(part.get("color_id"))
             if not part_num or color_id is None:
@@ -2647,9 +2751,11 @@ def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
             ai_snap_path = str(part.get("ai_snap_input_path") or "").strip()
             if not ai_snap_path:
                 continue
+            with_snap_path += 1
             profile = _slot_mask_query_profile(ai_snap_path, "")
             if profile is None:
                 continue
+            profiles_built += 1
             memory.append(
                 {
                     "profile": profile,
@@ -2662,6 +2768,11 @@ def _confirmed_label_memory(set_num: str, bag: int) -> List[Dict[str, Any]]:
                     "ai_snap_input_path": ai_snap_path,
                 }
             )
+    print(
+        "[confirmed-memory] "
+        f"set={set_num} bag={int(bag)} total_parts={total_parts} "
+        f"with_snap_path={with_snap_path} profiles_built={profiles_built}"
+    )
     return memory
 
 
@@ -2785,7 +2896,9 @@ def _load_crop_for_ai_snap(set_num: str, bag: int, crop_id: str) -> Optional[Dic
     labels_path = _label_store_path(str(set_num), int(bag))
     labels_payload = _load_existing_labels(labels_path)
     saved_crop = dict(labels_payload.get("crops", {}).get(crop_id) or {})
-    built_crops = _build_instruction_callout_crops(str(set_num), int(bag), ai_enabled=False)
+    built_crops = _load_crop_detection_cache(str(set_num), int(bag))
+    if built_crops is None:
+        built_crops = _build_instruction_callout_crops(str(set_num), int(bag), ai_enabled=False)
     built_by_id = {
         str(item.get("crop_id") or "").strip(): dict(item or {})
         for item in built_crops
@@ -3008,6 +3121,20 @@ def _same_part_entry(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     )
 
 
+def _append_part_entry_preserving_slot(parts: List[Dict[str, Any]], part_entry: Dict[str, Any]) -> None:
+    selected_slot_index = _coerce_int(part_entry.get("selected_slot_index"))
+    if selected_slot_index is not None and selected_slot_index >= 0:
+        for index, existing_part in enumerate(list(parts or [])):
+            if _coerce_int((existing_part or {}).get("selected_slot_index")) == int(selected_slot_index):
+                parts[index] = part_entry
+                return
+        parts.append(part_entry)
+        return
+
+    if not any(_same_part_entry(existing_part, part_entry) for existing_part in parts):
+        parts.append(part_entry)
+
+
 def _upsert_crop_entry(
     payload: Dict[str, Any],
     crop_id: str,
@@ -3155,8 +3282,7 @@ def _load_existing_labels(path: Path) -> Dict[str, Any]:
                     assigned = legacy_sequence[min(index, len(legacy_sequence) - 1)]
                     part_entry["qty"] = assigned.get("qty")
                     part_entry["qty_text"] = assigned.get("qty_text")
-                if not any(_same_part_entry(existing_part, part_entry) for existing_part in parts):
-                    parts.append(part_entry)
+                _append_part_entry_preserving_slot(parts, part_entry)
             crop_record["parts"] = parts
             _refresh_crop_next_qty_index(crop_record)
         return existing
@@ -3193,10 +3319,8 @@ def _load_existing_labels(path: Path) -> Dict[str, Any]:
                 assigned = row_sequence[0]
                 part_entry["qty"] = assigned.get("qty")
                 part_entry["qty_text"] = assigned.get("qty_text")
-            if part_entry["part_num"] and not any(
-                _same_part_entry(existing_part, part_entry) for existing_part in crop_record["parts"]
-            ):
-                crop_record["parts"].append(part_entry)
+            if part_entry["part_num"]:
+                _append_part_entry_preserving_slot(crop_record["parts"], part_entry)
             _refresh_crop_next_qty_index(crop_record)
             crop_record["annotated_at"] = crop_record.get("annotated_at") or str((row or {}).get("annotated_at") or "") or existing["created_at"]
         return existing
@@ -4454,6 +4578,37 @@ async def slot_mask_candidates(req: Request):
         if bgr is not None
     }
 
+    # Fast lookup: pool candidates by part_num::color_id for img_url / color_name enrichment.
+    pool_lookup: Dict[str, Dict[str, Any]] = {
+        _candidate_part_key(c.get("part_num"), c.get("color_id")): c
+        for c in candidate_rows
+        if str(c.get("part_num") or "").strip()
+    }
+
+    # --- Load confirmed-memory entries (cached by labels mtime) ---
+    memory_entries = _confirmed_label_memory_cached(str(set_num), int(bag))
+
+    # Extend color_bgr_by_id to cover memory candidate colour IDs that may not be
+    # in candidate_rows (so the colour gate has LEGO catalogue BGR for every memory part).
+    _mem_color_ids = list({int(e["color_id"]) for e in memory_entries if e.get("color_id") is not None})
+    _missing_mem_ids = [cid for cid in _mem_color_ids if cid not in color_bgr_by_id]
+    if _missing_mem_ids:
+        for _ecr in _load_catalog_colors_for_ids(_missing_mem_ids):
+            _ecid = _coerce_int(_ecr.get("color_id"))
+            _ecbgr = _slot_mask_hex_to_bgr(_ecr.get("rgb"))
+            if _ecid is not None and _ecbgr is not None:
+                color_bgr_by_id[int(_ecid)] = _ecbgr
+
+    # --- Shape-score memory entries (first pass — no colour gate yet) ---
+    _scored_memory: List[Any] = []
+    if memory_entries:
+        for entry in memory_entries:
+            score = _compare_slot_profiles(query_profile, entry["profile"])
+            if score >= _CONFIRMED_MEMORY_SUGGEST_THRESHOLD:
+                _scored_memory.append((score, entry))
+        _scored_memory.sort(key=lambda x: x[0], reverse=True)
+
+    # --- Normal catalog candidates ---
     ranked: List[Dict[str, Any]] = []
     for candidate in candidate_rows:
         part_num = str(candidate.get("part_num") or "").strip()
@@ -4470,6 +4625,7 @@ async def slot_mask_candidates(req: Request):
                 "image_url": str(candidate.get("img_url") or "").strip(),
                 "image_path": str(_slot_mask_resolve_local_image_path(candidate.get("img_url")) or ""),
                 "confidence": scores["confidence"],
+                "source": "catalog",
                 "score_breakdown": {
                     "colour": scores["colour"],
                     "aspect": scores["aspect"],
@@ -4486,11 +4642,100 @@ async def slot_mask_candidates(req: Request):
         ),
         reverse=True,
     )
-    top = ranked[:clip_k]
+
+    # --- Consensus colour from catalog top-3 (computed before memory gate so we can use it) ---
+    _catalog_top3 = ranked[:3]
+    _color_freq: Dict[int, int] = {}
+    for _cv in _catalog_top3:
+        if _cv.get("color_id") is not None:
+            _cid = int(_cv["color_id"])
+            _color_freq[_cid] = _color_freq.get(_cid, 0) + 1
+    if _color_freq:
+        _consensus_color_id = max(_color_freq, key=lambda k: _color_freq[k])
+        _consensus_count = _color_freq[_consensus_color_id]
+        _consensus_color_name = next(
+            (c["color_name"] for c in _catalog_top3
+             if int(c.get("color_id", 0) or 0) == _consensus_color_id),
+            str(_consensus_color_id),
+        )
+    else:
+        _consensus_color_id, _consensus_color_name, _consensus_count = None, None, 0
+
+    # --- Slot colour evidence for the compatibility gate ---
+    # Prefer catalog consensus (more reliable than raw pixel sampling) when strong enough.
+    # Fall back to the query profile's median BGR when consensus is weak or absent.
+    _slot_evidence_bgr: Optional[np.ndarray] = None
+    if _consensus_color_id is not None and _consensus_count >= 2:
+        _slot_evidence_bgr = color_bgr_by_id.get(int(_consensus_color_id))
+    if _slot_evidence_bgr is None:
+        _qbgr = query_profile.get("bgr")
+        if _qbgr is not None:
+            _slot_evidence_bgr = np.asarray(_qbgr, dtype=np.float32)
+
+    # --- Colour-compatibility gate: filter memory candidates ---
+    # Only show memory badge when the confirmed colour is plausible for this slot.
+    # No hard filter when colour evidence is unavailable (be lenient in ambiguous cases).
+    memory_candidates: List[Dict[str, Any]] = []
+    memory_seen: set = set()
+    _memory_before_colour_filter = len(_scored_memory)
+    _memory_colour_filtered = 0
+
+    for score, entry in _scored_memory:
+        key = _candidate_part_key(entry["part_num"], entry["color_id"])
+        if key in memory_seen:
+            continue  # deduplicate same part+colour across multiple confirmed slots
+        if _slot_evidence_bgr is not None:
+            _mem_bgr = color_bgr_by_id.get(int(entry["color_id"]))
+            if _mem_bgr is not None:
+                _colour_dist = float(np.linalg.norm(
+                    np.asarray(_slot_evidence_bgr, dtype=np.float32)
+                    - np.asarray(_mem_bgr, dtype=np.float32)
+                ))
+                if _colour_dist > _MEMORY_COLOUR_COMPAT_DISTANCE:
+                    _memory_colour_filtered += 1
+                    continue  # colour incompatible — exclude from memory badges
+        memory_seen.add(key)
+        pool_meta = pool_lookup.get(key, {})
+        memory_candidates.append(
+            {
+                "part_num": entry["part_num"],
+                "color_id": int(entry["color_id"]),
+                # Always use the user-confirmed color_name, not auto-detected.
+                "color_name": str(entry["color_name"] or pool_meta.get("color_name") or "n/a"),
+                "element_id": str(entry["element_id"] or pool_meta.get("element_id") or ""),
+                "image_url": str(pool_meta.get("img_url") or "").strip(),
+                "image_path": str(_slot_mask_resolve_local_image_path(pool_meta.get("img_url")) or ""),
+                "confidence": round(score, 4),
+                "source": "confirmed_memory",
+                "source_crop_id": str(entry.get("source_crop_id") or ""),
+                "source_slot_index": entry.get("source_slot_index"),
+                "score_breakdown": {
+                    "colour": 0.0,
+                    "aspect": 0.0,
+                    "silhouette": 0.0,
+                    "candidate_image_available": bool(pool_meta.get("img_url")),
+                },
+            }
+        )
+
+    _memory_after_colour_filter = len(memory_candidates)
+
+    # Remove catalog entries whose part+colour is already in memory_candidates.
+    ranked_deduped = [
+        c for c in ranked
+        if _candidate_part_key(c["part_num"], c["color_id"]) not in memory_seen
+    ]
+    top = memory_candidates + ranked_deduped[:clip_k]
+
     print(
         "[slot-mask-candidates] "
         f"set={set_num} bag={int(bag)} crop_id={crop_id} slot_index={int(slot_index)} "
-        f"pool={pool_source} candidates={len(candidate_rows)} clip_k={clip_k} returned={len(top)}"
+        f"pool={pool_source} candidates={len(candidate_rows)} "
+        f"memory_before_colour={_memory_before_colour_filter} "
+        f"memory_after_colour={_memory_after_colour_filter} "
+        f"colour_filtered={_memory_colour_filtered} "
+        f"clip_k={clip_k} returned={len(top)} "
+        f"consensus={_consensus_color_name}({_consensus_count}/3)"
     )
     return {
         "ok": True,
@@ -4500,7 +4745,14 @@ async def slot_mask_candidates(req: Request):
         "slot_index": int(slot_index),
         "candidate_pool_source": pool_source,
         "candidate_count": len(candidate_rows),
+        "memory_candidate_count": _memory_after_colour_filter,
+        "memory_before_colour_filter": _memory_before_colour_filter,
+        "memory_after_colour_filter": _memory_after_colour_filter,
+        "memory_colour_filtered": _memory_colour_filtered,
         "ranked_candidates": top,
+        "consensus_color_id": _consensus_color_id,
+        "consensus_color_name": _consensus_color_name,
+        "consensus_color_count": int(_consensus_count),
     }
 
 
@@ -5194,6 +5446,60 @@ async def update_crop_qty(req: Request):
     return {"ok": True, "path": str(path), "crop": existing["crops"].get(crop_id)}
 
 
+@router.post("/debug/next-unfilled-crop")
+async def next_unfilled_crop_endpoint(req: Request):
+    """Return the crop_id of the next crop (after from_crop_id) where filled_slots < total_slots.
+
+    Uses fresh labels from disk and the backend's _crop_qty_slot_state (which includes the
+    qty-signature fallback for old-style saves without explicit selected_slot_index), so the
+    result is authoritative and not affected by stale frontend state.
+
+    Body: {set_num, bag, from_crop_id, crop_ids: [{crop_id, qty_numbers, qty_text}]}
+    The crop_ids list must be in the same display order the frontend uses for navigation.
+    """
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    try:
+        bag = int(data.get("bag") or 1)
+    except Exception:
+        bag = 1
+    from_crop_id = str(data.get("from_crop_id") or "").strip()
+    candidates = list(data.get("crop_ids") or [])
+
+    path = _label_store_path(set_num, bag)
+    labels_payload = _load_existing_labels(path)
+    saved_crops = dict(labels_payload.get("crops") or {})
+
+    ids = [str((c or {}).get("crop_id") or "") for c in candidates]
+    try:
+        start = ids.index(from_crop_id) if from_crop_id else -1
+    except ValueError:
+        start = -1
+
+    for item in candidates[start + 1:]:
+        crop_id = str((item or {}).get("crop_id") or "").strip()
+        if not crop_id:
+            continue
+        qty_numbers = _coerce_int_list((item or {}).get("qty_numbers") or [])
+        qty_text = _coerce_str_list((item or {}).get("qty_text") or [])
+        saved = dict(saved_crops.get(crop_id) or {})
+        # Fall back to saved qty when the frontend passed nothing (e.g. crop with no qty override)
+        if not qty_numbers:
+            qty_numbers = _coerce_int_list(saved.get("qty") or [])
+        if not qty_text:
+            qty_text = _coerce_str_list(saved.get("qty_text") or [])
+        parts = list(saved.get("parts") or [])
+        slot_state = _crop_qty_slot_state({"parts": parts}, qty_numbers, qty_text)
+        if (
+            not slot_state.get("no_qty_detected")
+            and int(slot_state.get("total_slots") or 0) > 0
+            and int(slot_state.get("filled_slots") or 0) < int(slot_state.get("total_slots") or 0)
+        ):
+            return {"found": True, "crop_id": crop_id}
+
+    return {"found": False, "crop_id": None}
+
+
 @router.get("/debug/export-training-data")
 def export_training_data(
     set_num: str = Query(...),
@@ -5372,14 +5678,28 @@ def instruction_buildability(
     training_examples = _load_saved_training_examples(str(set_num), bag_number)
     labels_path = _label_store_path(str(set_num), bag_number)
     labels_payload = _load_existing_labels(labels_path)
-    crops = _build_instruction_callout_crops(
-        str(set_num),
-        bag_number,
-        ai_enabled=int(ai or 0) == 1,
-        step_filter=step,
-        page_filter=page,
-        rebuild=int(rebuild or 0) == 1,
-    )
+    # Persistent disk cache for crop detection (OCR + step detection).
+    # Only used for full-bag loads (no step/page filter, no AI mode, no rebuild).
+    _do_rebuild = int(rebuild or 0) == 1
+    _cache_eligible = not _do_rebuild and step is None and page is None and not (int(ai or 0) == 1)
+    crops = None
+    if _cache_eligible:
+        crops = _load_crop_detection_cache(str(set_num), bag_number)
+        if crops is not None:
+            print(f"[crop-cache] hit set={set_num} bag={bag_number} crops={len(crops)}")
+        else:
+            print(f"[crop-cache] miss set={set_num} bag={bag_number}")
+    if crops is None:
+        crops = _build_instruction_callout_crops(
+            str(set_num),
+            bag_number,
+            ai_enabled=int(ai or 0) == 1,
+            step_filter=step,
+            page_filter=page,
+            rebuild=_do_rebuild,
+        )
+        if _cache_eligible:
+            _write_crop_detection_cache(str(set_num), bag_number, crops)
     manual_pages = _build_manual_crop_pages(str(set_num), bag_number)
     parts_by_key = {
         f"{str(part.get('part_num') or '').strip()}::{int(part.get('color_id', 0) or 0)}": part
@@ -5430,9 +5750,11 @@ def instruction_buildability(
                     "img_url": str(part_meta.get("img_url") or ""),
                     "qty": normalized_part["qty"],
                     "qty_text": normalized_part["qty_text"],
+                    "selected_slot_index": normalized_part["selected_slot_index"],
                     "selected_qty_label": normalized_part["qty_text"] or (str(normalized_part["qty"]) if normalized_part["qty"] is not None else "none"),
                     "part_bbox": normalized_part["part_bbox"],
                     "confidence": normalized_part["confidence"],
+                    "ai_snap_input_path": normalized_part.get("ai_snap_input_path"),
                 }
             )
         slot_state = _crop_qty_slot_state(
@@ -5524,9 +5846,11 @@ def instruction_buildability(
                     "img_url": str(part_meta.get("img_url") or ""),
                     "qty": normalized_part["qty"],
                     "qty_text": normalized_part["qty_text"],
+                    "selected_slot_index": normalized_part["selected_slot_index"],
                     "selected_qty_label": normalized_part["qty_text"] or (str(normalized_part["qty"]) if normalized_part["qty"] is not None else "none"),
                     "part_bbox": normalized_part["part_bbox"],
                     "confidence": normalized_part["confidence"],
+                    "ai_snap_input_path": normalized_part.get("ai_snap_input_path"),
                 }
             )
         slot_state = _crop_qty_slot_state(
@@ -6234,6 +6558,22 @@ def instruction_buildability(
           color: #8a5a00;
           font-size: 11px;
         }}
+        .picker-slot-confirmed {{
+          display: block;
+          margin-top: 4px;
+          color: #155724;
+          font-size: 11px;
+          font-weight: 600;
+        }}
+        .picker-slot-confirmed-swatch {{
+          display: inline-block;
+          width: 10px;
+          height: 10px;
+          border: 1px solid #999;
+          border-radius: 2px;
+          vertical-align: middle;
+          margin-right: 3px;
+        }}
         .picker-slot-candidates {{
           display: grid;
           grid-template-columns: repeat(5, minmax(34px, 1fr));
@@ -6280,6 +6620,29 @@ def instruction_buildability(
         .picker-slot-candidate-score {{
           font-size: 8px;
           font-weight: 700;
+        }}
+        .picker-slot-candidate-memory {{
+          border: 1px solid #b8d4f0;
+          border-radius: 6px;
+          background: #eef5fc;
+          padding: 2px;
+        }}
+        .picker-slot-candidate-memory img {{
+          border-color: #7ab3e0;
+        }}
+        .picker-slot-memory-badge {{
+          display: inline-block;
+          background: #1a73e8;
+          color: #fff;
+          font-size: 8px;
+          font-weight: 700;
+          padding: 1px 4px;
+          border-radius: 3px;
+          letter-spacing: 0.02em;
+          max-width: 42px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }}
         .picker-slot-debug {{
           margin-top: 6px;
@@ -7019,6 +7382,8 @@ def instruction_buildability(
         const SLOT_MATCH_K = {clip_k_json};
         const FAST_MAP = {fast_map_json};
         const SLOT_MATCH_STRONG_THRESHOLD = {strong_match_threshold_json};
+        const SET_NUM = {json.dumps(str(set_num))};
+        const BAG_NUM = {bag_number};
         const manualSelections = new Map();
         const partTiles = Array.from(document.querySelectorAll(".part-tile"));
         window.legoColors = {lego_colors_json};
@@ -7171,6 +7536,12 @@ def instruction_buildability(
             }}
           }}
           return best;
+        }}
+
+        // Return the RGB object {{r,g,b}} for a LEGO color_id, or null if not found.
+        function legoColorRgb(colorId) {{
+          const c = (window.legoColors || []).find((x) => x && Number(x.color_id) === Number(colorId));
+          return c ? parseRgbHex(c.rgb) : null;
         }}
 
         function escapeHtml(value) {{
@@ -7462,49 +7833,34 @@ def instruction_buildability(
             }};
           }}
 
-          const assignedCounts = new Map();
-          const filledBySlotIndex = new Set();
+          // Slots filled = unique confirmed selected_slot_index values only.
+          // Parts without an explicit selected_slot_index are not counted against a slot.
+          const filledSlotIndices = new Set();
           parts.forEach((part) => {{
             const explicitSlotIndex = Number(part && part.selected_slot_index);
-            if (Number.isInteger(explicitSlotIndex) && explicitSlotIndex >= 0) {{
-              filledBySlotIndex.add(explicitSlotIndex);
-              return;
+            if (Number.isInteger(explicitSlotIndex) && explicitSlotIndex >= 0 && explicitSlotIndex < sequence.length) {{
+              filledSlotIndices.add(explicitSlotIndex);
             }}
-            const signature = qtySlotSignature(part.qty, part.qty_text);
-            if (!signature) {{
-              return;
-            }}
-            assignedCounts.set(signature, Number(assignedCounts.get(signature) || 0) + 1);
           }});
 
-          const consumedCounts = new Map();
-          let filledSlots = 0;
           let nextSlot = null;
+          let nextQtyIndex = sequence.length;
           for (let currentIndex = 0; currentIndex < sequence.length; currentIndex += 1) {{
-            const slot = sequence[currentIndex];
-            if (filledBySlotIndex.has(currentIndex)) {{
-              filledSlots += 1;
-              continue;
+            if (!filledSlotIndices.has(currentIndex)) {{
+              nextSlot = sequence[currentIndex];
+              nextQtyIndex = currentIndex;
+              break;
             }}
-            const signature = qtySlotSignature(slot.qty, slot.qty_text);
-            const assignedCount = Number(assignedCounts.get(signature) || 0);
-            const consumedCount = Number(consumedCounts.get(signature) || 0);
-            if (signature && assignedCount > consumedCount) {{
-              consumedCounts.set(signature, consumedCount + 1);
-              filledSlots += 1;
-              continue;
-            }}
-            nextSlot = slot;
-            break;
           }}
 
           return {{
             totalSlots: sequence.length,
-            filledSlots,
+            filledSlots: filledSlotIndices.size,
             slotsFull: nextSlot === null,
             noQtyDetected: false,
             nextQtyLabel: nextSlot ? String(nextSlot.qty_text || nextSlot.qty || "none") : "filled",
             nextQtyValue: nextSlot && Number.isFinite(Number(nextSlot.qty)) ? Number(nextSlot.qty) : null,
+            nextQtyIndex,
           }};
         }}
 
@@ -7518,11 +7874,11 @@ def instruction_buildability(
             Number.isInteger(explicitSlotIndex)
             && explicitSlotIndex >= 0
             && explicitSlotIndex < slotState.totalSlots
-            && explicitSlotIndex >= slotState.filledSlots
+            && !confirmedPartForSlot(crop, explicitSlotIndex)
           ) {{
             return explicitSlotIndex;
           }}
-          return Math.max(0, Math.min(slotState.filledSlots, slotState.totalSlots - 1));
+          return Math.max(0, Math.min(Number(slotState.nextQtyIndex ?? slotState.filledSlots), slotState.totalSlots - 1));
         }}
 
         function activeAiSnapResultForCrop(crop) {{
@@ -7617,28 +7973,27 @@ def instruction_buildability(
             }}
             return "";
           }}
-          return '<span class="picker-slot-candidates">' + candidates.slice(0, SLOT_MATCH_K).map((candidate) => {{
+          const memoryCount = candidates.filter((c) => c && c.source === "confirmed_memory").length;
+          return '<span class="picker-slot-candidates">' + candidates.slice(0, SLOT_MATCH_K + memoryCount).map((candidate) => {{
             const imageUrl = String(candidate && (candidate.image_url || candidate.img_url || "") || "");
             const confidence = Number(candidate && candidate.confidence);
+            const isMemory = candidate && candidate.source === "confirmed_memory";
             const label = String(candidate && candidate.part_num || "") + ":" + String(candidate && candidate.color_id || "");
             const isStrong = Number.isFinite(confidence) && confidence >= SLOT_MATCH_STRONG_THRESHOLD;
-            return '<span role="button" tabindex="0" class="picker-slot-candidate ' + (isStrong ? 'strong' : 'weak') + '" data-slot-suggestion="true" data-slot-index="' + escapeHtml(String(maskSlot.slot_index ?? "")) + '" data-part-num="' + escapeHtml(String(candidate && candidate.part_num || "")) + '" data-color-id="' + escapeHtml(String(candidate && candidate.color_id || 0)) + '" data-element-id="' + escapeHtml(String(candidate && candidate.element_id || "")) + '" data-color-name="' + escapeHtml(String(candidate && candidate.color_name || "")) + '" title="' + escapeHtml(label + (Number.isFinite(confidence) ? " " + confidence.toFixed(2) : "") + (isStrong ? " strong" : " weak")) + '">'
+            const memoryBadge = isMemory ? '<span class="picker-slot-memory-badge" title="confirmed in this bag">memory</span>' : '';
+            return '<span role="button" tabindex="0" class="picker-slot-candidate ' + (isStrong ? 'strong' : 'weak') + (isMemory ? ' picker-slot-candidate-memory' : '') + '" data-slot-suggestion="true" data-slot-index="' + escapeHtml(String(maskSlot.slot_index ?? "")) + '" data-part-num="' + escapeHtml(String(candidate && candidate.part_num || "")) + '" data-color-id="' + escapeHtml(String(candidate && candidate.color_id || 0)) + '" data-element-id="' + escapeHtml(String(candidate && candidate.element_id || "")) + '" data-color-name="' + escapeHtml(String(candidate && candidate.color_name || "")) + '" title="' + escapeHtml(label + (Number.isFinite(confidence) ? " " + confidence.toFixed(2) : "") + (isStrong ? " strong" : " weak") + (isMemory ? " [memory]" : "")) + '">'
               + (imageUrl ? '<img src="' + escapeHtml(imageUrl) + '" alt="' + escapeHtml(label) + '" loading="lazy" />' : '')
               + '<span>' + escapeHtml(label) + '</span>'
               + (Number.isFinite(confidence) ? '<span class="picker-slot-candidate-score">' + escapeHtml(confidence.toFixed(2)) + (isStrong ? ' strong' : '') + '</span>' : '')
+              + memoryBadge
               + '</span>';
           }}).join("") + '</span>';
         }}
 
         function confirmedPartForSlot(crop, slotIndex) {{
+          // Only restore by explicit selected_slot_index — never by array position.
           const parts = Array.isArray(crop && crop.parts) ? crop.parts : [];
-          const explicit = parts.find((part) => Number(part && part.selected_slot_index) === Number(slotIndex));
-          if (explicit) {{
-            return explicit;
-          }}
-          return Number.isInteger(Number(slotIndex)) && Number(slotIndex) >= 0 && Number(slotIndex) < parts.length
-            ? parts[Number(slotIndex)]
-            : null;
+          return parts.find((part) => Number(part && part.selected_slot_index) === Number(slotIndex)) || null;
         }}
 
         function renderFullCropMaskDebug(crop) {{
@@ -7736,7 +8091,10 @@ def instruction_buildability(
             autoMaskButton.textContent = crop.auto_mask_loading ? "Masking..." : "Auto Mask Slots";
           }}
           if (slotIndex === null) {{
-            status.textContent = "No open slot available for AI Snap.";
+            const slotStateFull = computeCropSlotState(crop);
+            status.textContent = (slotStateFull.slotsFull && !slotStateFull.noQtyDetected)
+              ? "All qty slots filled."
+              : "No open slot available for AI Snap.";
             return;
           }}
           if (crop.ai_snap_error) {{
@@ -7791,7 +8149,17 @@ def instruction_buildability(
             >
               <span class="picker-slot-name">Slot ${{idx + 1}}</span>
               <span class="picker-slot-qty">${{escapeHtml(String((slot && (slot.qty_text || slot.qty)) || "none"))}}</span>
-              ${{confirmedPartForSlot(crop, idx) ? '<span class="picker-slot-review">confirmed: ' + escapeHtml(String(confirmedPartForSlot(crop, idx).part_num || "")) + ':' + escapeHtml(String(confirmedPartForSlot(crop, idx).color_id || "")) + '</span>' : ''}}
+              ${{(() => {{
+                const cp = confirmedPartForSlot(crop, idx);
+                if (!cp) return '';
+                const cpRgb = legoColorRgb(Number(cp.color_id || 0));
+                const swatchStyle = cpRgb ? 'background:rgb(' + cpRgb.r + ',' + cpRgb.g + ',' + cpRgb.b + ')' : 'background:#ccc';
+                const cpColorLabel = cp.color_name || String(cp.color_id || '');
+                return '<span class="picker-slot-confirmed">'
+                  + '<span class="picker-slot-confirmed-swatch" style="' + swatchStyle + '"></span>'
+                  + escapeHtml(String(cp.part_num || '')) + ' · ' + escapeHtml(cpColorLabel)
+                  + '</span>';
+              }})()}}
               ${{(() => {{
                 const maskSlot = autoMaskSlots.get(Number(idx));
                 const cutoutUrl = maskSlot ? aiSnapArtifactUrl(maskSlot.part_cutout_path, maskSlot.generated_at) : "";
@@ -7825,10 +8193,26 @@ def instruction_buildability(
                   const colorMatch = closestLegoColorId({{r, g, b}});
                   const colorName = (colorMatch && colorMatch.color_name) || String((colorMatch && colorMatch.color_id) || "");
                   const dist = (colorMatch && Number.isFinite(colorMatch.distance)) ? colorMatch.distance.toFixed(0) : "";
+                  // Raw RGB is shown as a low-confidence guess by default.
                   colorHtml = '<span class="picker-slot-color">'
+                    + 'colour guess: '
                     + '<span class="picker-slot-color-swatch" style="background:rgb(' + r + ',' + g + ',' + b + ')"></span>'
                     + escapeHtml(colorName) + (dist ? " (" + dist + ")" : "")
                     + '</span>';
+                  // Override with candidate consensus when at least 2 of the top-3 agree.
+                  const consensusId = maskSlot.consensus_color_id;
+                  const consensusCount = Number(maskSlot.consensus_color_count) || 0;
+                  if (consensusId != null && consensusCount >= 2) {{
+                    const consensusRgb = legoColorRgb(Number(consensusId));
+                    const swatchStyle = consensusRgb
+                      ? 'background:rgb(' + consensusRgb.r + ',' + consensusRgb.g + ',' + consensusRgb.b + ')'
+                      : 'background:#ccc';
+                    colorHtml = '<span class="picker-slot-color">'
+                      + 'top candidates: '
+                      + '<span class="picker-slot-color-swatch" style="' + swatchStyle + '"></span>'
+                      + escapeHtml(String(maskSlot.consensus_color_name || consensusId))
+                      + '</span>';
+                  }}
                 }}
                 let lowAlphaHtml = "";
                 if (maskSlot && String(maskSlot.status || "") === "needs_review_low_alpha") {{
@@ -7836,7 +8220,10 @@ def instruction_buildability(
                 }}
                 let confidenceHtml = "";
                 if (maskSlot && maskSlot.slot_confidence) {{
-                  const conf = String(maskSlot.slot_confidence);
+                  // Downgrade to "medium" when shape is good but colour sampling is unreliable.
+                  const rawConf = String(maskSlot.slot_confidence);
+                  const colourConf = String(maskSlot.slot_colour_confidence || "");
+                  const conf = (rawConf === "high" && colourConf === "low") ? "medium" : rawConf;
                   confidenceHtml = '<span class="picker-slot-confidence picker-slot-confidence-' + escapeHtml(conf) + '">Confidence: ' + escapeHtml(conf) + '</span>';
                 }}
                 if (cutoutUrl) {{
@@ -7861,7 +8248,7 @@ def instruction_buildability(
           list.querySelectorAll("[data-picker-slot-index]").forEach((button) => {{
             button.addEventListener("click", () => {{
               const nextIndex = Number(button.dataset.pickerSlotIndex);
-              if (!Number.isInteger(nextIndex) || nextIndex < slotState.filledSlots || nextIndex >= slotState.totalSlots) {{
+              if (!Number.isInteger(nextIndex) || nextIndex >= slotState.totalSlots || confirmedPartForSlot(crop, nextIndex)) {{
                 return;
               }}
               crop.ai_snap_selected_slot_index = nextIndex;
@@ -7869,8 +8256,16 @@ def instruction_buildability(
                 crop.ai_snap_result = null;
               }}
               crop.ai_snap_error = "";
+              // Capture the maskSlot for this index before re-rendering (closure would use
+              // the pre-render autoMaskSlots map, which is fine since objects are shared).
+              const clickedMaskSlot = autoMaskSlots.get(nextIndex);
               renderBuildabilitySlots(crop.crop_id);
               renderSuggestedParts(crop.crop_id);
+              renderAiSnapStatus(crop);
+              // If this slot already has a cutout but no candidates yet, kick off matching.
+              if (clickedMaskSlot && SHOW_SLOT_MATCHES) {{
+                loadSlotMaskCandidates(crop, clickedMaskSlot);
+              }}
             }});
           }});
           list.querySelectorAll("[data-slot-suggestion]").forEach((el) => {{
@@ -8060,10 +8455,54 @@ def instruction_buildability(
           return null;
         }}
 
-        function goToNextUnfilledCrop() {{
-          const nxt = nextUnfilledCropId(activeCropId);
-          if (nxt) selectCrop(nxt);
-          else alert("No unfilled crops remaining.");
+        // Scroll the "Detected slots in crop" panel back into view after DOM updates.
+        // Uses requestAnimationFrame so the browser has committed the re-render before
+        // we reposition.  block:"nearest" means no scroll happens if panel is already visible.
+        function scrollToActiveSlotPanel() {{
+          requestAnimationFrame(function() {{
+            const panel = document.querySelector(".picker-slots-panel");
+            if (panel) {{
+              const y = panel.getBoundingClientRect().top + window.scrollY - 120;
+              window.scrollTo({{ top: Math.max(0, y), behavior: "smooth" }});
+            }}
+          }});
+        }}
+
+        async function goToNextUnfilledCrop() {{
+          // Ask the backend for the next unfilled crop so we always use authoritative
+          // saved-label state rather than potentially-stale in-memory frontend state.
+          const visibleCrops = cropRecords
+            .filter((c) => cropMap.has(c.crop_id) && isCropVisibleInCurrentView(c))
+            .map((c) => ({{
+              crop_id: c.crop_id,
+              qty_numbers: Array.isArray(c.qty_numbers) ? c.qty_numbers : [],
+              qty_text: Array.isArray(c.qty_text) ? c.qty_text : [],
+            }}));
+          let result;
+          try {{
+            const res = await fetch("/debug/next-unfilled-crop", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{
+                set_num: SET_NUM,
+                bag: BAG_NUM,
+                from_crop_id: activeCropId || "",
+                crop_ids: visibleCrops,
+              }}),
+            }});
+            if (!res.ok) throw new Error("server error");
+            result = await res.json();
+          }} catch (_err) {{
+            alert("Failed to find next unfilled crop.");
+            return;
+          }}
+          if (result && result.found && result.crop_id) {{
+            selectCrop(result.crop_id);
+            scrollToActiveSlotPanel();
+            setTimeout(scrollToActiveSlotPanel, 150);
+          }} else {{
+            alert("No unfilled crops remaining.");
+          }}
         }}
 
         function setShowHiddenCrops(showHidden) {{
@@ -9908,6 +10347,7 @@ def instruction_buildability(
             renderColourPicker(cropId);
           }}
           updatePartTileAssignmentState();
+          scrollToActiveSlotPanel();
           saveStatus.textContent = "Removed " + partNum + " / color " + colorId + " from " + crop.crop_id;
         }}
 
@@ -9996,6 +10436,8 @@ def instruction_buildability(
           crop.ai_snap_error = "";
           renderAssignedParts(crop.crop_id);
           renderBuildabilitySlots(crop.crop_id);
+          updateCropCardVisuals(crop.crop_id);
+          scrollToActiveSlotPanel();
           renderSuggestedParts(crop.crop_id);
           updatePartTileAssignmentState();
           if (status) {{
@@ -10078,6 +10520,8 @@ def instruction_buildability(
           maskSlot.prediction_similarity = null;
           renderAssignedParts(crop.crop_id);
           renderBuildabilitySlots(crop.crop_id);
+          updateCropCardVisuals(crop.crop_id);
+          scrollToActiveSlotPanel();
           updatePartTileAssignmentState();
           if (status) {{
             status.textContent = "Accepted prediction: slot " + (Number(slotIndex) + 1)
@@ -10122,6 +10566,16 @@ def instruction_buildability(
             return;
           }}
 
+          // Bind to the currently open slot so the backend stores selected_slot_index
+          // and the frontend can restore by (crop_id, selected_slot_index) on refresh.
+          const slotIndex = currentBuildabilitySlotIndex(crop);
+          const sequence = buildClientQtySequence(crop);
+          const seqSlot = (slotIndex !== null && Number.isInteger(slotIndex)) ? sequence[slotIndex] : null;
+          const maskSlotForSave = (Array.isArray(crop.auto_mask_slots) ? crop.auto_mask_slots : []).find(
+            (s) => Number(s && s.slot_index) === Number(slotIndex)
+          );
+          const aiSnapInputPath = (maskSlotForSave && maskSlotForSave.part_cutout_path) || null;
+
           const payload = {{
             set_num: {json.dumps(str(set_num))},
             bag: {bag_number},
@@ -10138,6 +10592,10 @@ def instruction_buildability(
             color_id: colorId,
             color_name: colorName || null,
             element_id: elementId || null,
+            ai_snap_input_path: aiSnapInputPath,
+            selected_slot_index: slotIndex,
+            qty: seqSlot ? (seqSlot.qty ?? null) : null,
+            qty_text: seqSlot ? (seqSlot.qty_text || null) : null,
             allow_extra_part: allowExtraPartEnabled()
           }};
 
@@ -10154,18 +10612,22 @@ def instruction_buildability(
             crop.ai_snap_result = null;
             crop.ai_snap_error = "";
             renderAssignedParts(crop.crop_id);
+            renderBuildabilitySlots(crop.crop_id);
+            updateCropCardVisuals(crop.crop_id);
+            scrollToActiveSlotPanel();
             if (activeCropId === crop.crop_id) {{
               renderSuggestedParts(crop.crop_id);
               renderColourPicker(crop.crop_id);
               renderAiSnapStatus(crop);
             }}
             updatePartTileAssignmentState();
-            status.textContent = "Saved " + crop.crop_id + " -> " + partNum + " / color " + colorId;
+            status.textContent = "Saved " + crop.crop_id + " slot " + (slotIndex !== null ? slotIndex + 1 : "?") + " -> " + partNum + " / color " + colorId;
             const updatedSlotState = computeCropSlotState(crop);
             if (!updatedSlotState.noQtyDetected && updatedSlotState.slotsFull) {{
               const nextCropId = nextVisibleCropId(crop.crop_id);
               if (nextCropId) {{
                 selectCrop(nextCropId);
+                scrollToActiveSlotPanel();
               }}
             }}
           }} else {{
@@ -10604,7 +11066,9 @@ def manual_match_review(
     )
     lego_colors_json = json.dumps(lego_colors)
     labels_payload = _load_existing_labels(_label_store_path(str(set_num), bag_number))
-    crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=False)
+    crops = _load_crop_detection_cache(str(set_num), bag_number)
+    if crops is None:
+        crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=False)
     crop_tiles: List[str] = []
     review_crops: List[Dict[str, Any]] = []
     for crop in crops:

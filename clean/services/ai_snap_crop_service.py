@@ -20,6 +20,9 @@ _DESKTOP_MASK_OVERLAY_DIR = Path.home() / "Desktop" / "aim2build-mask-overlays"
 _SAM_REFINED_DIR = Path.home() / "aim2build-data" / "instruction-training" / "sam_refined"
 _MIN_ALPHA_PIXELS = 30
 _MIN_ALPHA_RATIO = 0.04   # 4 % of the slot ROI bounding box
+_MIN_ALPHA_FOR_COLOUR = 127
+_MAX_COLOUR_BRIGHTNESS = 210
+_MIN_COLOUR_PIXEL_COUNT = 20
 
 
 def _safe_slug(value: Any, fallback: str = "unknown") -> str:
@@ -291,6 +294,107 @@ def _recover_grey_foreground(
     return expanded
 
 
+def _recover_light_foreground(
+    mask: np.ndarray,
+    img: np.ndarray,
+    bg: np.ndarray,
+) -> np.ndarray:
+    """Recovery pass for white, near-white, and transparent LEGO parts.
+
+    Light-coloured and transparent parts have near-zero colour distance from a
+    white or very light background, so the 72nd-percentile diff threshold in
+    ``_foreground_mask_for_image`` may leave them entirely undetected (seed == 0)
+    or heavily under-segmented.  This pass attempts to recover them without
+    disturbing an existing mask if the part is dark.
+
+    Pixel criterion
+    ---------------
+    S < 55  — excludes the coloured photo backdrop (blue backdrop S ≈ 80–150).
+    V > 185 — restricts to genuinely bright pixels; dark/brown/red/grey parts all
+              have V ≪ 185 so this guard completely protects Bag 1 dark-part paths.
+    diff > 6 — excludes pixels that match the background colour almost exactly.
+
+    Extra safety
+    ------------
+    * Blue-backdrop suppression: (H 95–135 AND S ≥ 40) → excluded.  Handles the
+      few backdrop tiles that slip through the saturation gate.
+    * Soft-edge reinforcement (Canny 20/80) is applied only in the zone-restricted
+      path (seed ≥ 50 px) where the dilation zone prevents runaway expansion.
+    * Area-growth guard: if the existing seed is already substantial (> 100 px)
+      and the result would more than double it, the expansion is discarded.
+    * Minimum-pixel guard: if the final mask has fewer than _MIN_ALPHA_PIXELS
+      pixels, the original mask is returned unchanged to avoid reporting a
+      spurious near-empty light blob.
+
+    Zone-restricted only
+    ---------------------
+    Requires seed ≥ 50 px from the primary threshold before doing anything.
+    Without a reliable anchor the candidate map cannot be safely bounded, so
+    we return the unchanged mask and let downstream mark the slot needs_review.
+    seed ≥ 50  — expand within a 39×39 dilation zone only, augmented with
+                 soft Canny edges (20/80) to catch transparent-part outlines.
+    """
+    if mask is None or int(np.count_nonzero(mask)) < 50:
+        return mask
+
+    img_h, img_w = mask.shape[:2]
+    seed_count = int(np.count_nonzero(mask))
+
+    diff = np.linalg.norm(img.astype(np.float32) - bg.reshape(1, 1, 3), axis=2)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h_ch = hsv[:, :, 0].astype(np.float32)   # 0–179 in OpenCV
+    s_ch = hsv[:, :, 1].astype(np.float32)   # 0–255
+    v_ch = hsv[:, :, 2].astype(np.float32)   # 0–255
+
+    # Light/white candidate pixels.
+    light_cand = (s_ch < 55) & (v_ch > 185) & (diff > 6)
+
+    # Suppress blue/cyan backdrop tiles that slip through the saturation gate.
+    blue_bg = (h_ch >= 95) & (h_ch <= 135) & (s_ch >= 40)
+    light_cand = light_cand & ~blue_bg
+
+    light_cand_u8 = light_cand.astype(np.uint8) * 255
+
+    border = max(1, min(4, min(img_h, img_w) // 24))
+
+    # Zone-restricted path: expand from the existing seed with soft edges.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges_soft = cv2.Canny(gray, 20, 80)
+    cand_with_edges = cv2.bitwise_or(light_cand_u8, edges_soft)
+    zone_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (39, 39))
+    zone = cv2.dilate(mask, zone_k, iterations=1)
+    in_zone = cv2.bitwise_and(cand_with_edges, zone)
+    expanded = cv2.bitwise_or(mask, in_zone)
+
+    # Border zeroing.
+    expanded[:border, :] = 0
+    expanded[img_h - border:, :] = 0
+    expanded[:, :border] = 0
+    expanded[:, img_w - border:] = 0
+
+    # Consolidate: close fills internal gaps; open removes isolated specks.
+    expanded = cv2.morphologyEx(expanded, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
+    expanded = cv2.morphologyEx(expanded, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8), iterations=1)
+
+    # Re-apply border zeroing after morphological ops.
+    expanded[:border, :] = 0
+    expanded[img_h - border:, :] = 0
+    expanded[:, :border] = 0
+    expanded[:, img_w - border:] = 0
+
+    new_count = int(np.count_nonzero(expanded))
+
+    # Area-growth guard: if seed was substantial and result explodes, discard expansion.
+    if seed_count > 100 and new_count > seed_count * 2:
+        return mask
+
+    # Minimum-pixel guard: discard noise results below the low-alpha threshold.
+    if new_count < _MIN_ALPHA_PIXELS:
+        return mask
+
+    return expanded
+
+
 def _foreground_mask_for_image(img: Any) -> tuple[Optional[np.ndarray], str]:
     h, w = img.shape[:2]
     bg = _edge_background_bgr(img)
@@ -312,6 +416,7 @@ def _foreground_mask_for_image(img: Any) -> tuple[Optional[np.ndarray], str]:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
     mask = _recover_grey_foreground(mask, img, bg)
+    mask = _recover_light_foreground(mask, img, bg)
     return mask, ""
 
 
@@ -419,7 +524,13 @@ def _alpha_stats(alpha: Any) -> Dict[str, Any]:
 def _rgb_stats_from_bgra(bgra: np.ndarray) -> Dict[str, Any]:
     """Return median and mean RGB (not BGR) of opaque pixels in a BGRA image."""
     alpha = bgra[:, :, 3]
-    mask = alpha > 0
+    b_ch = bgra[:, :, 0].astype(np.float32)
+    g_ch = bgra[:, :, 1].astype(np.float32)
+    r_ch = bgra[:, :, 2].astype(np.float32)
+    brightness = (b_ch + g_ch + r_ch) / 3.0
+    mask = (alpha > _MIN_ALPHA_FOR_COLOUR) & (brightness < _MAX_COLOUR_BRIGHTNESS)
+    if int(np.count_nonzero(mask)) < _MIN_COLOUR_PIXEL_COUNT:
+        mask = alpha > 50
     if not mask.any():
         return {"slot_rgb_median": None, "slot_rgb_avg": None}
     b, g, r = bgra[:, :, 0][mask], bgra[:, :, 1][mask], bgra[:, :, 2][mask]
@@ -908,6 +1019,15 @@ def _write_slot_artifacts_from_master_mask(
     rgb_stats = _rgb_stats_from_bgra(bgra)
     _alpha_count = int(alpha_debug.get("alpha_pixel_count", 0) or 0)
     _ah, _aw = bgra.shape[:2]
+    # Colour reliability is independent of shape quality.
+    # Small cutouts, expanded masks, or missing medians produce unreliable RGB.
+    _colour_confidence = (
+        "low"
+        if (rgb_stats.get("slot_rgb_median") is None
+            or _alpha_count < 200
+            or _enhancement_expanded_pct > 0.15)
+        else "high"
+    )
     if _alpha_count < _MIN_ALPHA_PIXELS or _alpha_count < _ah * _aw * _MIN_ALPHA_RATIO:
         return {
             "ok": False,
@@ -920,6 +1040,7 @@ def _write_slot_artifacts_from_master_mask(
             "alpha_pixel_count": _alpha_count,
             "enhancement_overexpanded": bool(_enhancement_overexpanded),
             "enhancement_expanded_pct": _enhancement_expanded_pct,
+            "colour_confidence": _colour_confidence,
             **rgb_stats,
         }
     ok_cutout = cv2.imwrite(str(cutout_path), bgra)
@@ -938,6 +1059,7 @@ def _write_slot_artifacts_from_master_mask(
             "actual_saved_cutout_size": [int(bgra.shape[1]), int(bgra.shape[0])] if ok_cutout else None,
             "enhancement_overexpanded": bool(_enhancement_overexpanded),
             "enhancement_expanded_pct": _enhancement_expanded_pct,
+            "colour_confidence": _colour_confidence,
             **alpha_debug,
             **rgb_stats,
         }
@@ -957,6 +1079,7 @@ def _write_slot_artifacts_from_master_mask(
         "actual_saved_cutout_size": [int(bgra.shape[1]), int(bgra.shape[0])],
         "enhancement_overexpanded": bool(_enhancement_overexpanded),
         "enhancement_expanded_pct": _enhancement_expanded_pct,
+        "colour_confidence": _colour_confidence,
         **alpha_debug,
         **rgb_stats,
     }
@@ -1258,6 +1381,7 @@ def create_shape_masks_for_callout_slots(
                 "enhancement_overexpanded": _enhancement_overexpanded,
                 "enhancement_expanded_pct": _expanded_pct,
                 "slot_confidence": _slot_confidence,
+                "slot_colour_confidence": str(artifact_result.get("colour_confidence") or "low"),
             }
         )
         print(
