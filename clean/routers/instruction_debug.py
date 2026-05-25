@@ -21,6 +21,7 @@ from html import escape
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
@@ -2644,12 +2645,20 @@ def _slot_mask_score_candidate(
 
 
 def _auto_mask_cache_key(crop_image_bytes: bytes, qty_token_boxes: list) -> str:
-    """Return a hex SHA1 that uniquely identifies this (image, boxes) pair."""
+    """Return a hex SHA1 that uniquely identifies this (image, boxes) pair.
+
+    Token text is included so that an OCR correction (e.g. "1x" → "2x") that
+    flips the _force_window_fallback decision invalidates the cached result even
+    when the bounding-box geometry is unchanged.
+    """
     _GEOM_KEYS = ("x", "y", "w", "h", "cx", "cy")
     canonical = json.dumps(
         sorted(
             [
-                {k: b[k] for k in _GEOM_KEYS if k in b}
+                {
+                    **{k: b[k] for k in _GEOM_KEYS if k in b},
+                    "text": str(b.get("text") or "").strip(),
+                }
                 for b in qty_token_boxes
                 if isinstance(b, dict)
             ],
@@ -3034,6 +3043,53 @@ def _write_ai_snap_temp_crop_image(crop: Dict[str, Any]) -> Optional[Path]:
             pass
         return None
     return out_path
+
+
+def _analysis_bundle_slug(set_num: str, bag: int, crop_id: str) -> str:
+    safe_set = re.sub(r"[^0-9A-Za-z._-]+", "_", str(set_num or "").strip() or "set")
+    safe_crop = re.sub(r"[^0-9A-Za-z._-]+", "_", str(crop_id or "").strip() or "crop")
+    return f"{safe_set}_bag{int(bag or 0)}_{safe_crop}"
+
+
+def _copy_analysis_bundle_file(path_value: Any, bundle_dir: Path, name: str) -> str:
+    source = Path(str(path_value or "").strip())
+    if not source.exists() or not source.is_file():
+        return ""
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    dest = bundle_dir / name
+    shutil.copy2(str(source), str(dest))
+    return str(dest)
+
+
+def _master_islands_from_mask(mask_path: str) -> List[Dict[str, Any]]:
+    mask_file = Path(str(mask_path or "").strip())
+    if not mask_file.exists():
+        return []
+    mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
+    if mask is None or getattr(mask, "size", 0) == 0:
+        return []
+    labels_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (mask > 0).astype(np.uint8),
+        8,
+    )
+    islands: List[Dict[str, Any]] = []
+    for label in range(1, labels_count):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        fill = float(area) / float(max(1, w * h))
+        islands.append(
+            {
+                "label": int(label),
+                "bbox": [x, y, w, h],
+                "area": area,
+                "fill": round(fill, 4),
+                "centroid": [round(float(centroids[label][0]), 2), round(float(centroids[label][1]), 2)],
+            }
+        )
+    return islands
 
 
 def _mock_rank_slot_candidates(
@@ -4185,8 +4241,9 @@ async def ai_rank_slot(req: Request):
         for item in list(crop.get("qty_token_boxes", []) or [])
         if isinstance(item, dict)
     ]
+    qty_token_boxes.sort(key=lambda t: (int(t.get("cy", 0) or 0), int(t.get("x", 0) or 0)))
     selected_qty_box: Optional[Dict[str, Any]] = None
-    selected_qty_box_index = int(slot_index) - 1
+    selected_qty_box_index = int(slot_index)
     if 0 <= selected_qty_box_index < len(qty_token_boxes):
         selected_qty_box = dict(qty_token_boxes[selected_qty_box_index])
     elif qty_token_boxes:
@@ -4428,6 +4485,160 @@ def ai_snap_artifact(path: str = Query(...)):
     if allowed_root not in resolved.parents or not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="artifact not found")
     return FileResponse(str(resolved))
+
+
+@router.get("/debug/export-crop-analysis-bundle")
+def export_crop_analysis_bundle(
+    set_num: str = Query("70618"),
+    bag: int = Query(2),
+    crop_id: str = Query(...),
+):
+    set_num = str(set_num or "70618").strip() or "70618"
+    bag_number = int(bag or 1)
+    crop_id = str(crop_id or "").strip()
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+
+    crop = _load_crop_for_ai_snap(set_num, bag_number, crop_id)
+    if not crop:
+        raise HTTPException(status_code=404, detail="crop not found")
+    qty_token_boxes = [
+        dict(item)
+        for item in list(crop.get("qty_token_boxes", []) or [])
+        if isinstance(item, dict)
+    ]
+
+    bundle_dir = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+        / _analysis_bundle_slug(set_num, bag_number, crop_id)
+    )
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_crop_path: Optional[Path] = None
+    try:
+        temp_crop_path = _write_ai_snap_temp_crop_image(crop)
+        if temp_crop_path is None:
+            raise HTTPException(status_code=400, detail="crop image unavailable")
+
+        original_crop_path = _copy_analysis_bundle_file(temp_crop_path, bundle_dir, "original_crop.png")
+        result = create_shape_masks_for_callout_slots(
+            str(temp_crop_path),
+            qty_token_boxes,
+            set_num=set_num,
+            bag=bag_number,
+            crop_id=crop_id,
+            desktop_overlays=False,
+        )
+    finally:
+        if temp_crop_path is not None:
+            try:
+                temp_crop_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    full_crop_mask_path = str(result.get("full_crop_mask_path") or "")
+    full_crop_overlay_path = str(result.get("full_crop_mask_overlay_path") or "")
+    raw_master_mask_path = ""
+    master_island_overlay_path = ""
+    if full_crop_mask_path:
+        full_mask_file = Path(full_crop_mask_path)
+        debug_stem = full_mask_file.stem.removesuffix("_full_mask")
+        raw_master_mask_path = str(full_mask_file.parent / f"{debug_stem}_raw_master_mask.png")
+        master_island_overlay_path = str(
+            Path("/Users/olly/aim2build-instruction")
+            / "debug"
+            / "ai_training"
+            / "full_crop_mask_overlays"
+            / f"{debug_stem}_master_island_overlay.png"
+        )
+
+    copied_files: Dict[str, Any] = {
+        "original_crop": original_crop_path,
+        "full_mask_overlay": _copy_analysis_bundle_file(
+            full_crop_overlay_path,
+            bundle_dir,
+            "full_mask_overlay.png",
+        ),
+        "raw_master_mask": _copy_analysis_bundle_file(
+            raw_master_mask_path,
+            bundle_dir,
+            "raw_master_mask.png",
+        ),
+        "master_island_overlay": _copy_analysis_bundle_file(
+            master_island_overlay_path,
+            bundle_dir,
+            "master_island_overlay.png",
+        ),
+        "slot_cutouts": [],
+    }
+
+    slot_assignments: List[Dict[str, Any]] = []
+    for slot in list(result.get("slots") or []):
+        slot_index = int(slot.get("slot_index", len(slot_assignments)) or 0)
+        cutout_path = str(slot.get("part_cutout_path") or "")
+        copied_cutout = _copy_analysis_bundle_file(
+            cutout_path,
+            bundle_dir,
+            f"slot_{slot_index}_cutout.png",
+        )
+        copied_files["slot_cutouts"].append(copied_cutout)
+        slot_assignments.append(
+            {
+                "slot_index": slot_index,
+                "status": str(slot.get("status") or ""),
+                "component_box": slot.get("component_box"),
+                "component_area": slot.get("component_area"),
+                "function_path_used": str(slot.get("function_path_used") or ""),
+                "qty_token_box": slot.get("qty_token_box"),
+                "shape_mask_path": str(slot.get("shape_mask_path") or ""),
+                "part_cutout_path": cutout_path,
+                "bundle_cutout_path": copied_cutout,
+                "alpha_pixel_count": int(slot.get("alpha_pixel_count", 0) or 0),
+                "reason": str(slot.get("reason") or ""),
+            }
+        )
+
+    metadata = {
+        "set_num": set_num,
+        "bag": bag_number,
+        "crop_id": crop_id,
+        "generated_at": _iso_now(),
+        "bundle_dir": str(bundle_dir),
+        "source_crop": {
+            "page": int(crop.get("page", 0) or 0),
+            "step": int(crop.get("step", 0) or 0),
+            "crop_box": crop.get("crop_box"),
+            "crop_image_path": str(crop.get("crop_image_path") or ""),
+        },
+        "qty_token_boxes": qty_token_boxes,
+        "master_islands": _master_islands_from_mask(raw_master_mask_path or full_crop_mask_path),
+        "slot_assignments": slot_assignments,
+        "cutout_paths": [item for item in copied_files["slot_cutouts"] if item],
+        "copied_files": copied_files,
+        "source_artifacts": {
+            "full_crop_mask_path": full_crop_mask_path,
+            "full_crop_mask_overlay_path": full_crop_overlay_path,
+            "raw_master_mask_path": raw_master_mask_path,
+            "master_island_overlay_path": master_island_overlay_path,
+        },
+        "error": str(result.get("error") or ""),
+    }
+    metadata_path = bundle_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "bundle_dir": str(bundle_dir),
+            "metadata_path": str(metadata_path),
+            "copied_files": copied_files,
+            "slot_count": int(result.get("slot_count") or len(slot_assignments)),
+            "error": str(result.get("error") or ""),
+        }
+    )
 
 
 @router.get("/debug/manual-page-image")
@@ -8189,30 +8400,9 @@ def instruction_buildability(
                   : '';
                 let colorHtml = "";
                 if (maskSlot && maskSlot.slot_rgb_median) {{
-                  const [r, g, b] = maskSlot.slot_rgb_median;
-                  const colorMatch = closestLegoColorId({{r, g, b}});
-                  const colorName = (colorMatch && colorMatch.color_name) || String((colorMatch && colorMatch.color_id) || "");
-                  const dist = (colorMatch && Number.isFinite(colorMatch.distance)) ? colorMatch.distance.toFixed(0) : "";
-                  // Raw RGB is shown as a low-confidence guess by default.
                   colorHtml = '<span class="picker-slot-color">'
-                    + 'colour guess: '
-                    + '<span class="picker-slot-color-swatch" style="background:rgb(' + r + ',' + g + ',' + b + ')"></span>'
-                    + escapeHtml(colorName) + (dist ? " (" + dist + ")" : "")
+                    + 'colour guess: experimental'
                     + '</span>';
-                  // Override with candidate consensus when at least 2 of the top-3 agree.
-                  const consensusId = maskSlot.consensus_color_id;
-                  const consensusCount = Number(maskSlot.consensus_color_count) || 0;
-                  if (consensusId != null && consensusCount >= 2) {{
-                    const consensusRgb = legoColorRgb(Number(consensusId));
-                    const swatchStyle = consensusRgb
-                      ? 'background:rgb(' + consensusRgb.r + ',' + consensusRgb.g + ',' + consensusRgb.b + ')'
-                      : 'background:#ccc';
-                    colorHtml = '<span class="picker-slot-color">'
-                      + 'top candidates: '
-                      + '<span class="picker-slot-color-swatch" style="' + swatchStyle + '"></span>'
-                      + escapeHtml(String(maskSlot.consensus_color_name || consensusId))
-                      + '</span>';
-                  }}
                 }}
                 let lowAlphaHtml = "";
                 if (maskSlot && String(maskSlot.status || "") === "needs_review_low_alpha") {{

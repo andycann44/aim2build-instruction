@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
+from clean.services.ai_snap_crop_service import _foreground_mask_for_image
+
 
 def _encode_png(path: Path, image: Any) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,8 +255,11 @@ def normalize_slot_crop_from_qty(
         }
 
     out_dir = _resolve_output_dir(output_dir, "slot_crop_normalize_")
-    mask_info = _foreground_mask_from_instruction_crop(img)
-    fg_mask = mask_info["mask"]
+    # Use the background-adaptive LAB-distance mask (same path as Auto Mask).
+    # Falls back to the legacy blue-only mask if the adaptive estimator fails.
+    fg_mask, _mask_err = _foreground_mask_for_image(img)
+    if fg_mask is None:
+        fg_mask = _foreground_mask_from_instruction_crop(img)["mask"]
     qty_pad = max(4, int(round(max(qw_i, qh_i) * 0.18)))
     mask_x1 = max(0, qx_i - qty_pad)
     mask_y1 = max(0, qy_i - qty_pad)
