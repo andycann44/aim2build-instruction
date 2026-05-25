@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
-from clean.services.training_store_service import _TRAINING_STORE_INDEX, _read_json_file, _safe_bundle_id
+from clean.services.training_store_service import (
+    _REPO_ROOT,
+    _TRAINING_STORE_INDEX,
+    _read_json_file,
+    _safe_bundle_id,
+    _utc_timestamp,
+    _write_json_atomic,
+)
+
+
+_R2_REQUIRED_KEYS = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
+_R2_OPTIONAL_KEYS = ["R2_PUBLIC_BASE_URL"]
 
 
 def _approved_entry(bundle_id: str) -> Dict[str, Any]:
@@ -48,6 +60,77 @@ def _flatten_artifacts(artifact_paths: Dict[str, Any]) -> List[Dict[str, Any]]:
     return files
 
 
+def _read_local_env_file() -> Dict[str, str]:
+    env_path = _REPO_ROOT / ".env"
+    if not env_path.exists() or not env_path.is_file():
+        return {}
+    values: Dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
+def _load_r2_config() -> Dict[str, Any]:
+    local_env = _read_local_env_file()
+    values: Dict[str, str] = {}
+    sources: Dict[str, str] = {}
+    for key in _R2_REQUIRED_KEYS + _R2_OPTIONAL_KEYS:
+        env_value = str(os.environ.get(key) or "").strip()
+        if env_value:
+            values[key] = env_value
+            sources[key] = "environment"
+            continue
+        file_value = str(local_env.get(key) or "").strip()
+        if file_value:
+            values[key] = file_value
+            sources[key] = ".env"
+    missing = [key for key in _R2_REQUIRED_KEYS if not values.get(key)]
+    return {
+        "values": values,
+        "missing": missing,
+        "present": {key: bool(values.get(key)) for key in _R2_REQUIRED_KEYS + _R2_OPTIONAL_KEYS},
+        "sources": sources,
+    }
+
+
+def _r2_config_summary(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "present": dict(config.get("present") or {}),
+        "missing": list(config.get("missing") or []),
+        "sources": dict(config.get("sources") or {}),
+    }
+
+
+def _update_r2_upload_status(bundle_id: str, status: str, r2_paths: Dict[str, str]) -> None:
+    index = _read_json_file(_TRAINING_STORE_INDEX)
+    entries = index.get("entries") if isinstance(index.get("entries"), list) else []
+    updated_entries: List[Dict[str, Any]] = []
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        if str(entry.get("bundle_id") or "") == str(bundle_id):
+            entry["r2_status"] = status
+            entry["r2_uploaded_at"] = _utc_timestamp() if status == "uploaded" else ""
+            entry["r2_paths"] = dict(r2_paths)
+        updated_entries.append(entry)
+    _write_json_atomic(
+        _TRAINING_STORE_INDEX,
+        {
+            "schema_version": str(index.get("schema_version") or "1.0"),
+            "updated_at": _utc_timestamp(),
+            "entries": updated_entries,
+        },
+    )
+
+
 def prepare_bundle_for_r2(bundle_id: str) -> Dict[str, Any]:
     entry = _approved_entry(bundle_id)
     artifact_paths = entry.get("artifact_paths") if isinstance(entry.get("artifact_paths"), dict) else {}
@@ -72,6 +155,74 @@ def prepare_bundle_for_r2(bundle_id: str) -> Dict[str, Any]:
             "bundle_id": safe_bundle_id,
             "files": manifest_files,
         },
+    }
+
+
+def upload_bundle_to_r2(bundle_id: str, *, dry_run: bool = True) -> Dict[str, Any]:
+    prepared = prepare_bundle_for_r2(bundle_id)
+    config = _load_r2_config()
+    prepared["r2_config"] = _r2_config_summary(config)
+    prepared["dry_run"] = bool(dry_run)
+    if dry_run:
+        prepared["would_upload"] = True
+        return prepared
+
+    if config.get("missing"):
+        return {
+            **prepared,
+            "ok": False,
+            "would_upload": False,
+            "error": "missing_r2_config",
+        }
+
+    try:
+        import boto3  # type: ignore
+    except Exception:
+        return {
+            **prepared,
+            "ok": False,
+            "would_upload": False,
+            "error": "boto3_unavailable",
+        }
+
+    values = dict(config.get("values") or {})
+    endpoint_url = f"https://{values['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=values["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=values["R2_SECRET_ACCESS_KEY"],
+    )
+    uploaded_paths: Dict[str, str] = {}
+    try:
+        for item in list((prepared.get("manifest") or {}).get("files") or []):
+            local_path = str(item.get("local_path") or "")
+            r2_key = str(item.get("r2_key") or "")
+            if not local_path or not r2_key or not bool(item.get("exists")):
+                continue
+            client.upload_file(local_path, values["R2_BUCKET"], r2_key)
+            public_base = str(values.get("R2_PUBLIC_BASE_URL") or "").rstrip("/")
+            uploaded_paths[str(item.get("role") or r2_key)] = (
+                f"{public_base}/{r2_key}" if public_base else r2_key
+            )
+    except Exception as exc:
+        _update_r2_upload_status(str(prepared.get("bundle_id") or bundle_id), "failed", uploaded_paths)
+        return {
+            **prepared,
+            "ok": False,
+            "would_upload": False,
+            "uploaded": False,
+            "r2_paths": uploaded_paths,
+            "error": type(exc).__name__,
+        }
+
+    _update_r2_upload_status(str(prepared.get("bundle_id") or bundle_id), "uploaded", uploaded_paths)
+    return {
+        **prepared,
+        "ok": True,
+        "would_upload": False,
+        "uploaded": True,
+        "r2_paths": uploaded_paths,
     }
 
 
