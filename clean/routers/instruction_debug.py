@@ -47,6 +47,7 @@ from clean.routers.debug import (
     _response_text_to_json_debug,
 )
 from clean.services import debug_service, step_detector_service
+from clean.services.training_store_service import register_analysis_bundle, update_bundle_review
 from clean.services.azure_openai_service import rank_crop_candidates
 from clean.services.ai_snap_crop_service import (
     create_shape_mask_for_slot_crop,
@@ -4639,6 +4640,119 @@ def export_crop_analysis_bundle(
             "error": str(result.get("error") or ""),
         }
     )
+
+
+@router.post("/debug/training-store/register-bundle")
+def training_store_register_bundle(bundle_id: str = Query(...)):
+    try:
+        result = register_analysis_bundle(bundle_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+def _parse_slot_indexes(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_values = value
+    else:
+        raw_text = str(value or "").strip()
+        if not raw_text:
+            return []
+        raw_values = raw_text.split(",")
+    slots: List[int] = []
+    for raw in raw_values:
+        try:
+            slot_index = int(raw)
+        except Exception:
+            continue
+        if slot_index >= 0 and slot_index not in slots:
+            slots.append(slot_index)
+    slots.sort()
+    return slots
+
+
+async def _training_store_review_payload(
+    req: Request,
+    bundle_id: str,
+    slots: str,
+    notes: str,
+    reviewer: str,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    content_type = str(req.headers.get("content-type") or "")
+    if "application/json" in content_type:
+        try:
+            body = await req.json()
+            if isinstance(body, dict):
+                payload = dict(body)
+        except Exception:
+            payload = {}
+    resolved_bundle_id = str(payload.get("bundle_id") or bundle_id or "").strip()
+    resolved_notes = str(payload.get("notes") if payload.get("notes") is not None else notes or "")
+    resolved_reviewer = str(payload.get("reviewer") if payload.get("reviewer") is not None else reviewer or "")
+    raw_slots = payload.get("slot_indexes")
+    if raw_slots is None:
+        raw_slots = payload.get("slots")
+    if raw_slots is None:
+        raw_slots = slots
+    return {
+        "bundle_id": resolved_bundle_id,
+        "slot_indexes": _parse_slot_indexes(raw_slots),
+        "notes": resolved_notes,
+        "reviewer": resolved_reviewer,
+    }
+
+
+@router.post("/debug/training-store/approve-bundle")
+async def training_store_approve_bundle(
+    req: Request,
+    bundle_id: str = Query(""),
+    slots: str = Query(""),
+    notes: str = Query(""),
+    reviewer: str = Query(""),
+):
+    payload = await _training_store_review_payload(req, bundle_id, slots, notes, reviewer)
+    try:
+        result = update_bundle_review(
+            payload["bundle_id"],
+            "approved",
+            slot_indexes=payload["slot_indexes"],
+            notes=payload["notes"],
+            reviewer=payload["reviewer"],
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/reject-bundle")
+async def training_store_reject_bundle(
+    req: Request,
+    bundle_id: str = Query(""),
+    slots: str = Query(""),
+    notes: str = Query(""),
+    reviewer: str = Query(""),
+):
+    payload = await _training_store_review_payload(req, bundle_id, slots, notes, reviewer)
+    try:
+        result = update_bundle_review(
+            payload["bundle_id"],
+            "rejected",
+            slot_indexes=payload["slot_indexes"],
+            notes=payload["notes"],
+            reviewer=payload["reviewer"],
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
 
 
 @router.get("/debug/manual-page-image")
