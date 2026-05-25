@@ -90,6 +90,17 @@ def _review_defaults(existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     }
 
 
+def _cloud_defaults(existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    existing = existing or {}
+    return {
+        "r2_status": str(existing.get("r2_status") or "pending"),
+        "r2_uploaded_at": str(existing.get("r2_uploaded_at") or ""),
+        "r2_paths": dict(existing.get("r2_paths") or {}) if isinstance(existing.get("r2_paths"), dict) else {},
+        "azure_status": str(existing.get("azure_status") or "pending"),
+        "azure_indexed_at": str(existing.get("azure_indexed_at") or ""),
+    }
+
+
 def register_analysis_bundle(bundle_id: str) -> Dict[str, Any]:
     safe_bundle_id = _safe_bundle_id(bundle_id)
     bundle_path = (_ANALYSIS_BUNDLES_DIR / safe_bundle_id).resolve()
@@ -115,6 +126,11 @@ def register_analysis_bundle(bundle_id: str) -> Dict[str, Any]:
         "artifact_paths": _artifact_paths_from_metadata(metadata),
         "review_status": "unreviewed",
         "cloud_status": "local_only",
+        "r2_status": "pending",
+        "r2_uploaded_at": "",
+        "r2_paths": {},
+        "azure_status": "pending",
+        "azure_indexed_at": "",
     }
 
     index = _read_json_file(_TRAINING_STORE_INDEX)
@@ -133,6 +149,7 @@ def register_analysis_bundle(bundle_id: str) -> Dict[str, Any]:
         if isinstance(item, dict) and str(item.get("bundle_id") or "") != safe_bundle_id
     ]
     entry.update(_review_defaults(existing_entry))
+    entry.update(_cloud_defaults(existing_entry))
     updated_entries.append(entry)
     updated_entries.sort(key=lambda item: str(item.get("bundle_id") or ""))
 
@@ -175,6 +192,7 @@ def update_bundle_review(
         entry = dict(raw_entry)
         if str(entry.get("bundle_id") or "") == safe_bundle_id:
             entry.update(_review_defaults(entry))
+            entry.update(_cloud_defaults(entry))
             entry["review_status"] = review_status
             if review_status == "approved":
                 entry["approved_slots"] = normalized_slots

@@ -48,6 +48,7 @@ from clean.routers.debug import (
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.training_store_service import register_analysis_bundle, update_bundle_review
+from clean.services.training_cloud_sync_service import prepare_bundle_for_azure, prepare_bundle_for_r2
 from clean.services.azure_openai_service import rank_crop_candidates
 from clean.services.ai_snap_crop_service import (
     create_shape_mask_for_slot_crop,
@@ -4748,6 +4749,28 @@ async def training_store_reject_bundle(
             notes=payload["notes"],
             reviewer=payload["reviewer"],
         )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.get("/debug/training-store/prepare-r2-upload")
+def training_store_prepare_r2_upload(bundle_id: str = Query(...)):
+    try:
+        result = prepare_bundle_for_r2(bundle_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.get("/debug/training-store/prepare-azure-index")
+def training_store_prepare_azure_index(bundle_id: str = Query(...)):
+    try:
+        result = prepare_bundle_for_azure(bundle_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
