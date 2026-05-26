@@ -5749,14 +5749,14 @@ def training_store_review_ui(
     def _render_candidate_cards(candidates: List[Dict[str, Any]]) -> str:
         return "".join(
             (
-                f'<figure>'
-                f'<div class="slot-img">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
-                f'<figcaption>Candidate {escape(str(_candidate_display_index(candidate, index)))} · {escape(str(candidate.get("status") or "pending"))}</figcaption>'
+                f'<figure class="split-candidate-card">'
+                f'<div class="slot-img split-candidate-img">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+                f'<figcaption><strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong><span>{escape(str(candidate.get("status") or "pending"))}</span></figcaption>'
                 f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}<br>Qty scrub: {escape(str(candidate.get("qty_scrub_status") or "not run"))}</div>'
                 f'<div class="candidate-actions">'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
-                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Needs Qty Scrub / Scrub Qty</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Scrub Qty</button>'
                 f'</div>'
                 f'</figure>'
             )
@@ -5804,6 +5804,24 @@ def training_store_review_ui(
         and str(candidate.get("status") or "") == "accepted"
         and (not bool(candidate.get("qty_detected")) or bool(str(candidate.get("qty_scrubbed_path") or "").strip()))
     ]
+    selected_set_num = str((selected or {}).get("set_num") or (metadata.get("set_num") if isinstance(metadata, dict) else "") or "")
+    selected_bag_num = _coerce_int((selected or {}).get("bag_num") or (metadata.get("bag") if isinstance(metadata, dict) else None))
+    if selected_bag_num is None:
+        selected_bag_num = _coerce_int((metadata.get("bag_num") if isinstance(metadata, dict) else None))
+    step_href = ""
+    if selected_set_num and selected_bag_num is not None and selected_page_num and selected_step_num:
+        step_href = (
+            f"/debug/instruction-buildability?set_num={_url_quote(selected_set_num)}"
+            f"&bag={int(selected_bag_num)}"
+            f"&page={_url_quote(str(selected_page_num))}"
+            f"&step={_url_quote(str(selected_step_num))}"
+            f"&show_hidden=1"
+        )
+    step_link_html = (
+        f'<a class="view-step-link" href="{escape(step_href)}" target="_blank" rel="noopener">View Step</a>'
+        if step_href
+        else ""
+    )
     confirm_cards: List[str] = []
     for index, candidate in enumerate(clean_accepted_candidates):
         candidate_index = _coerce_int(candidate.get("index"))
@@ -5817,7 +5835,7 @@ def training_store_review_ui(
                 row=selected or {},
                 candidate=candidate,
                 confirmed_rows=confirmed_example_rows,
-                limit=30,
+                limit=200,
             )
         except Exception:
             matches = []
@@ -5875,6 +5893,7 @@ def training_store_review_ui(
             f'<span>qty {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span></div>'
             f'<span class="review-state">{escape(str(candidate.get("status") or "pending"))}</span>'
             f'<span class="review-state {escape("saved" if int(candidate_index) in confirmed_examples else "unsaved")}">{escape("confirmed" if int(candidate_index) in confirmed_examples else "not confirmed")}</span>'
+            f'{step_link_html}'
             f'</div>'
             f'<div class="candidate-workspace">'
             f'<div class="candidate-preview-panel">'
@@ -5922,9 +5941,15 @@ def training_store_review_ui(
     figcaption {{ color:#66727d; font-size:12px; margin-top:6px; }}
     img {{ max-width:100%; height:auto; image-rendering:auto; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
     .slots {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }}
-    .split-candidates {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px; margin-top:10px; }}
-    .candidate-actions {{ display:flex; gap:6px; margin-top:8px; }}
-    .candidate-actions button {{ padding:6px 8px; font-size:12px; }}
+    .split-candidates {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px; margin-top:10px; align-items:start; }}
+    .split-candidate-card {{ display:grid; gap:9px; padding:10px; }}
+    .split-candidate-card figcaption {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
+    .split-candidate-card figcaption strong {{ color:#172026; font-size:14px; }}
+    .split-candidate-img {{ min-height:132px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
+    .split-candidate-img img {{ max-height:118px; max-width:150px; object-fit:contain; background:transparent; }}
+    .candidate-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-top:8px; }}
+    .candidate-actions button {{ padding:8px 9px; font-size:12px; min-width:0; white-space:normal; line-height:1.15; }}
+    .candidate-actions button[data-candidate-action="scrub"] {{ grid-column:1 / -1; }}
     .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
     .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:18px; margin-top:10px; }}
     .confirm-card {{ background:white; border:1px solid #d8dee3; border-radius:8px; padding:14px; overflow:hidden; box-shadow:0 1px 2px rgba(31,45,61,.04); }}
@@ -5934,6 +5959,8 @@ def training_store_review_ui(
     .review-state {{ display:inline-flex; align-items:center; justify-content:center; min-height:28px; border:1px solid #cbd6e2; border-radius:999px; padding:4px 10px; color:#32465a; background:#f8fafb; font-size:12px; white-space:nowrap; }}
     .review-state.saved {{ border-color:#7db28a; background:#eef6ef; color:#2f6c41; }}
     .review-state.unsaved {{ border-color:#e1c36a; background:#fff8df; color:#725b10; }}
+    .view-step-link {{ display:inline-flex; align-items:center; justify-content:center; min-height:30px; border:1px solid #1f6fc9; border-radius:6px; padding:5px 11px; color:#1f6fc9; background:#eef6ff; text-decoration:none; font-size:13px; font-weight:700; white-space:nowrap; }}
+    .view-step-link:hover {{ background:#dcecff; }}
     .candidate-workspace {{ display:grid; grid-template-columns:minmax(260px,320px) minmax(0,1fr); gap:16px; align-items:start; }}
     .candidate-preview-panel {{ display:grid; gap:10px; align-content:start; }}
     .confirm-thumb {{ min-height:240px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:8px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
@@ -6150,6 +6177,9 @@ def training_store_review_ui(
     }});
     document.querySelectorAll('[data-review-colour-chip]').forEach((button) => {{
       button.addEventListener('click', () => {{
+        if (button.dataset.reviewColourClear === 'true') {{
+          return;
+        }}
         setReviewCardColour(button.closest('.confirm-card'), button.dataset.colorId || '');
       }});
     }});
