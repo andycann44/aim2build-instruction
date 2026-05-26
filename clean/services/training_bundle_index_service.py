@@ -223,6 +223,7 @@ def register_bundle(
                     approved = EXCLUDED.approved,
                     r2_prefix = EXCLUDED.r2_prefix,
                     manifest_path = EXCLUDED.manifest_path,
+                    review_status = COALESCE(NULLIF(training_bundle_index.review_status, ''), 'pending'),
                     updated_at = NOW()
                 RETURNING *;
                 """,
@@ -545,10 +546,23 @@ def update_split_candidate_status(
         raise ValueError("candidate_index is out of range")
     candidate = dict(candidates[target_pos]) if isinstance(candidates[target_pos], dict) else {}
     candidate["status"] = status
+    if status == "accepted":
+        candidate["review_state"] = ""
     if v2_mask_path:
         candidate["v2_mask_path"] = str(v2_mask_path)
     candidates[target_pos] = candidate
+    def update_group(raw_items: Any) -> List[Dict[str, Any]]:
+        updated: List[Dict[str, Any]] = []
+        for raw_item in list(raw_items or []):
+            item = dict(raw_item) if isinstance(raw_item, dict) else {}
+            if _coerce_int(item.get("index")) == int(candidate_index):
+                item.update(candidate)
+            updated.append(item)
+        return updated
+
     paths["candidates"] = candidates
+    paths["baseline_slot_candidates"] = update_group(paths.get("baseline_slot_candidates"))
+    paths["ai_suggested_candidates"] = update_group(paths.get("ai_suggested_candidates"))
     return update_split_candidates(bundle_id, split_candidate_paths=paths)
 
 
@@ -640,4 +654,75 @@ def list_candidate_training_examples(bundle_id: str) -> Dict[str, Any]:
         "ok": True,
         "bundle_id": bundle_id,
         "rows": [_json_safe_row(dict(row or {})) for row in list(rows or [])],
+    }
+
+
+def unconfirm_candidate_part(*, bundle_id: str, candidate_index: Any) -> Dict[str, Any]:
+    ensure_schema()
+    bundle_id = str(bundle_id or "").strip()
+    if not bundle_id:
+        raise ValueError("bundle_id is required")
+    parsed_candidate_index = _coerce_int(candidate_index)
+    if parsed_candidate_index is None or parsed_candidate_index < 0:
+        raise ValueError("candidate_index must be >= 0")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM candidate_training_examples
+                WHERE bundle_id = %s AND candidate_index = %s
+                RETURNING *;
+                """,
+                (bundle_id, parsed_candidate_index),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return {
+        "ok": True,
+        "bundle_id": bundle_id,
+        "candidate_index": parsed_candidate_index,
+        "removed": bool(row),
+        "row": _json_safe_row(dict(row or {})) if row else {},
+    }
+
+
+def reset_bag_index_rows(*, set_num: str, bag_num: Any) -> Dict[str, Any]:
+    ensure_schema()
+    safe_set_num = str(set_num or "").strip()
+    parsed_bag_num = _coerce_int(bag_num)
+    if not safe_set_num:
+        raise ValueError("set_num is required")
+    if parsed_bag_num is None:
+        raise ValueError("bag_num is required")
+    bundle_prefix = f"{safe_set_num}_bag{parsed_bag_num}_"
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM candidate_training_examples
+                WHERE bundle_id LIKE %s
+                RETURNING bundle_id;
+                """,
+                (bundle_prefix + "%",),
+            )
+            candidate_rows = cur.fetchall()
+            cur.execute(
+                """
+                DELETE FROM training_bundle_index
+                WHERE set_num = %s AND bag_num = %s
+                RETURNING bundle_id;
+                """,
+                (safe_set_num, parsed_bag_num),
+            )
+            index_rows = cur.fetchall()
+        conn.commit()
+    return {
+        "ok": True,
+        "set_num": safe_set_num,
+        "bag_num": parsed_bag_num,
+        "bundle_prefix": bundle_prefix,
+        "candidate_training_examples_deleted_count": len(candidate_rows or []),
+        "candidate_training_example_bundle_ids": sorted({str(row.get("bundle_id") or "") for row in list(candidate_rows or [])}),
+        "training_bundle_index_deleted_count": len(index_rows or []),
+        "training_bundle_index_bundle_ids": sorted(str(row.get("bundle_id") or "") for row in list(index_rows or [])),
     }

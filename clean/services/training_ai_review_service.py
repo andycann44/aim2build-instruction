@@ -165,6 +165,16 @@ def _boxes_intersect(a: List[int], b: List[int]) -> bool:
     return max(ax1, bx1) < min(ax2, bx2) and max(ay1, by1) < min(ay2, by2)
 
 
+def _box_intersection_area(a: List[int], b: List[int]) -> int:
+    if len(a) != 4 or len(b) != 4:
+        return 0
+    ax1, ay1, aw, ah = a
+    bx1, by1, bw, bh = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax1 + aw, bx1 + bw), min(ay1 + ah, by1 + bh)
+    return max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+
 def _box_iou(a: List[int], b: List[int]) -> float:
     if not _boxes_intersect(a, b):
         return 0.0
@@ -248,6 +258,136 @@ def _qty_values_from_tokens(tokens: List[Dict[str, Any]]) -> List[int]:
         if value not in values:
             values.append(value)
     return values
+
+
+def _blue_callout_background_mask(image_bgr: np.ndarray) -> np.ndarray:
+    if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
+        return np.zeros((0, 0), dtype=bool)
+    bgr = image_bgr.astype(np.int16)
+    b = bgr[:, :, 0]
+    g = bgr[:, :, 1]
+    r = bgr[:, :, 2]
+    return (
+        (b >= 135)
+        & (g >= 115)
+        & (b >= r + 16)
+        & (g >= r + 4)
+    )
+
+
+def _expanded_export_alpha(original_bgr: np.ndarray, component_mask: np.ndarray) -> np.ndarray:
+    base = (component_mask > 0).astype(np.uint8)
+    if base is None or getattr(base, "size", 0) == 0 or int(np.count_nonzero(base)) == 0:
+        return np.zeros_like(base, dtype=np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    closed = cv2.morphologyEx(base, cv2.MORPH_CLOSE, kernel, iterations=1)
+    dilated = cv2.dilate(closed, kernel, iterations=2)
+    background = _blue_callout_background_mask(original_bgr)
+    if background.shape != dilated.shape:
+        background = np.zeros_like(dilated, dtype=bool)
+    expanded = ((dilated > 0) & ~background) | (base > 0)
+    return expanded.astype(np.uint8) * 255
+
+
+def _token_center(token: Dict[str, Any]) -> List[float]:
+    try:
+        x = float(token.get("x", 0) or 0)
+        y = float(token.get("y", 0) or 0)
+        w = float(token.get("w", 0) or 0)
+        h = float(token.get("h", 0) or 0)
+    except Exception:
+        return [0.0, 0.0]
+    return [x + (w / 2.0), y + (h / 2.0)]
+
+
+def _box_center(box: List[int]) -> List[float]:
+    if len(box) != 4:
+        return [0.0, 0.0]
+    x, y, w, h = box
+    return [float(x) + (float(w) / 2.0), float(y) + (float(h) / 2.0)]
+
+
+def _distance_from_point_to_box(px: float, py: float, box: List[int]) -> float:
+    if len(box) != 4:
+        return 999999.0
+    x, y, w, h = box
+    x2, y2 = x + w, y + h
+    dx = 0.0
+    if px < x:
+        dx = float(x) - px
+    elif px > x2:
+        dx = px - float(x2)
+    dy = 0.0
+    if py < y:
+        dy = float(y) - py
+    elif py > y2:
+        dy = py - float(y2)
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def _assign_qty_tokens_to_components(
+    components: List[Dict[str, Any]],
+    qty_token_boxes: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    assignments: Dict[int, Dict[str, Any]] = {}
+    used_labels = set()
+    ordered_tokens = sorted(
+        [
+            dict(token, _token_order=index)
+            for index, token in enumerate(list(qty_token_boxes or []))
+            if isinstance(token, dict)
+        ],
+        key=lambda token: (
+            float(token.get("y", 0) or 0),
+            float(token.get("x", 0) or 0),
+        ),
+    )
+    for token_order, token in enumerate(ordered_tokens):
+        tcx, tcy = _token_center(token)
+        scored: List[Dict[str, Any]] = []
+        for component in components:
+            label = int(component.get("component_label", -1))
+            if label in used_labels:
+                continue
+            box = list(component.get("box") or [])
+            if len(box) != 4:
+                continue
+            ccx, ccy = _box_center(box)
+            x, y, w, h = box
+            above_or_near = ccy <= tcy or y <= tcy + max(12.0, float(h) * 0.25)
+            if not above_or_near:
+                continue
+            point_distance = _distance_from_point_to_box(tcx, tcy, box)
+            center_distance = float(((ccx - tcx) ** 2 + (ccy - tcy) ** 2) ** 0.5)
+            vertical_gap = max(0.0, float(y) - tcy)
+            below_penalty = 0.0 if ccy <= tcy else 80.0
+            score = point_distance + (center_distance * 0.18) + (vertical_gap * 1.5) + below_penalty
+            scored.append(
+                {
+                    "component_label": label,
+                    "score": score,
+                    "point_distance": point_distance,
+                    "center_distance": center_distance,
+                    "component_center": [ccx, ccy],
+                    "component_box": box,
+                    "token_center": [tcx, tcy],
+                }
+            )
+        if not scored:
+            continue
+        best = sorted(scored, key=lambda item: item["score"])[0]
+        label = int(best["component_label"])
+        used_labels.add(label)
+        token_copy = dict(token)
+        token_copy["anchor_order"] = token_order
+        assignments[label] = {
+            "qty_token": token_copy,
+            "qty_values": _qty_values_from_tokens([token_copy]),
+            "anchor_order": token_order,
+            "assignment_score": best,
+            "candidate_scores": scored,
+        }
+    return assignments
 
 
 def _normalised_qty_tokens_from_metadata(row: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -543,11 +683,6 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
 
     metadata = _read_bundle_metadata(row)
     copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
-    slot_assignments = [
-        dict(item)
-        for item in list(metadata.get("slot_assignments") or [])
-        if isinstance(item, dict)
-    ]
     qty_token_boxes = _normalised_qty_tokens_from_metadata(row, metadata)
     original_path = Path(str(copied_files.get("original_crop") or "").strip())
     mask_path = Path(str(copied_files.get("raw_master_mask") or "").strip())
@@ -579,7 +714,80 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
     bundle_dir.mkdir(parents=True, exist_ok=True)
     baseline_candidates: List[Dict[str, Any]] = []
     ai_candidates: List[Dict[str, Any]] = []
+    rejected_components: List[Dict[str, Any]] = []
     palette = [(0, 80, 255), (0, 180, 80), (255, 100, 0), (200, 0, 200), (0, 180, 220)]
+    component_source_mask = (raw_mask > 0).astype(np.uint8) * 255
+    qty_reject_pad = 2
+    padded_qty_boxes: List[List[int]] = []
+    for token in qty_token_boxes:
+        token_box = _clip_box(
+            [
+                float(token.get("x", 0) or 0) - qty_reject_pad,
+                float(token.get("y", 0) or 0) - qty_reject_pad,
+                float(token.get("w", 0) or 0) + qty_reject_pad * 2,
+                float(token.get("h", 0) or 0) + qty_reject_pad * 2,
+            ],
+            width,
+            height,
+        )
+        if token_box:
+            padded_qty_boxes.append(token_box)
+    component_count, component_labels, component_stats, component_centroids = cv2.connectedComponentsWithStats(
+        component_source_mask,
+        8,
+    )
+    min_component_area = max(8, int(round((width * height) * 0.0015)))
+    components: List[Dict[str, Any]] = []
+    for component_label in range(1, int(component_count)):
+        x = int(component_stats[component_label, cv2.CC_STAT_LEFT])
+        y = int(component_stats[component_label, cv2.CC_STAT_TOP])
+        w = int(component_stats[component_label, cv2.CC_STAT_WIDTH])
+        h = int(component_stats[component_label, cv2.CC_STAT_HEIGHT])
+        area = int(component_stats[component_label, cv2.CC_STAT_AREA])
+        component = {
+            "component_label": int(component_label),
+            "box": [x, y, w, h],
+            "area": area,
+            "centroid": [
+                float(component_centroids[component_label][0]),
+                float(component_centroids[component_label][1]),
+            ],
+        }
+        rejected_reason = ""
+        if area <= 0:
+            rejected_reason = "no_mask_pixels"
+        elif area < min_component_area:
+            rejected_reason = "component_area_too_small"
+        elif w < 6:
+            rejected_reason = "component_width_too_small"
+        elif h < 6:
+            rejected_reason = "component_height_too_small"
+        else:
+            bbox_area = max(1, w * h)
+            qty_overlap = max((_box_intersection_area([x, y, w, h], qty_box) for qty_box in padded_qty_boxes), default=0)
+            if qty_overlap / float(bbox_area) > 0.45 and area < max(min_component_area * 4, 220):
+                rejected_reason = "qty_text_component"
+        if rejected_reason:
+            rejected_components.append({**component, "rejected_reason": rejected_reason})
+            continue
+        components.append(component)
+    components.sort(key=lambda item: (int(item["box"][1]), int(item["box"][0])))
+    qty_component_assignments = _assign_qty_tokens_to_components(components, qty_token_boxes)
+    component_order = {
+        int(component.get("component_label")): index
+        for index, component in enumerate(components)
+    }
+    ordered_components = sorted(
+        components,
+        key=lambda component: (
+            qty_component_assignments.get(int(component.get("component_label")), {}).get(
+                "anchor_order",
+                10000 + component_order.get(int(component.get("component_label")), 0),
+            ),
+            int(component.get("box", [0, 0, 0, 0])[1]),
+            int(component.get("box", [0, 0, 0, 0])[0]),
+        ),
+    )
 
     def write_candidate(
         *,
@@ -587,12 +795,17 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
         display_index: int,
         internal_index: int,
         source_box: List[int],
+        component_label: int = 0,
+        component_mask: np.ndarray,
+        assigned_qty: Dict[str, Any],
         label: str,
         reason: str,
         confidence: float,
     ) -> Dict[str, Any]:
         x, y, w, h = source_box
-        local_mask = (raw_mask[y : y + h, x : x + w] > 0).astype(np.uint8)
+        scoped_component_mask = np.zeros_like(component_mask, dtype=np.uint8)
+        scoped_component_mask[y : y + h, x : x + w] = (component_mask[y : y + h, x : x + w] > 0).astype(np.uint8) * 255
+        local_mask = (scoped_component_mask[y : y + h, x : x + w] > 0).astype(np.uint8)
         if local_mask is None or getattr(local_mask, "size", 0) == 0 or int(np.count_nonzero(local_mask)) == 0:
             return {}
         nz = cv2.findNonZero(local_mask)
@@ -600,27 +813,44 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
             return {}
         bx, by, bw, bh = cv2.boundingRect(nz)
         pad = 6
-        tight_x = max(0, x + bx - pad)
-        tight_y = max(0, y + by - pad)
-        tight_x2 = min(width, x + bx + bw + pad)
-        tight_y2 = min(height, y + by + bh + pad)
+        raw_tight_x = max(0, x + bx - pad)
+        raw_tight_y = max(0, y + by - pad)
+        raw_tight_x2 = min(width, x + bx + bw + pad)
+        raw_tight_y2 = min(height, y + by + bh + pad)
+        export_alpha_full = _expanded_export_alpha(original, scoped_component_mask)
+        export_nz = cv2.findNonZero((export_alpha_full > 0).astype(np.uint8))
+        if export_nz is not None:
+            ex, ey, ew, eh = cv2.boundingRect(export_nz)
+            tight_x = max(0, ex - pad)
+            tight_y = max(0, ey - pad)
+            tight_x2 = min(width, ex + ew + pad)
+            tight_y2 = min(height, ey + eh + pad)
+        else:
+            tight_x = raw_tight_x
+            tight_y = raw_tight_y
+            tight_x2 = raw_tight_x2
+            tight_y2 = raw_tight_y2
         tight_box = [tight_x, tight_y, tight_x2 - tight_x, tight_y2 - tight_y]
         tx, ty, tw, th = tight_box
         tight_original = original[ty : ty + th, tx : tx + tw]
-        tight_mask = (raw_mask[ty : ty + th, tx : tx + tw] > 0).astype(np.uint8) * 255
+        raw_tight_mask = (scoped_component_mask[ty : ty + th, tx : tx + tw] > 0).astype(np.uint8) * 255
+        tight_mask = export_alpha_full[ty : ty + th, tx : tx + tw]
         if tight_original is None or getattr(tight_original, "size", 0) == 0:
             return {}
         bgra = cv2.cvtColor(tight_original, cv2.COLOR_BGR2BGRA)
         bgra[:, :, 3] = tight_mask
         bgra[tight_mask == 0, 0:3] = 0
-        candidate_qty_tokens = _candidate_qty_tokens(tight_box, qty_token_boxes)
-        qty_values = _qty_values_from_tokens(candidate_qty_tokens)
+        assigned_token = assigned_qty.get("qty_token") if isinstance(assigned_qty.get("qty_token"), dict) else {}
+        candidate_qty_tokens = [dict(assigned_token)] if assigned_token else []
+        qty_values = list(assigned_qty.get("qty_values") or [])
 
         prefix = "baseline_slot_candidate" if group == "baseline_slot" else "ai_split_candidate"
         candidate_path = bundle_dir / f"{prefix}_{internal_index}.png"
         mask_candidate_path = bundle_dir / f"{prefix}_{internal_index}_mask.png"
+        raw_mask_candidate_path = bundle_dir / f"{prefix}_{internal_index}_raw_mask.png"
         cv2.imwrite(str(candidate_path), bgra)
         cv2.imwrite(str(mask_candidate_path), bgra[:, :, 3])
+        cv2.imwrite(str(raw_mask_candidate_path), raw_tight_mask)
         clean_candidate_path = ""
         clean_mask_candidate_path = ""
         qty_scrub_status = "not_needed"
@@ -641,14 +871,25 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
             "status": "pending",
             "box": tight_box,
             "source_box": source_box,
+            "component_label": int(component_label),
+            "component_area": int(np.count_nonzero(scoped_component_mask > 0)),
             "label": label,
             "reason": reason,
             "confidence": confidence,
             "candidate_path": str(candidate_path),
             "mask_path": str(mask_candidate_path),
+            "raw_mask_path": str(raw_mask_candidate_path),
+            "alpha_expansion": {
+                "mode": "dilate_close_non_blue_background",
+                "dilate_px": 2,
+                "close_kernel": "3x3",
+                "raw_alpha_area": int(np.count_nonzero(raw_tight_mask > 0)),
+                "expanded_alpha_area": int(np.count_nonzero(tight_mask > 0)),
+            },
             "qty_detected": bool(candidate_qty_tokens),
             "qty_values": qty_values,
             "qty_token_boxes": candidate_qty_tokens,
+            "qty_anchor_assignment": assigned_qty,
             "qty_scrubbed_path": clean_candidate_path,
             "qty_scrubbed_mask_path": clean_mask_candidate_path,
             "thumbnail_path": clean_candidate_path or str(candidate_path),
@@ -656,16 +897,23 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
         }
 
     combined_index = 0
-    for slot_pos, slot in enumerate(slot_assignments):
-        box = _clip_box(_coerce_box(slot.get("component_box")), width, height)
-        if not box:
+    for component_pos, component in enumerate(ordered_components):
+        box = list(component.get("box") or [])
+        component_label = int(component.get("component_label") or 0)
+        if len(box) != 4:
             continue
-        color = palette[slot_pos % len(palette)]
+        component_mask = (component_labels == component_label).astype(np.uint8) * 255
+        color = palette[component_pos % len(palette)]
         x, y, w, h = box
         cv2.rectangle(preview, (x, y), (x + w - 1, y + h - 1), color, 2)
+        assigned_qty = qty_component_assignments.get(component_label, {})
+        qty_values = list(assigned_qty.get("qty_values") or [])
+        label_text = f"Candidate {component_pos + 1}"
+        if qty_values:
+            label_text = f"{label_text} ({'/'.join(str(value) + 'x' for value in qty_values)})"
         cv2.putText(
             preview,
-            f"slot {slot_pos + 1}",
+            label_text,
             (x, max(14, y - 5)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
@@ -675,11 +923,14 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
         )
         candidate = write_candidate(
             group="baseline_slot",
-            display_index=slot_pos + 1,
+            display_index=component_pos + 1,
             internal_index=combined_index,
             source_box=box,
-            label=f"Slot {slot_pos + 1}",
-            reason=str(slot.get("reason") or "original slot assignment"),
+            component_label=component_label,
+            component_mask=component_mask,
+            assigned_qty=assigned_qty,
+            label=f"Mask Component Candidate {component_pos + 1}",
+            reason="raw_master_mask connected component with OCR qty anchor metadata",
             confidence=1.0,
         )
         if candidate:
@@ -711,6 +962,9 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
             display_index=ai_internal_index + 1,
             internal_index=combined_index,
             source_box=box,
+            component_label=0,
+            component_mask=raw_mask,
+            assigned_qty={},
             label=str(region.get("label") or f"AI Suggested Candidate {ai_internal_index + 1}"),
             reason=str(region.get("reason") or ""),
             confidence=float(region.get("confidence", 0) or 0),
@@ -728,6 +982,17 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
         "source_original_crop": str(original_path),
         "source_raw_master_mask": str(mask_path),
         "source_overlay": str(overlay_path) if overlay_path.exists() else "",
+        "candidate_source": "raw_master_mask_connected_components",
+        "qty_anchor_source": "direct_qty_ocr_boxes",
+        "qty_anchor_rule": "OCR boxes assign qty/order to nearest above/near mask component; crops always come from component masks",
+        "mask_component_count": int(component_count) - 1,
+        "accepted_component_count": len(components),
+        "rejected_component_count": len(rejected_components),
+        "rejected_components": rejected_components,
+        "qty_component_assignments": {
+            str(label): assignment
+            for label, assignment in qty_component_assignments.items()
+        },
         "baseline_slot_candidates": baseline_candidates,
         "ai_suggested_candidates": ai_candidates,
         "candidates": all_candidates,
@@ -739,6 +1004,10 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
         "baseline_slot_candidate_count": len(baseline_candidates),
         "ai_suggested_candidate_count": len(ai_candidates),
         "split_candidate_count": len(all_candidates),
+        "mask_component_count": int(component_count) - 1,
+        "accepted_component_count": len(components),
+        "rejected_component_count": len(rejected_components),
+        "qty_component_assignments": paths["qty_component_assignments"],
         "split_candidate_paths": paths,
         "row": stored.get("row"),
     }
@@ -772,6 +1041,43 @@ def mark_split_candidate(bundle_id: str, candidate_index: int, status: str) -> D
         "candidate_index": int(candidate_index),
         "status": status,
         "v2_mask_path": v2_mask_path,
+        "row": stored.get("row"),
+    }
+
+
+def set_split_candidate_review_state(bundle_id: str, candidate_index: int, review_state: str) -> Dict[str, Any]:
+    allowed_states = {"", "needs_mask_expand", "needs_ocr_review", "needs_manual_crop"}
+    state = str(review_state or "").strip()
+    if state not in allowed_states:
+        raise ValueError("review_state must be needs_mask_expand, needs_ocr_review, needs_manual_crop, or empty")
+    row = dict(get_bundle(bundle_id).get("row") or {})
+    paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+    candidates = list(paths.get("candidates") or [])
+    if candidate_index < 0 or candidate_index >= len(candidates):
+        raise ValueError("candidate_index is out of range")
+
+    def update_candidate(raw_candidate: Any) -> Dict[str, Any]:
+        item = dict(raw_candidate) if isinstance(raw_candidate, dict) else {}
+        try:
+            item_index = int(item.get("index"))
+        except Exception:
+            item_index = None
+        if item_index != int(candidate_index):
+            return item
+        item["review_state"] = state
+        if state and str(item.get("status") or "") == "accepted":
+            item["status"] = "pending"
+        return item
+
+    paths["candidates"] = [update_candidate(item) for item in list(paths.get("candidates") or [])]
+    paths["baseline_slot_candidates"] = [update_candidate(item) for item in list(paths.get("baseline_slot_candidates") or [])]
+    paths["ai_suggested_candidates"] = [update_candidate(item) for item in list(paths.get("ai_suggested_candidates") or [])]
+    stored = update_split_candidates(str(row.get("bundle_id") or bundle_id), split_candidate_paths=paths)
+    return {
+        "ok": True,
+        "bundle_id": str(row.get("bundle_id") or bundle_id),
+        "candidate_index": int(candidate_index),
+        "review_state": state,
         "row": stored.get("row"),
     }
 

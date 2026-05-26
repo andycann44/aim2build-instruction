@@ -160,9 +160,25 @@ def register_analysis_bundle(bundle_id: str) -> Dict[str, Any]:
     }
     _write_json_atomic(_TRAINING_STORE_INDEX, new_index)
 
+    postgres_result: Dict[str, Any] = {}
+    try:
+        from clean.services.training_bundle_index_service import register_bundle as register_index_bundle
+
+        postgres_result = register_index_bundle(
+            entry,
+            metadata=metadata,
+            manifest_path=str(metadata_path),
+        )
+    except Exception as exc:
+        postgres_result = {
+            "ok": False,
+            "error": type(exc).__name__,
+        }
+
     return {
         "ok": True,
         "entry": entry,
+        "postgres": postgres_result,
         "index_path": str(_TRAINING_STORE_INDEX),
         "entry_count": len(updated_entries),
     }

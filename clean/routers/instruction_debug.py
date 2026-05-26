@@ -55,6 +55,8 @@ from clean.services.training_bundle_index_service import (
     get_review_stats,
     list_candidate_training_examples,
     list_review_queue,
+    reset_bag_index_rows,
+    unconfirm_candidate_part,
     update_review as update_training_bundle_review,
 )
 from clean.services.training_ai_review_service import (
@@ -62,6 +64,7 @@ from clean.services.training_ai_review_service import (
     generate_split_candidates,
     mark_split_candidate,
     scrub_candidate_qty,
+    set_split_candidate_review_state,
 )
 from clean.services.azure_openai_service import rank_crop_candidates
 from clean.services.ai_snap_crop_service import (
@@ -4892,6 +4895,8 @@ def training_store_export_batch(
     exported_bundle_ids: List[str] = []
     skipped_bundle_ids: List[str] = []
     registered_bundle_ids: List[str] = []
+    local_bundle_paths: Dict[str, str] = {}
+    registration_results: Dict[str, Any] = {}
     failed: List[Dict[str, Any]] = []
 
     for crop in list(crops or []):
@@ -4900,12 +4905,21 @@ def training_store_export_batch(
             continue
         bundle_id = _analysis_bundle_slug(set_text, bag_number, crop_id)
         metadata_path = analysis_root / bundle_id / "metadata.json"
+        local_bundle_paths[bundle_id] = str(metadata_path.parent)
         if metadata_path.exists() and not force_export:
             skipped_bundle_ids.append(bundle_id)
             try:
                 register_result = register_analysis_bundle(bundle_id)
-                if bool(register_result.get("ok")):
+                registration_results[bundle_id] = register_result
+                postgres_result = register_result.get("postgres") if isinstance(register_result.get("postgres"), dict) else {}
+                if bool(register_result.get("ok")) and bool(postgres_result.get("ok")):
                     registered_bundle_ids.append(bundle_id)
+                else:
+                    failed.append({
+                        "bundle_id": bundle_id,
+                        "crop_id": crop_id,
+                        "error": str(postgres_result.get("error") or "postgres_register_failed"),
+                    })
             except Exception as exc:
                 failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": type(exc).__name__})
             continue
@@ -4916,9 +4930,17 @@ def training_store_export_batch(
                 failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": str(payload.get("error") or "export_failed")})
                 continue
             register_result = register_analysis_bundle(bundle_id)
+            registration_results[bundle_id] = register_result
             exported_bundle_ids.append(bundle_id)
-            if bool(register_result.get("ok")):
+            postgres_result = register_result.get("postgres") if isinstance(register_result.get("postgres"), dict) else {}
+            if bool(register_result.get("ok")) and bool(postgres_result.get("ok")):
                 registered_bundle_ids.append(bundle_id)
+            else:
+                failed.append({
+                    "bundle_id": bundle_id,
+                    "crop_id": crop_id,
+                    "error": str(postgres_result.get("error") or "postgres_register_failed"),
+                })
         except HTTPException as exc:
             failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": str(exc.detail)})
         except Exception as exc:
@@ -4943,6 +4965,8 @@ def training_store_export_batch(
             "exported_bundle_ids": exported_bundle_ids,
             "registered_bundle_ids": registered_bundle_ids,
             "skipped_bundle_ids": skipped_bundle_ids,
+            "local_bundle_paths": local_bundle_paths,
+            "registration_results": registration_results,
             "failed": failed,
         }
     )
@@ -5173,6 +5197,91 @@ def training_store_bundle_index_row(bundle_id: str = Query(...)):
     return JSONResponse(result)
 
 
+def _training_bundle_artifact_debug(bundle_id: str) -> Dict[str, Any]:
+    safe_bundle_id = str(bundle_id or "").strip()
+    if not safe_bundle_id or not re.fullmatch(r"[A-Za-z0-9_.-]+", safe_bundle_id):
+        raise ValueError("invalid bundle_id")
+    analysis_root = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+    ).resolve()
+    local_folder = (analysis_root / safe_bundle_id).resolve()
+    if analysis_root not in local_folder.parents:
+        raise ValueError("bundle path escapes analysis bundle directory")
+    metadata_path = local_folder / "metadata.json"
+    metadata: Dict[str, Any] = {}
+    if metadata_path.exists() and metadata_path.is_file():
+        try:
+            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            metadata = {}
+    copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
+
+    def _path_status(path_value: Any) -> Dict[str, Any]:
+        path_text = str(path_value or "").strip()
+        path = Path(path_text) if path_text else Path()
+        return {
+            "path": path_text,
+            "exists": bool(path_text and path.exists() and path.is_file()),
+        }
+
+    local_files_present = (
+        sorted(item.name for item in local_folder.iterdir() if item.is_file())
+        if local_folder.exists() and local_folder.is_dir()
+        else []
+    )
+    return {
+        "bundle_id": safe_bundle_id,
+        "local_folder": str(local_folder),
+        "local_folder_exists": local_folder.exists() and local_folder.is_dir(),
+        "local_files_present": local_files_present,
+        "metadata_path": str(metadata_path),
+        "metadata_exists": metadata_path.exists() and metadata_path.is_file(),
+        "original_crop": _path_status(copied_files.get("original_crop") or (local_folder / "original_crop.png")),
+        "full_mask_overlay": _path_status(copied_files.get("full_mask_overlay") or (local_folder / "full_mask_overlay.png")),
+        "raw_master_mask": _path_status(copied_files.get("raw_master_mask") or (local_folder / "raw_master_mask.png")),
+        "master_island_overlay": _path_status(copied_files.get("master_island_overlay") or (local_folder / "master_island_overlay.png")),
+        "slot_cutouts": [
+            _path_status(path_value)
+            for path_value in list(copied_files.get("slot_cutouts") or [])
+        ],
+    }
+
+
+@router.get("/debug/training-store/bundle-debug")
+def training_store_bundle_debug(bundle_id: str = Query(...)):
+    try:
+        artifact_debug = _training_bundle_artifact_debug(bundle_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    postgres_row: Dict[str, Any] = {}
+    postgres_error = ""
+    postgres_row_found = False
+    try:
+        postgres_row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        postgres_row_found = bool(postgres_row)
+    except FileNotFoundError as exc:
+        postgres_error = str(exc)
+    except Exception as exc:
+        postgres_error = type(exc).__name__
+    return JSONResponse(
+        {
+            "ok": True,
+            "bundle_id": str(bundle_id or "").strip(),
+            "postgres_row_found": postgres_row_found,
+            "postgres_row": postgres_row,
+            "postgres_error": postgres_error,
+            **artifact_debug,
+            "original_crop_exists": bool((artifact_debug.get("original_crop") or {}).get("exists")),
+            "overlay_exists": bool((artifact_debug.get("full_mask_overlay") or {}).get("exists")),
+            "raw_master_mask_exists": bool((artifact_debug.get("raw_master_mask") or {}).get("exists")),
+        }
+    )
+
+
 @router.get("/debug/training-store/review-queue")
 def training_store_review_queue(
     review_status: str = Query(""),
@@ -5283,6 +5392,21 @@ def training_store_reject_split_candidate(
     return JSONResponse(result)
 
 
+@router.post("/debug/training-store/set-candidate-review-state")
+def training_store_set_candidate_review_state(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+    review_state: str = Query(""),
+):
+    try:
+        result = set_split_candidate_review_state(bundle_id, candidate_index, review_state)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
 @router.post("/debug/training-store/scrub-candidate-qty")
 def training_store_scrub_candidate_qty(
     bundle_id: str = Query(...),
@@ -5364,6 +5488,67 @@ async def training_store_confirm_candidate_part(req: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(result)
+
+
+@router.post("/debug/training-store/unconfirm-candidate-part")
+def training_store_unconfirm_candidate_part(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+):
+    try:
+        result = unconfirm_candidate_part(bundle_id=bundle_id, candidate_index=candidate_index)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/reset-bag")
+def training_store_reset_bag(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+    confirm: str = Query(""),
+):
+    safe_set_num = re.sub(r"[^A-Za-z0-9.-]+", "", str(set_num or "").strip())
+    parsed_bag_num = _coerce_int(bag_num)
+    if confirm != "RESET":
+        raise HTTPException(status_code=400, detail="confirm=RESET is required")
+    if not safe_set_num or parsed_bag_num is None:
+        raise HTTPException(status_code=400, detail="set_num and bag_num are required")
+
+    bundle_prefix = f"{safe_set_num}_bag{int(parsed_bag_num)}_"
+    analysis_root = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+    ).resolve()
+    deleted_paths: List[str] = []
+    if analysis_root.exists() and analysis_root.is_dir():
+        for bundle_dir in sorted(analysis_root.glob(f"{bundle_prefix}*")):
+            if not bundle_dir.is_dir():
+                continue
+            resolved = bundle_dir.resolve()
+            if analysis_root not in resolved.parents:
+                continue
+            shutil.rmtree(resolved)
+            deleted_paths.append(str(resolved))
+    try:
+        db_result = reset_bag_index_rows(set_num=safe_set_num, bag_num=int(parsed_bag_num))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(
+        {
+            "ok": True,
+            "set_num": safe_set_num,
+            "bag_num": int(parsed_bag_num),
+            "bundle_prefix": bundle_prefix,
+            "local_analysis_bundle_deleted_count": len(deleted_paths),
+            "local_analysis_bundle_deleted_paths": deleted_paths,
+            **db_result,
+            "r2_touched": False,
+            "catalog_db_touched": False,
+        }
+    )
 
 
 def _training_review_metadata_path(row: Dict[str, Any]) -> Path:
@@ -5480,8 +5665,6 @@ def _training_review_candidate_part_matches(
         required_qty = int(part.get("qty", 0) or 0)
         assigned_qty = int(assigned_totals.get(key, 0) or 0) + int(confirmed_totals.get(key, 0) or 0)
         remaining_qty = required_qty - assigned_qty
-        if remaining_qty <= 0:
-            continue
         catalog_color = color_catalog_by_id.get(int(color_id), {})
         scores = _slot_mask_score_candidate(query_profile, part, color_bgr_by_id)
         ranked.append(
@@ -5515,6 +5698,8 @@ def _training_review_candidate_part_matches(
             str(item.get("part_num") or ""),
         )
     )
+    if limit is None or int(limit or 0) <= 0:
+        return ranked
     return ranked[: max(1, int(limit or 5))]
 
 
@@ -5616,16 +5801,42 @@ def training_store_review_ui(
         raise HTTPException(status_code=400, detail=str(exc))
     rows = [dict(row) for row in list(queue.get("rows") or []) if isinstance(row, dict)]
     selected = next((row for row in rows if str(row.get("bundle_id") or "") == str(bundle_id or "").strip()), None)
+    direct_lookup_warning = ""
     if selected is None and bundle_id:
         try:
             selected = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
-        except Exception:
+        except Exception as exc:
             selected = None
+            try:
+                artifact_debug = _training_bundle_artifact_debug(bundle_id)
+            except Exception:
+                artifact_debug = {}
+            if bool(artifact_debug.get("local_folder_exists")):
+                selected = {
+                    "bundle_id": str(bundle_id or "").strip(),
+                    "manifest_path": str(artifact_debug.get("metadata_path") or ""),
+                }
+                direct_lookup_warning = (
+                    "Postgres row missing for this bundle, but local bundle artifacts exist. "
+                    f"local_folder={artifact_debug.get('local_folder')}; lookup_error={type(exc).__name__}"
+                )
+            else:
+                direct_lookup_warning = (
+                    "Bundle was requested directly but no Postgres row or local bundle folder was found. "
+                    f"lookup_error={type(exc).__name__}"
+                )
     if selected is None and rows:
         selected = rows[0]
 
     selected_bundle_id = str((selected or {}).get("bundle_id") or "")
     metadata = _read_training_review_metadata(selected or {}) if selected else {}
+    if selected and metadata:
+        source_crop = metadata.get("source_crop") if isinstance(metadata.get("source_crop"), dict) else {}
+        selected.setdefault("set_num", str(metadata.get("set_num") or ""))
+        selected.setdefault("bag_num", metadata.get("bag"))
+        selected.setdefault("page_num", source_crop.get("page"))
+        selected.setdefault("step_num", source_crop.get("step"))
+        selected.setdefault("crop_num", _coerce_int(str(metadata.get("crop_id") or "").rsplit("_c", 1)[-1]))
     copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
     qty_token_boxes = [
         dict(item)
@@ -5746,17 +5957,26 @@ def training_store_review_ui(
         display = _coerce_int(candidate.get("display_index"))
         return int(display if display is not None else int(parsed if parsed is not None else fallback) + 1)
 
+    review_state_labels = {
+        "needs_mask_expand": "Needs Mask Expand",
+        "needs_ocr_review": "Needs OCR Review",
+        "needs_manual_crop": "Needs Manual Crop",
+    }
+
     def _render_candidate_cards(candidates: List[Dict[str, Any]]) -> str:
         return "".join(
             (
-                f'<figure class="split-candidate-card">'
+                f'<figure class="split-candidate-card {escape("has-review-state" if str(candidate.get("review_state") or "") else "")}">'
                 f'<div class="slot-img split-candidate-img">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
-                f'<figcaption><strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong><span>{escape(str(candidate.get("status") or "pending"))}</span></figcaption>'
+                f'<figcaption><strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong><span>{escape(review_state_labels.get(str(candidate.get("review_state") or ""), str(candidate.get("status") or "pending")))}</span></figcaption>'
                 f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}<br>Qty scrub: {escape(str(candidate.get("qty_scrub_status") or "not run"))}</div>'
                 f'<div class="candidate-actions">'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Scrub Qty</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_mask_expand">Needs Mask Expand</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_ocr_review">Needs OCR Review</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_manual_crop">Needs Manual Crop</button>'
                 f'</div>'
                 f'</figure>'
             )
@@ -5775,6 +5995,9 @@ def training_store_review_ui(
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Needs Qty Scrub / Scrub Qty</button>'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_mask_expand">Needs Mask Expand</button>'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_ocr_review">Needs OCR Review</button>'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_manual_crop">Needs Manual Crop</button>'
             f'</div>'
             f'</figure>'
         )
@@ -5797,11 +6020,26 @@ def training_store_review_ui(
         except Exception:
             confirmed_example_rows = []
             confirmed_examples = {}
+    def _training_review_candidate_confirmed(confirmed: Dict[str, Any]) -> bool:
+        return any(
+            str(confirmed.get(field) or "").strip()
+            for field in ("part_num", "element_id", "confirmed_by")
+        )
+
     clean_accepted_candidates = [
         dict(candidate)
         for candidate in split_candidates
         if isinstance(candidate, dict)
-        and str(candidate.get("status") or "") == "accepted"
+        and (
+            str(candidate.get("status") or "") == "accepted"
+            or _training_review_candidate_confirmed(
+                confirmed_examples.get(
+                    int(_coerce_int(candidate.get("index")) if _coerce_int(candidate.get("index")) is not None else -1),
+                    {},
+                )
+            )
+        )
+        and not str(candidate.get("review_state") or "").strip()
         and (not bool(candidate.get("qty_detected")) or bool(str(candidate.get("qty_scrubbed_path") or "").strip()))
     ]
     selected_set_num = str((selected or {}).get("set_num") or (metadata.get("set_num") if isinstance(metadata, dict) else "") or "")
@@ -5828,6 +6066,11 @@ def training_store_review_ui(
         if candidate_index is None:
             candidate_index = index
         confirmed = confirmed_examples.get(int(candidate_index), {})
+        is_confirmed = _training_review_candidate_confirmed(confirmed)
+        display_status = "Confirmed - locked" if is_confirmed else str(candidate.get("status") or "pending")
+        display_status_class = " saved" if is_confirmed else ""
+        disabled_attr = " disabled" if is_confirmed else ""
+        locked_class = " locked" if is_confirmed else ""
         qty_values = list(candidate.get("qty_values") or [])
         qty_value = str((qty_values or [""])[0])
         try:
@@ -5835,10 +6078,17 @@ def training_store_review_ui(
                 row=selected or {},
                 candidate=candidate,
                 confirmed_rows=confirmed_example_rows,
-                limit=200,
+                limit=5000,
             )
         except Exception:
             matches = []
+        initial_selected_color_id = _coerce_int(confirmed.get("color_id"))
+        initial_selected_color_text = str(initial_selected_color_id) if initial_selected_color_id is not None else ""
+        initial_filtered_count = (
+            sum(1 for match in matches if _coerce_int(match.get("color_id")) == initial_selected_color_id)
+            if initial_selected_color_id is not None
+            else len(matches)
+        )
         color_buttons: List[str] = []
         seen_match_colors: set[int] = set()
         for match in matches:
@@ -5849,7 +6099,7 @@ def training_store_review_ui(
             rgb_text = str(match.get("color_rgb") or "").strip().replace("#", "")
             swatch_style = f"background: #{escape(rgb_text)};" if re.match(r"^[0-9A-Fa-f]{6}$", rgb_text) else ""
             color_buttons.append(
-                f'<button type="button" class="review-colour-chip" data-review-colour-chip="true" '
+                f'<button type="button" class="review-colour-chip{escape(" active" if initial_selected_color_id is not None and int(match_color_id) == initial_selected_color_id else "")}" data-review-colour-chip="true"{disabled_attr} '
                 f'data-color-id="{escape(str(match_color_id))}" data-color-name="{escape(str(match.get("color_name") or ""))}" '
                 f'data-color-rgb="{escape(rgb_text)}">'
                 f'<span class="review-colour-swatch" style="{swatch_style}"></span>'
@@ -5858,41 +6108,65 @@ def training_store_review_ui(
             )
         color_filter_html = (
             '<div class="review-colour-filter">'
-            '<button type="button" class="review-colour-chip active" data-review-colour-clear="true">All colours</button>'
-            '<button type="button" class="review-colour-chip" data-review-colour-pick="true">Pick colour from candidate</button>'
+            f'<button type="button" class="review-colour-chip{escape(" active" if not initial_selected_color_text else "")}" data-review-colour-clear="true"{disabled_attr}>All colours</button>'
+            f'<button type="button" class="review-colour-chip" data-review-colour-pick="true"{disabled_attr}>Pick colour from candidate</button>'
             + "".join(color_buttons)
             + '</div>'
         )
-        suggestion_html = "".join(
-            (
-                f'<article class="part-suggestion">'
+        suggestion_cards: List[str] = []
+        for match in matches:
+            match_color_value = match.get("color_id")
+            match_color_text = str(match_color_value) if match_color_value is not None else ""
+            suggestion_cards.append(
+                f'<article class="part-suggestion{escape(" hidden" if initial_selected_color_text and match_color_text != initial_selected_color_text else "")}" data-part-color-id="{escape(match_color_text)}">'
                 f'<div class="part-suggestion-img">{_training_review_catalog_img(match.get("image_path") or match.get("image_url"), str(match.get("part_num") or ""))}</div>'
                 f'<div class="part-suggestion-body">'
                 f'<strong>{escape(str(match.get("part_num") or ""))}</strong>'
-                f'<span class="part-colour">{escape(str(match.get("color_name") or ("color " + str(match.get("color_id") or ""))))} ({escape(str(match.get("color_id") or ""))})</span>'
+                f'<span class="part-colour">{escape(str(match.get("color_name") or ("color " + match_color_text)))} ({escape(match_color_text)})</span>'
                 f'<span class="part-name">{escape(str(match.get("part_name") or ""))}</span>'
                 f'<span class="part-meta">element: {escape(str(match.get("element_id") or "n/a"))}</span>'
                 f'<span class="part-meta">remaining: {escape(str(match.get("remaining_qty") or 0))} of {escape(str(match.get("required_qty") or 0))}</span>'
                 f'<span class="part-score">match {escape(str(match.get("confidence") or ""))}</span>'
-                f'<button type="button" data-suggest-confirm="true" data-suggestion-color-id="{escape(str(match.get("color_id") or ""))}" '
+                f'<button type="button" data-suggest-confirm="true"{disabled_attr} data-suggestion-color-id="{escape(match_color_text)}" '
                 f'data-suggestion-color-rgb="{escape(str(match.get("color_rgb") or "").strip().replace("#", ""))}" '
                 f'data-confirm-candidate="{escape(str(candidate_index))}" '
                 f'data-part-num="{escape(str(match.get("part_num") or ""))}" '
-                f'data-color-id="{escape(str(match.get("color_id") or ""))}" '
+                f'data-color-id="{escape(match_color_text)}" '
                 f'data-element-id="{escape(str(match.get("element_id") or ""))}" '
                 f'data-candidate-qty="{escape(qty_value)}">Confirm this part</button>'
                 f'</div>'
                 f'</article>'
             )
-            for match in matches
-        ) or '<div class="missing">No required-part matches available.</div>'
+        suggestion_html = "".join(suggestion_cards)
+        no_color_matches_html = (
+            f'<div class="missing" data-colour-empty-message="true">No set-needed parts found for color_id {escape(initial_selected_color_text)}</div>'
+            if initial_selected_color_text and initial_filtered_count == 0
+            else '<div class="missing hidden" data-colour-empty-message="true"></div>'
+        )
+        if not suggestion_html:
+            suggestion_html = '<div class="missing">No required-part matches available.</div>'
+        match_debug_html = (
+            f'<div class="match-debug" data-match-debug="true" '
+            f'data-total-matches="{escape(str(len(matches)))}" '
+            f'data-selected-color-id="{escape(initial_selected_color_text)}" '
+            f'data-filtered-match-count="{escape(str(initial_filtered_count))}">'
+            f'total_matches: {escape(str(len(matches)))} · '
+            f'selected_color_id: <span data-debug-selected-color>{escape(initial_selected_color_text or "all")}</span> · '
+            f'filtered_match_count: <span data-debug-filtered-count>{escape(str(initial_filtered_count))}</span>'
+            f'</div>'
+        )
+        unconfirm_html = (
+            f'<button type="button" class="unconfirm-btn" data-unconfirm-candidate="{escape(str(candidate_index))}">Unconfirm part</button>'
+            if is_confirmed
+            else ""
+        )
         confirm_cards.append(
-            f'<article class="confirm-card annotation-workstation">'
+            f'<article class="confirm-card annotation-workstation{locked_class}">'
             f'<div class="confirm-card-head">'
             f'<div><strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong>'
             f'<span>qty {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span></div>'
-            f'<span class="review-state">{escape(str(candidate.get("status") or "pending"))}</span>'
-            f'<span class="review-state {escape("saved" if int(candidate_index) in confirmed_examples else "unsaved")}">{escape("confirmed" if int(candidate_index) in confirmed_examples else "not confirmed")}</span>'
+            f'<span class="review-state{display_status_class}">{escape(display_status)}</span>'
+            f'<span class="review-state {escape("saved" if is_confirmed else "unsaved")}">{escape("confirmed" if is_confirmed else "not confirmed")}</span>'
             f'{step_link_html}'
             f'</div>'
             f'<div class="candidate-workspace">'
@@ -5900,24 +6174,31 @@ def training_store_review_ui(
             f'<div class="confirm-thumb" data-confirm-thumb="true">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
             f'<div class="candidate-preview-meta">'
             f'<span><strong>Qty</strong> {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span>'
-            f'<span><strong>State</strong> {escape(str(candidate.get("status") or "pending"))}</span>'
+            f'<span><strong>State</strong> {escape(display_status)}</span>'
             f'<span><strong>Scrub</strong> {escape(str(candidate.get("qty_scrub_status") or "not run"))}</span>'
             f'</div>'
-            f'<label><span class="label">part_num</span><input data-confirm-field="part_num" value="{escape(str(confirmed.get("part_num") or ""))}"></label>'
-            f'<label><span class="label">color_id</span><input data-confirm-field="color_id" type="number" value="{escape(str(confirmed.get("color_id") or ""))}"></label>'
-            f'<label><span class="label">element_id</span><input data-confirm-field="element_id" value="{escape(str(confirmed.get("element_id") or ""))}"></label>'
-            f'<label><span class="label">confirmed_by</span><input data-confirm-field="confirmed_by" value="{escape(str(confirmed.get("confirmed_by") or "andy"))}"></label>'
-            f'<button type="button" class="manual-confirm-btn" data-confirm-candidate="{escape(str(candidate_index))}" data-candidate-qty="{escape(qty_value)}">Confirm manual fields</button>'
+            f'<label><span class="label">part_num</span><input data-confirm-field="part_num" value="{escape(str(confirmed.get("part_num") or ""))}"{disabled_attr}></label>'
+            f'<label><span class="label">color_id</span><input data-confirm-field="color_id" type="number" value="{escape(str(confirmed.get("color_id") or ""))}"{disabled_attr}></label>'
+            f'<label><span class="label">element_id</span><input data-confirm-field="element_id" value="{escape(str(confirmed.get("element_id") or ""))}"{disabled_attr}></label>'
+            f'<label><span class="label">confirmed_by</span><input data-confirm-field="confirmed_by" value="{escape(str(confirmed.get("confirmed_by") or "andy"))}"{disabled_attr}></label>'
+            f'<button type="button" class="manual-confirm-btn" data-confirm-candidate="{escape(str(candidate_index))}" data-candidate-qty="{escape(qty_value)}"{disabled_attr}>Confirm manual fields</button>'
+            f'{unconfirm_html}'
             f'</div>'
             f'<div class="candidate-match-panel">'
             f'{color_filter_html}'
-            f'<div class="part-suggestions" aria-label="Suggested LEGO parts">{suggestion_html}</div>'
+            f'{match_debug_html}'
+            f'<div class="part-suggestions" aria-label="Suggested LEGO parts">{suggestion_html}{no_color_matches_html}</div>'
             f'</div>'
             f'</div>'
             f'</article>'
         )
     confirm_candidate_html = "".join(confirm_cards) or '<div class="missing">No clean accepted candidates ready for part confirmation.</div>'
     title = escape(selected_bundle_id or "Training Review")
+    direct_lookup_warning_html = (
+        f'<div class="missing">{escape(direct_lookup_warning)}</div>'
+        if direct_lookup_warning
+        else ""
+    )
     html = f"""
 <!doctype html>
 <html>
@@ -5943,16 +6224,20 @@ def training_store_review_ui(
     .slots {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }}
     .split-candidates {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px; margin-top:10px; align-items:start; }}
     .split-candidate-card {{ display:grid; gap:9px; padding:10px; }}
+    .split-candidate-card.has-review-state {{ border-color:#d59a20; background:#fff8e8; }}
     .split-candidate-card figcaption {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
     .split-candidate-card figcaption strong {{ color:#172026; font-size:14px; }}
+    .split-candidate-card.has-review-state figcaption span {{ color:#8a5a00; font-weight:700; }}
     .split-candidate-img {{ min-height:132px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
     .split-candidate-img img {{ max-height:118px; max-width:150px; object-fit:contain; background:transparent; }}
     .candidate-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-top:8px; }}
     .candidate-actions button {{ padding:8px 9px; font-size:12px; min-width:0; white-space:normal; line-height:1.15; }}
     .candidate-actions button[data-candidate-action="scrub"] {{ grid-column:1 / -1; }}
+    .candidate-actions button[data-candidate-action^="needs_"] {{ background:#fff8e8; border-color:#d59a20; color:#755000; }}
     .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
     .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:18px; margin-top:10px; }}
     .confirm-card {{ background:white; border:1px solid #d8dee3; border-radius:8px; padding:14px; overflow:hidden; box-shadow:0 1px 2px rgba(31,45,61,.04); }}
+    .confirm-card.locked {{ border-color:#7db28a; background:#f7fbf7; }}
     .confirm-card-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; border-bottom:1px solid #e4e9ed; padding-bottom:10px; margin-bottom:12px; }}
     .confirm-card-head strong {{ display:block; font-size:18px; line-height:1.15; }}
     .confirm-card-head span {{ color:#66727d; font-size:13px; }}
@@ -5973,6 +6258,8 @@ def training_store_review_ui(
     .candidate-preview-panel label {{ display:block; }}
     .candidate-preview-panel input {{ width:100%; box-sizing:border-box; }}
     .manual-confirm-btn {{ width:100%; }}
+    .unconfirm-btn {{ width:100%; background:#f8fafb; color:#2f6c41; border-color:#7db28a; }}
+    button:disabled, input:disabled {{ opacity:.58; cursor:not-allowed; }}
     .candidate-match-panel {{ min-width:0; }}
     .review-colour-filter {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; padding:10px; border:1px solid #e4e9ed; border-radius:8px; background:#f8fafb; }}
     .review-colour-chip {{ display:inline-flex; align-items:center; gap:7px; border:1px solid #cbd6e2; border-radius:999px; background:#fff; color:#32465a; padding:8px 12px; font-size:12px; line-height:1.2; cursor:pointer; max-width:100%; }}
@@ -6027,6 +6314,7 @@ def training_store_review_ui(
     <aside>{''.join(queue_links) or '<div class="missing">No bundles match the current filters.</div>'}</aside>
     <section>
       <h2>{title}</h2>
+      {direct_lookup_warning_html}
       <div class="meta">
         <div><span class="label">status</span>{escape(str((selected or {}).get("review_status") or ""))}</div>
         <div><span class="label">set</span>{escape(str((selected or {}).get("set_num") or ""))}</div>
@@ -6094,12 +6382,16 @@ def training_store_review_ui(
       button.addEventListener('click', async () => {{
         const action = button.dataset.candidateAction;
         const index = button.dataset.candidateIndex;
-        const endpoint = action === 'accept'
-          ? '/debug/training-store/accept-split-candidate'
-          : (action === 'scrub'
-            ? '/debug/training-store/scrub-candidate-qty'
-            : '/debug/training-store/reject-split-candidate');
         const params = new URLSearchParams({{bundle_id: "{escape(selected_bundle_id)}", candidate_index: String(index || "")}});
+        let endpoint = '/debug/training-store/reject-split-candidate';
+        if (action === 'accept') {{
+          endpoint = '/debug/training-store/accept-split-candidate';
+        }} else if (action === 'scrub') {{
+          endpoint = '/debug/training-store/scrub-candidate-qty';
+        }} else if (['needs_mask_expand', 'needs_ocr_review', 'needs_manual_crop'].includes(action)) {{
+          endpoint = '/debug/training-store/set-candidate-review-state';
+          params.set('review_state', action);
+        }}
         const res = await fetch(endpoint + '?' + params.toString(), {{method: 'POST'}});
         if (!res.ok) {{
           alert(await res.text());
@@ -6110,6 +6402,9 @@ def training_store_review_ui(
     }});
     document.querySelectorAll('[data-confirm-candidate]').forEach((button) => {{
       button.addEventListener('click', async () => {{
+        if (button.disabled) {{
+          return;
+        }}
         const card = button.closest('.confirm-card');
         const fieldValue = (name) => {{
           const input = card && card.querySelector('[data-confirm-field="' + name + '"]');
@@ -6136,6 +6431,18 @@ def training_store_review_ui(
         location.reload();
       }});
     }});
+    document.querySelectorAll('[data-unconfirm-candidate]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const index = button.dataset.unconfirmCandidate;
+        const params = new URLSearchParams({{bundle_id: "{escape(selected_bundle_id)}", candidate_index: String(index || "")}});
+        const res = await fetch('/debug/training-store/unconfirm-candidate-part?' + params.toString(), {{method: 'POST'}});
+        if (!res.ok) {{
+          alert(await res.text());
+          return;
+        }}
+        location.reload();
+      }});
+    }});
     function rgbHexToTuple(rgbHex) {{
       const text = String(rgbHex || '').trim().replace(/^#/, '').toUpperCase();
       if (!/^[0-9A-F]{{6}}$/.test(text)) {{
@@ -6152,19 +6459,45 @@ def training_store_review_ui(
       if (!card) {{
         return;
       }}
-      const selected = String(colorId || '');
+      const selected = colorId === null || colorId === undefined ? '' : String(colorId);
       card.querySelectorAll('[data-review-colour-chip]').forEach((button) => {{
-        button.classList.toggle('active', selected && String(button.dataset.colorId || '') === selected);
+        const buttonColor = button.dataset.colorId === undefined ? '' : String(button.dataset.colorId);
+        button.classList.toggle('active', !!selected && buttonColor === selected);
       }});
       const clearButton = card.querySelector('[data-review-colour-clear]');
       if (clearButton) {{
         clearButton.classList.toggle('active', !selected);
       }}
+      let filteredCount = 0;
       card.querySelectorAll('.part-suggestion').forEach((node) => {{
-        const confirmButton = node.querySelector('[data-suggest-confirm]');
-        const matchColor = confirmButton ? String(confirmButton.dataset.suggestionColorId || '') : '';
-        node.classList.toggle('hidden', !!selected && matchColor !== selected);
+        const matchColor = node.dataset.partColorId === undefined ? '' : String(node.dataset.partColorId);
+        const hidden = !!selected && matchColor !== selected;
+        node.classList.toggle('hidden', hidden);
+        if (!hidden) {{
+          filteredCount += 1;
+        }}
       }});
+      const debug = card.querySelector('[data-match-debug]');
+      if (debug) {{
+        debug.dataset.selectedColorId = selected;
+        debug.dataset.filteredMatchCount = String(filteredCount);
+        const selectedNode = debug.querySelector('[data-debug-selected-color]');
+        const countNode = debug.querySelector('[data-debug-filtered-count]');
+        if (selectedNode) {{
+          selectedNode.textContent = selected || 'all';
+        }}
+        if (countNode) {{
+          countNode.textContent = String(filteredCount);
+        }}
+      }}
+      const emptyMessage = card.querySelector('[data-colour-empty-message]');
+      if (emptyMessage) {{
+        const showEmpty = !!selected && filteredCount === 0;
+        emptyMessage.classList.toggle('hidden', !showEmpty);
+        if (showEmpty) {{
+          emptyMessage.textContent = 'No set-needed parts found for color_id ' + selected;
+        }}
+      }}
       const colorInput = card.querySelector('[data-confirm-field="color_id"]');
       if (colorInput && selected) {{
         colorInput.value = selected;
@@ -6172,11 +6505,17 @@ def training_store_review_ui(
     }}
     document.querySelectorAll('[data-review-colour-clear]').forEach((button) => {{
       button.addEventListener('click', () => {{
+        if (button.disabled) {{
+          return;
+        }}
         setReviewCardColour(button.closest('.confirm-card'), '');
       }});
     }});
     document.querySelectorAll('[data-review-colour-chip]').forEach((button) => {{
       button.addEventListener('click', () => {{
+        if (button.disabled) {{
+          return;
+        }}
         if (button.dataset.reviewColourClear === 'true') {{
           return;
         }}
@@ -6185,6 +6524,9 @@ def training_store_review_ui(
     }});
     document.querySelectorAll('[data-review-colour-pick]').forEach((button) => {{
       button.addEventListener('click', () => {{
+        if (button.disabled) {{
+          return;
+        }}
         const card = button.closest('.confirm-card');
         const thumb = card && card.querySelector('[data-confirm-thumb]');
         if (!thumb) {{
