@@ -50,8 +50,10 @@ from clean.services import debug_service, step_detector_service
 from clean.services.training_store_service import list_registered_bundles, register_analysis_bundle, update_bundle_review
 from clean.services.training_cloud_sync_service import prepare_bundle_for_azure, prepare_bundle_for_r2, upload_bundle_to_r2
 from clean.services.training_bundle_index_service import (
+    confirm_candidate_part,
     get_bundle as get_training_bundle_index_row,
     get_review_stats,
+    list_candidate_training_examples,
     list_review_queue,
     update_review as update_training_bundle_review,
 )
@@ -5295,6 +5297,75 @@ def training_store_scrub_candidate_qty(
     return JSONResponse(result)
 
 
+@router.post("/debug/training-store/confirm-candidate-part")
+async def training_store_confirm_candidate_part(req: Request):
+    payload: Dict[str, Any] = {}
+    try:
+        body = await req.json()
+        if isinstance(body, dict):
+            payload = dict(body)
+    except Exception:
+        payload = {}
+    query = dict(req.query_params)
+    bundle_id = str(payload.get("bundle_id") or query.get("bundle_id") or "").strip()
+    candidate_index_raw = payload.get("candidate_index", query.get("candidate_index"))
+    try:
+        candidate_index = int(candidate_index_raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="candidate_index is required")
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+        candidates = [
+            dict(item)
+            for item in list(paths.get("candidates") or [])
+            if isinstance(item, dict)
+        ]
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if _coerce_int(item.get("index")) == int(candidate_index)
+            ),
+            None,
+        )
+        if candidate is None and 0 <= candidate_index < len(candidates):
+            candidate = candidates[candidate_index]
+        if candidate is None:
+            raise ValueError("candidate_index is out of range")
+        if str(candidate.get("status") or "") != "accepted":
+            raise ValueError("candidate must be accepted before part confirmation")
+        if bool(candidate.get("qty_detected")) and not str(candidate.get("qty_scrubbed_path") or "").strip():
+            raise ValueError("candidate must be qty-scrubbed before part confirmation")
+        qty_values = list(candidate.get("qty_values") or [])
+        qty = payload.get("qty", query.get("qty"))
+        if qty in {None, ""} and qty_values:
+            qty = qty_values[0]
+        thumbnail_path = str(
+            payload.get("thumbnail_path")
+            or candidate.get("qty_scrubbed_path")
+            or candidate.get("thumbnail_path")
+            or candidate.get("candidate_path")
+            or ""
+        )
+        result = confirm_candidate_part(
+            bundle_id=bundle_id,
+            candidate_index=candidate_index,
+            part_num=str(payload.get("part_num") or query.get("part_num") or ""),
+            color_id=payload.get("color_id", query.get("color_id")),
+            element_id=str(payload.get("element_id") or query.get("element_id") or ""),
+            qty=qty,
+            thumbnail_path=thumbnail_path,
+            r2_path=str(payload.get("r2_path") or query.get("r2_path") or candidate.get("r2_path") or ""),
+            confirmed_by=str(payload.get("confirmed_by") or query.get("confirmed_by") or "andy"),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
 def _training_review_metadata_path(row: Dict[str, Any]) -> Path:
     manifest_path = Path(str(row.get("manifest_path") or "").strip())
     if manifest_path.exists() and manifest_path.is_file():
@@ -5327,6 +5398,124 @@ def _training_review_img(path_value: Any, alt: str) -> str:
         return '<div class="missing">missing</div>'
     src = f"/debug/ai-snap-artifact?path={_url_quote(path_text)}"
     return f'<img src="{src}" alt="{escape(alt)}" loading="lazy">'
+
+
+def _training_review_catalog_img(path_value: Any, alt: str) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return '<div class="missing">no image</div>'
+    if path_text.startswith(("http://", "https://")):
+        src = path_text
+    else:
+        src = f"/debug/ai-snap-artifact?path={_url_quote(path_text)}"
+    return f'<img src="{escape(src)}" alt="{escape(alt)}" loading="lazy">'
+
+
+def _training_review_confirmed_example_totals(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    totals: Dict[str, int] = {}
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        part_num = str(row.get("part_num") or "").strip()
+        color_id = _coerce_int(row.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        qty = _coerce_int(row.get("qty"))
+        assigned_qty = int(qty) if qty is not None and int(qty) > 0 else 1
+        key = _candidate_part_key(part_num, color_id)
+        totals[key] = totals.get(key, 0) + assigned_qty
+    return totals
+
+
+def _training_review_candidate_part_matches(
+    *,
+    row: Dict[str, Any],
+    candidate: Dict[str, Any],
+    confirmed_rows: List[Dict[str, Any]],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    set_num = str(row.get("set_num") or "").strip()
+    bag = _coerce_int(row.get("bag_num")) or 1
+    if not set_num:
+        parsed = re.match(r"^(?P<set>[^_]+)_bag(?P<bag>\d+)_", str(row.get("bundle_id") or ""))
+        if parsed:
+            set_num = str(parsed.group("set") or "")
+            bag = _coerce_int(parsed.group("bag")) or bag
+    thumbnail_path = str(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path") or "").strip()
+    mask_path = str(candidate.get("qty_scrubbed_mask_path") or candidate.get("mask_path") or "").strip()
+    if not set_num or not thumbnail_path:
+        return []
+    query_profile = _slot_mask_query_profile(thumbnail_path, mask_path)
+    if query_profile is None:
+        return []
+
+    candidate_rows, _pool_source = _slot_mask_candidate_pool(set_num, int(bag))
+    if not candidate_rows:
+        return []
+    labels_path = _label_store_path(set_num, int(bag))
+    labels_payload = _load_existing_labels(labels_path)
+    assigned_totals = _assigned_part_totals_from_labels(labels_payload)
+    confirmed_totals = _training_review_confirmed_example_totals(confirmed_rows)
+    color_ids = [int(part.get("color_id", 0) or 0) for part in candidate_rows]
+    color_bgr_by_id = {
+        int(item["color_id"]): _slot_mask_hex_to_bgr(item.get("rgb"))
+        for item in _load_catalog_colors_for_ids(color_ids)
+    }
+    color_catalog_by_id = {
+        int(item.get("color_id", 0) or 0): dict(item)
+        for item in _load_catalog_colors_for_ids(color_ids)
+    }
+    color_bgr_by_id = {
+        color_id: bgr
+        for color_id, bgr in color_bgr_by_id.items()
+        if bgr is not None
+    }
+    ranked: List[Dict[str, Any]] = []
+    for part in candidate_rows:
+        part_num = str(part.get("part_num") or "").strip()
+        color_id = _coerce_int(part.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        key = _candidate_part_key(part_num, color_id)
+        required_qty = int(part.get("qty", 0) or 0)
+        assigned_qty = int(assigned_totals.get(key, 0) or 0) + int(confirmed_totals.get(key, 0) or 0)
+        remaining_qty = required_qty - assigned_qty
+        if remaining_qty <= 0:
+            continue
+        catalog_color = color_catalog_by_id.get(int(color_id), {})
+        scores = _slot_mask_score_candidate(query_profile, part, color_bgr_by_id)
+        ranked.append(
+            {
+                "part_num": part_num,
+                "display_part_num": str(part.get("display_part_num") or part_num),
+                "color_id": int(color_id),
+                "color_name": str(part.get("color_name") or catalog_color.get("color_name") or f"color {int(color_id)}"),
+                "color_rgb": str(catalog_color.get("rgb") or ""),
+                "element_id": str(part.get("element_id") or ""),
+                "part_name": str(part.get("part_name") or part.get("name") or part.get("part_name_en") or part.get("description") or ""),
+                "image_url": str(part.get("img_url") or "").strip(),
+                "image_path": str(_slot_mask_resolve_local_image_path(part.get("img_url")) or ""),
+                "required_qty": required_qty,
+                "assigned_qty": assigned_qty,
+                "remaining_qty": remaining_qty,
+                "confidence": scores["confidence"],
+                "score_breakdown": {
+                    "colour": scores["colour"],
+                    "aspect": scores["aspect"],
+                    "silhouette": scores["silhouette"],
+                    "candidate_image_available": bool(scores["candidate_image_available"]),
+                },
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            -float(item.get("confidence", 0.0) or 0.0),
+            -float((item.get("score_breakdown") or {}).get("colour", 0.0) or 0.0),
+            -int(item.get("remaining_qty", 0) or 0),
+            str(item.get("part_num") or ""),
+        )
+    )
+    return ranked[: max(1, int(limit or 5))]
 
 
 def _training_review_qty_overlay(copied_files: Dict[str, Any], qty_token_boxes: List[Dict[str, Any]], bundle_id: str) -> str:
@@ -5591,6 +5780,111 @@ def training_store_review_ui(
         )
         for index, candidate in enumerate(split_candidates)
     ) if not baseline_slot_candidates and not ai_suggested_candidates else ""
+    confirmed_example_rows: List[Dict[str, Any]] = []
+    confirmed_examples: Dict[int, Dict[str, Any]] = {}
+    if selected_bundle_id:
+        try:
+            confirmed_example_rows = [
+                dict(item)
+                for item in list(list_candidate_training_examples(selected_bundle_id).get("rows") or [])
+                if isinstance(item, dict)
+            ]
+            confirmed_examples = {
+                int(item.get("candidate_index")): dict(item)
+                for item in confirmed_example_rows
+                if isinstance(item, dict) and _coerce_int(item.get("candidate_index")) is not None
+            }
+        except Exception:
+            confirmed_example_rows = []
+            confirmed_examples = {}
+    clean_accepted_candidates = [
+        dict(candidate)
+        for candidate in split_candidates
+        if isinstance(candidate, dict)
+        and str(candidate.get("status") or "") == "accepted"
+        and (not bool(candidate.get("qty_detected")) or bool(str(candidate.get("qty_scrubbed_path") or "").strip()))
+    ]
+    confirm_cards: List[str] = []
+    for index, candidate in enumerate(clean_accepted_candidates):
+        candidate_index = _coerce_int(candidate.get("index"))
+        if candidate_index is None:
+            candidate_index = index
+        confirmed = confirmed_examples.get(int(candidate_index), {})
+        qty_values = list(candidate.get("qty_values") or [])
+        qty_value = str((qty_values or [""])[0])
+        try:
+            matches = _training_review_candidate_part_matches(
+                row=selected or {},
+                candidate=candidate,
+                confirmed_rows=confirmed_example_rows,
+                limit=5,
+            )
+        except Exception:
+            matches = []
+        color_buttons: List[str] = []
+        seen_match_colors: set[int] = set()
+        for match in matches:
+            match_color_id = _coerce_int(match.get("color_id"))
+            if match_color_id is None or int(match_color_id) in seen_match_colors:
+                continue
+            seen_match_colors.add(int(match_color_id))
+            rgb_text = str(match.get("color_rgb") or "").strip().replace("#", "")
+            swatch_style = f"background: #{escape(rgb_text)};" if re.match(r"^[0-9A-Fa-f]{6}$", rgb_text) else ""
+            color_buttons.append(
+                f'<button type="button" class="review-colour-chip" data-review-colour-chip="true" '
+                f'data-color-id="{escape(str(match_color_id))}" data-color-name="{escape(str(match.get("color_name") or ""))}" '
+                f'data-color-rgb="{escape(rgb_text)}">'
+                f'<span class="review-colour-swatch" style="{swatch_style}"></span>'
+                f'<span>{escape(str(match.get("color_name") or ("color " + str(match_color_id))))} ({escape(str(match_color_id))})</span>'
+                f'</button>'
+            )
+        color_filter_html = (
+            '<div class="review-colour-filter">'
+            '<button type="button" class="review-colour-chip active" data-review-colour-clear="true">All colours</button>'
+            '<button type="button" class="review-colour-chip" data-review-colour-pick="true">Pick colour from candidate</button>'
+            + "".join(color_buttons)
+            + '</div>'
+        )
+        suggestion_html = "".join(
+            (
+                f'<div class="part-suggestion">'
+                f'<div class="part-suggestion-img">{_training_review_catalog_img(match.get("image_path") or match.get("image_url"), str(match.get("part_num") or ""))}</div>'
+                f'<div class="part-suggestion-body">'
+                f'<strong>{escape(str(match.get("part_num") or ""))} / {escape(str(match.get("color_id") or ""))}</strong>'
+                f'<span>{escape(str(match.get("part_name") or match.get("color_name") or ""))}</span>'
+                f'<span>element: {escape(str(match.get("element_id") or "n/a"))}</span>'
+                f'<span>remaining: {escape(str(match.get("remaining_qty") or 0))} of {escape(str(match.get("required_qty") or 0))}</span>'
+                f'<span>match: {escape(str(match.get("confidence") or ""))}</span>'
+                f'<button type="button" data-suggest-confirm="true" data-suggestion-color-id="{escape(str(match.get("color_id") or ""))}" '
+                f'data-suggestion-color-rgb="{escape(str(match.get("color_rgb") or "").strip().replace("#", ""))}" '
+                f'data-confirm-candidate="{escape(str(candidate_index))}" '
+                f'data-part-num="{escape(str(match.get("part_num") or ""))}" '
+                f'data-color-id="{escape(str(match.get("color_id") or ""))}" '
+                f'data-element-id="{escape(str(match.get("element_id") or ""))}" '
+                f'data-candidate-qty="{escape(qty_value)}">Confirm this part</button>'
+                f'</div>'
+                f'</div>'
+            )
+            for match in matches
+        ) or '<div class="missing">No required-part matches available.</div>'
+        confirm_cards.append(
+            f'<article class="confirm-card">'
+            f'<div class="confirm-thumb" data-confirm-thumb="true">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+            f'<div class="confirm-fields">'
+            f'<strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong>'
+            f'<span class="candidate-meta">qty: {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span>'
+            f'<label><span class="label">part_num</span><input data-confirm-field="part_num" value="{escape(str(confirmed.get("part_num") or ""))}"></label>'
+            f'<label><span class="label">color_id</span><input data-confirm-field="color_id" type="number" value="{escape(str(confirmed.get("color_id") or ""))}"></label>'
+            f'<label><span class="label">element_id</span><input data-confirm-field="element_id" value="{escape(str(confirmed.get("element_id") or ""))}"></label>'
+            f'<label><span class="label">confirmed_by</span><input data-confirm-field="confirmed_by" value="{escape(str(confirmed.get("confirmed_by") or "andy"))}"></label>'
+            f'<button type="button" data-confirm-candidate="{escape(str(candidate_index))}" data-candidate-qty="{escape(qty_value)}">Confirm Manual Fields</button>'
+            f'<span class="candidate-meta">{escape("confirmed" if int(candidate_index) in confirmed_examples else "not confirmed")}</span>'
+            f'</div>'
+            f'{color_filter_html}'
+            f'<div class="part-suggestions">{suggestion_html}</div>'
+            f'</article>'
+        )
+    confirm_candidate_html = "".join(confirm_cards) or '<div class="missing">No clean accepted candidates ready for part confirmation.</div>'
     title = escape(selected_bundle_id or "Training Review")
     html = f"""
 <!doctype html>
@@ -5619,6 +5913,27 @@ def training_store_review_ui(
     .candidate-actions {{ display:flex; gap:6px; margin-top:8px; }}
     .candidate-actions button {{ padding:6px 8px; font-size:12px; }}
     .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
+    .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:14px; margin-top:10px; }}
+    .confirm-card {{ display:grid; grid-template-columns:128px minmax(260px,360px) minmax(360px,1fr); gap:12px; background:white; border:1px solid #d8dee3; border-radius:6px; padding:12px; align-items:start; overflow:hidden; }}
+    .confirm-thumb {{ min-height:116px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
+    .confirm-thumb.picker-active {{ outline:2px solid #cf1f1f; cursor:crosshair; }}
+    .confirm-thumb.picker-active img {{ cursor:crosshair; }}
+    .confirm-thumb img {{ max-height:112px; max-width:112px; object-fit:contain; background:transparent; }}
+    .confirm-fields {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; align-items:end; min-width:0; }}
+    .confirm-fields strong, .confirm-fields .candidate-meta {{ grid-column:1 / -1; }}
+    .confirm-fields button {{ grid-column:1 / -1; }}
+    .review-colour-filter {{ grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding-top:2px; }}
+    .review-colour-chip {{ display:inline-flex; align-items:center; gap:7px; border:1px solid #cbd6e2; border-radius:999px; background:#fff; color:#32465a; padding:7px 10px; font-size:12px; line-height:1.2; cursor:pointer; max-width:100%; }}
+    .review-colour-chip.active {{ border-color:#cf1f1f; background:#fff1f1; color:#7d1d1d; box-shadow:0 0 0 2px rgba(207,31,31,.08); }}
+    .review-colour-swatch {{ width:14px; height:14px; border-radius:999px; border:1px solid rgba(0,0,0,.2); flex:0 0 14px; }}
+    .part-suggestions {{ display:grid; gap:8px; max-height:420px; overflow:auto; padding-right:4px; }}
+    .part-suggestion {{ display:grid; grid-template-columns:70px minmax(0,1fr); gap:10px; border:1px solid #e4e9ed; border-radius:6px; padding:8px; }}
+    .part-suggestion.hidden {{ display:none; }}
+    .part-suggestion-img {{ display:flex; align-items:center; justify-content:center; }}
+    .part-suggestion-img img {{ max-height:58px; max-width:66px; object-fit:contain; background:transparent; }}
+    .part-suggestion-body {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 8px; font-size:12px; color:#66727d; min-width:0; }}
+    .part-suggestion-body strong {{ color:#172026; }}
+    .part-suggestion-body button {{ grid-column:1 / -1; padding:6px 8px; font-size:12px; }}
     .ocr-table {{ width:100%; border-collapse:collapse; background:white; border:1px solid #d8dee3; border-radius:6px; overflow:hidden; margin:8px 0 14px; }}
     .ocr-table th, .ocr-table td {{ text-align:left; border-bottom:1px solid #e4e9ed; padding:7px 8px; font-size:13px; }}
     .ocr-table th {{ color:#66727d; background:#f8fafb; }}
@@ -5634,6 +5949,20 @@ def training_store_review_ui(
     textarea {{ grid-column:span 2; min-height:42px; }}
     button {{ background:#1f6fc9; color:white; border-color:#1f6fc9; cursor:pointer; }}
     .missing {{ padding:18px; color:#66727d; background:#f3f5f6; border-radius:6px; }}
+    @media (max-width: 1180px) {{
+      .confirm-card {{ grid-template-columns:112px minmax(220px,1fr); }}
+      .part-suggestions {{ grid-column:1 / -1; }}
+    }}
+    @media (max-width: 760px) {{
+      main {{ grid-template-columns:1fr; }}
+      aside {{ display:none; }}
+      .confirm-card {{ grid-template-columns:92px minmax(0,1fr); }}
+      .confirm-thumb {{ min-height:92px; }}
+      .confirm-thumb img {{ max-width:82px; max-height:82px; }}
+      .confirm-fields {{ grid-template-columns:1fr; }}
+      .review-colour-filter, .part-suggestions {{ grid-column:1 / -1; }}
+      .meta, .images {{ grid-template-columns:1fr; }}
+    }}
   </style>
 </head>
 <body>
@@ -5670,6 +5999,8 @@ def training_store_review_ui(
       <h4>AI Suggested Candidates</h4>
       <div class="split-candidates">{ai_candidate_html}</div>
       {f'<h4>Legacy Candidates</h4><div class="split-candidates">{legacy_split_candidate_html}</div>' if legacy_split_candidate_html else ''}
+      <h3>Confirm LEGO Part</h3>
+      <div class="confirm-grid">{confirm_candidate_html}</div>
       <form id="review-form">
         <input type="hidden" name="bundle_id" value="{escape(selected_bundle_id)}">
         <label><span class="label">status</span><select name="review_status"><option>approved</option><option>rejected</option><option>needs_split_fix</option><option>bad_mask</option></select></label>
@@ -5719,6 +6050,162 @@ def training_store_review_ui(
           return;
         }}
         location.reload();
+      }});
+    }});
+    document.querySelectorAll('[data-confirm-candidate]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const card = button.closest('.confirm-card');
+        const fieldValue = (name) => {{
+          const input = card && card.querySelector('[data-confirm-field="' + name + '"]');
+          return input ? input.value : '';
+        }};
+        const payload = {{
+          bundle_id: "{escape(selected_bundle_id)}",
+          candidate_index: Number(button.dataset.confirmCandidate || 0),
+          part_num: button.dataset.partNum || fieldValue('part_num'),
+          color_id: Number(button.dataset.colorId || fieldValue('color_id') || 0),
+          element_id: button.dataset.elementId || fieldValue('element_id'),
+          qty: Number(button.dataset.candidateQty || 0) || null,
+          confirmed_by: fieldValue('confirmed_by') || 'andy'
+        }};
+        const res = await fetch('/debug/training-store/confirm-candidate-part', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload)
+        }});
+        if (!res.ok) {{
+          alert(await res.text());
+          return;
+        }}
+        location.reload();
+      }});
+    }});
+    function rgbHexToTuple(rgbHex) {{
+      const text = String(rgbHex || '').trim().replace(/^#/, '').toUpperCase();
+      if (!/^[0-9A-F]{{6}}$/.test(text)) {{
+        return null;
+      }}
+      return [parseInt(text.slice(0, 2), 16), parseInt(text.slice(2, 4), 16), parseInt(text.slice(4, 6), 16)];
+    }}
+    function rgbDistanceSquared(left, right) {{
+      return Math.pow(Number(left[0] || 0) - Number(right[0] || 0), 2)
+        + Math.pow(Number(left[1] || 0) - Number(right[1] || 0), 2)
+        + Math.pow(Number(left[2] || 0) - Number(right[2] || 0), 2);
+    }}
+    function setReviewCardColour(card, colorId) {{
+      if (!card) {{
+        return;
+      }}
+      const selected = String(colorId || '');
+      card.querySelectorAll('[data-review-colour-chip]').forEach((button) => {{
+        button.classList.toggle('active', selected && String(button.dataset.colorId || '') === selected);
+      }});
+      const clearButton = card.querySelector('[data-review-colour-clear]');
+      if (clearButton) {{
+        clearButton.classList.toggle('active', !selected);
+      }}
+      card.querySelectorAll('.part-suggestion').forEach((node) => {{
+        const confirmButton = node.querySelector('[data-suggest-confirm]');
+        const matchColor = confirmButton ? String(confirmButton.dataset.suggestionColorId || '') : '';
+        node.classList.toggle('hidden', !!selected && matchColor !== selected);
+      }});
+      const colorInput = card.querySelector('[data-confirm-field="color_id"]');
+      if (colorInput && selected) {{
+        colorInput.value = selected;
+      }}
+    }}
+    document.querySelectorAll('[data-review-colour-clear]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        setReviewCardColour(button.closest('.confirm-card'), '');
+      }});
+    }});
+    document.querySelectorAll('[data-review-colour-chip]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        setReviewCardColour(button.closest('.confirm-card'), button.dataset.colorId || '');
+      }});
+    }});
+    document.querySelectorAll('[data-review-colour-pick]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const card = button.closest('.confirm-card');
+        const thumb = card && card.querySelector('[data-confirm-thumb]');
+        if (!thumb) {{
+          return;
+        }}
+        const isActive = thumb.classList.toggle('picker-active');
+        button.classList.toggle('active', isActive);
+        button.textContent = isActive ? 'Click candidate image' : 'Pick colour from candidate';
+      }});
+    }});
+    document.querySelectorAll('[data-confirm-thumb]').forEach((thumb) => {{
+      thumb.addEventListener('click', (event) => {{
+        if (!thumb.classList.contains('picker-active')) {{
+          return;
+        }}
+        const card = thumb.closest('.confirm-card');
+        const image = thumb.querySelector('img');
+        if (!card || !image || !image.naturalWidth || !image.naturalHeight) {{
+          return;
+        }}
+        const rect = image.getBoundingClientRect();
+        if (!rect.width || !rect.height) {{
+          return;
+        }}
+        const relX = event.clientX - rect.left;
+        const relY = event.clientY - rect.top;
+        if (relX < 0 || relY < 0 || relX > rect.width || relY > rect.height) {{
+          return;
+        }}
+        const sampleX = Math.max(0, Math.min(image.naturalWidth - 1, Math.round((relX / rect.width) * image.naturalWidth)));
+        const sampleY = Math.max(0, Math.min(image.naturalHeight - 1, Math.round((relY / rect.height) * image.naturalHeight)));
+        const canvas = document.createElement('canvas');
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const ctx = canvas.getContext('2d', {{ willReadFrequently: true }});
+        if (!ctx) {{
+          return;
+        }}
+        ctx.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight);
+        let r = 0, g = 0, b = 0, count = 0;
+        for (let dy = -2; dy <= 2; dy += 1) {{
+          for (let dx = -2; dx <= 2; dx += 1) {{
+            const px = Math.max(0, Math.min(image.naturalWidth - 1, sampleX + dx));
+            const py = Math.max(0, Math.min(image.naturalHeight - 1, sampleY + dy));
+            const pixel = ctx.getImageData(px, py, 1, 1).data;
+            if (Number(pixel[3] || 0) < 20) {{
+              continue;
+            }}
+            r += Number(pixel[0] || 0);
+            g += Number(pixel[1] || 0);
+            b += Number(pixel[2] || 0);
+            count += 1;
+          }}
+        }}
+        if (!count) {{
+          return;
+        }}
+        const sampled = [Math.round(r / count), Math.round(g / count), Math.round(b / count)];
+        let bestColorId = '';
+        let bestDistance = Number.POSITIVE_INFINITY;
+        card.querySelectorAll('[data-review-colour-chip]').forEach((button) => {{
+          const rgb = rgbHexToTuple(button.dataset.colorRgb || '');
+          if (!rgb) {{
+            return;
+          }}
+          const distance = rgbDistanceSquared(sampled, rgb);
+          if (distance < bestDistance) {{
+            bestDistance = distance;
+            bestColorId = String(button.dataset.colorId || '');
+          }}
+        }});
+        if (bestColorId) {{
+          setReviewCardColour(card, bestColorId);
+        }}
+        thumb.classList.remove('picker-active');
+        const pickButton = card.querySelector('[data-review-colour-pick]');
+        if (pickButton) {{
+          pickButton.classList.remove('active');
+          pickButton.textContent = 'Pick colour from candidate';
+        }}
       }});
     }});
   </script>

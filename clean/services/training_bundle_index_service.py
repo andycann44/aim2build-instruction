@@ -86,8 +86,26 @@ def ensure_schema() -> Dict[str, Any]:
                     ADD COLUMN IF NOT EXISTS split_candidate_paths JSONB;
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS candidate_training_examples (
+                    id SERIAL PRIMARY KEY,
+                    bundle_id TEXT NOT NULL,
+                    candidate_index INTEGER NOT NULL,
+                    part_num TEXT,
+                    color_id INTEGER,
+                    element_id TEXT,
+                    qty INTEGER,
+                    thumbnail_path TEXT,
+                    r2_path TEXT,
+                    confirmed_by TEXT,
+                    confirmed_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE (bundle_id, candidate_index)
+                );
+                """
+            )
         conn.commit()
-    return {"ok": True, "table": "training_bundle_index"}
+    return {"ok": True, "tables": ["training_bundle_index", "candidate_training_examples"]}
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -532,3 +550,94 @@ def update_split_candidate_status(
     candidates[target_pos] = candidate
     paths["candidates"] = candidates
     return update_split_candidates(bundle_id, split_candidate_paths=paths)
+
+
+def confirm_candidate_part(
+    *,
+    bundle_id: str,
+    candidate_index: Any,
+    part_num: str,
+    color_id: Any,
+    element_id: str = "",
+    qty: Any = None,
+    thumbnail_path: str = "",
+    r2_path: str = "",
+    confirmed_by: str = "",
+) -> Dict[str, Any]:
+    ensure_schema()
+    bundle_id = str(bundle_id or "").strip()
+    if not bundle_id:
+        raise ValueError("bundle_id is required")
+    parsed_candidate_index = _coerce_int(candidate_index)
+    if parsed_candidate_index is None or parsed_candidate_index < 0:
+        raise ValueError("candidate_index must be >= 0")
+    resolved_part_num = str(part_num or "").strip()
+    if not resolved_part_num:
+        raise ValueError("part_num is required")
+    parsed_color_id = _coerce_int(color_id)
+    if parsed_color_id is None:
+        raise ValueError("color_id is required")
+    parsed_qty = _coerce_int(qty)
+
+    row = {
+        "bundle_id": bundle_id,
+        "candidate_index": parsed_candidate_index,
+        "part_num": resolved_part_num,
+        "color_id": parsed_color_id,
+        "element_id": str(element_id or "").strip(),
+        "qty": parsed_qty,
+        "thumbnail_path": str(thumbnail_path or "").strip(),
+        "r2_path": str(r2_path or "").strip(),
+        "confirmed_by": str(confirmed_by or "").strip(),
+    }
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO candidate_training_examples (
+                    bundle_id, candidate_index, part_num, color_id, element_id,
+                    qty, thumbnail_path, r2_path, confirmed_by, confirmed_at
+                ) VALUES (
+                    %(bundle_id)s, %(candidate_index)s, %(part_num)s, %(color_id)s, %(element_id)s,
+                    %(qty)s, %(thumbnail_path)s, %(r2_path)s, %(confirmed_by)s, NOW()
+                )
+                ON CONFLICT (bundle_id, candidate_index) DO UPDATE SET
+                    part_num = EXCLUDED.part_num,
+                    color_id = EXCLUDED.color_id,
+                    element_id = EXCLUDED.element_id,
+                    qty = EXCLUDED.qty,
+                    thumbnail_path = EXCLUDED.thumbnail_path,
+                    r2_path = EXCLUDED.r2_path,
+                    confirmed_by = EXCLUDED.confirmed_by,
+                    confirmed_at = NOW()
+                RETURNING *;
+                """,
+                row,
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return {"ok": True, "row": _json_safe_row(dict(result or {}))}
+
+
+def list_candidate_training_examples(bundle_id: str) -> Dict[str, Any]:
+    ensure_schema()
+    bundle_id = str(bundle_id or "").strip()
+    if not bundle_id:
+        raise ValueError("bundle_id is required")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM candidate_training_examples
+                WHERE bundle_id = %s
+                ORDER BY candidate_index ASC, id ASC;
+                """,
+                (bundle_id,),
+            )
+            rows = cur.fetchall()
+    return {
+        "ok": True,
+        "bundle_id": bundle_id,
+        "rows": [_json_safe_row(dict(row or {})) for row in list(rows or [])],
+    }
