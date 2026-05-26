@@ -5817,7 +5817,7 @@ def training_store_review_ui(
                 row=selected or {},
                 candidate=candidate,
                 confirmed_rows=confirmed_example_rows,
-                limit=5,
+                limit=30,
             )
         except Exception:
             matches = []
@@ -5847,14 +5847,15 @@ def training_store_review_ui(
         )
         suggestion_html = "".join(
             (
-                f'<div class="part-suggestion">'
+                f'<article class="part-suggestion">'
                 f'<div class="part-suggestion-img">{_training_review_catalog_img(match.get("image_path") or match.get("image_url"), str(match.get("part_num") or ""))}</div>'
                 f'<div class="part-suggestion-body">'
-                f'<strong>{escape(str(match.get("part_num") or ""))} / {escape(str(match.get("color_id") or ""))}</strong>'
-                f'<span>{escape(str(match.get("part_name") or match.get("color_name") or ""))}</span>'
-                f'<span>element: {escape(str(match.get("element_id") or "n/a"))}</span>'
-                f'<span>remaining: {escape(str(match.get("remaining_qty") or 0))} of {escape(str(match.get("required_qty") or 0))}</span>'
-                f'<span>match: {escape(str(match.get("confidence") or ""))}</span>'
+                f'<strong>{escape(str(match.get("part_num") or ""))}</strong>'
+                f'<span class="part-colour">{escape(str(match.get("color_name") or ("color " + str(match.get("color_id") or ""))))} ({escape(str(match.get("color_id") or ""))})</span>'
+                f'<span class="part-name">{escape(str(match.get("part_name") or ""))}</span>'
+                f'<span class="part-meta">element: {escape(str(match.get("element_id") or "n/a"))}</span>'
+                f'<span class="part-meta">remaining: {escape(str(match.get("remaining_qty") or 0))} of {escape(str(match.get("required_qty") or 0))}</span>'
+                f'<span class="part-score">match {escape(str(match.get("confidence") or ""))}</span>'
                 f'<button type="button" data-suggest-confirm="true" data-suggestion-color-id="{escape(str(match.get("color_id") or ""))}" '
                 f'data-suggestion-color-rgb="{escape(str(match.get("color_rgb") or "").strip().replace("#", ""))}" '
                 f'data-confirm-candidate="{escape(str(candidate_index))}" '
@@ -5863,25 +5864,37 @@ def training_store_review_ui(
                 f'data-element-id="{escape(str(match.get("element_id") or ""))}" '
                 f'data-candidate-qty="{escape(qty_value)}">Confirm this part</button>'
                 f'</div>'
-                f'</div>'
+                f'</article>'
             )
             for match in matches
         ) or '<div class="missing">No required-part matches available.</div>'
         confirm_cards.append(
-            f'<article class="confirm-card">'
+            f'<article class="confirm-card annotation-workstation">'
+            f'<div class="confirm-card-head">'
+            f'<div><strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong>'
+            f'<span>qty {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span></div>'
+            f'<span class="review-state">{escape(str(candidate.get("status") or "pending"))}</span>'
+            f'<span class="review-state {escape("saved" if int(candidate_index) in confirmed_examples else "unsaved")}">{escape("confirmed" if int(candidate_index) in confirmed_examples else "not confirmed")}</span>'
+            f'</div>'
+            f'<div class="candidate-workspace">'
+            f'<div class="candidate-preview-panel">'
             f'<div class="confirm-thumb" data-confirm-thumb="true">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
-            f'<div class="confirm-fields">'
-            f'<strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong>'
-            f'<span class="candidate-meta">qty: {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span>'
+            f'<div class="candidate-preview-meta">'
+            f'<span><strong>Qty</strong> {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span>'
+            f'<span><strong>State</strong> {escape(str(candidate.get("status") or "pending"))}</span>'
+            f'<span><strong>Scrub</strong> {escape(str(candidate.get("qty_scrub_status") or "not run"))}</span>'
+            f'</div>'
             f'<label><span class="label">part_num</span><input data-confirm-field="part_num" value="{escape(str(confirmed.get("part_num") or ""))}"></label>'
             f'<label><span class="label">color_id</span><input data-confirm-field="color_id" type="number" value="{escape(str(confirmed.get("color_id") or ""))}"></label>'
             f'<label><span class="label">element_id</span><input data-confirm-field="element_id" value="{escape(str(confirmed.get("element_id") or ""))}"></label>'
             f'<label><span class="label">confirmed_by</span><input data-confirm-field="confirmed_by" value="{escape(str(confirmed.get("confirmed_by") or "andy"))}"></label>'
-            f'<button type="button" data-confirm-candidate="{escape(str(candidate_index))}" data-candidate-qty="{escape(qty_value)}">Confirm Manual Fields</button>'
-            f'<span class="candidate-meta">{escape("confirmed" if int(candidate_index) in confirmed_examples else "not confirmed")}</span>'
+            f'<button type="button" class="manual-confirm-btn" data-confirm-candidate="{escape(str(candidate_index))}" data-candidate-qty="{escape(qty_value)}">Confirm manual fields</button>'
             f'</div>'
+            f'<div class="candidate-match-panel">'
             f'{color_filter_html}'
-            f'<div class="part-suggestions">{suggestion_html}</div>'
+            f'<div class="part-suggestions" aria-label="Suggested LEGO parts">{suggestion_html}</div>'
+            f'</div>'
+            f'</div>'
             f'</article>'
         )
     confirm_candidate_html = "".join(confirm_cards) or '<div class="missing">No clean accepted candidates ready for part confirmation.</div>'
@@ -5913,27 +5926,42 @@ def training_store_review_ui(
     .candidate-actions {{ display:flex; gap:6px; margin-top:8px; }}
     .candidate-actions button {{ padding:6px 8px; font-size:12px; }}
     .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
-    .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:14px; margin-top:10px; }}
-    .confirm-card {{ display:grid; grid-template-columns:128px minmax(260px,360px) minmax(360px,1fr); gap:12px; background:white; border:1px solid #d8dee3; border-radius:6px; padding:12px; align-items:start; overflow:hidden; }}
-    .confirm-thumb {{ min-height:116px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
+    .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:18px; margin-top:10px; }}
+    .confirm-card {{ background:white; border:1px solid #d8dee3; border-radius:8px; padding:14px; overflow:hidden; box-shadow:0 1px 2px rgba(31,45,61,.04); }}
+    .confirm-card-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; border-bottom:1px solid #e4e9ed; padding-bottom:10px; margin-bottom:12px; }}
+    .confirm-card-head strong {{ display:block; font-size:18px; line-height:1.15; }}
+    .confirm-card-head span {{ color:#66727d; font-size:13px; }}
+    .review-state {{ display:inline-flex; align-items:center; justify-content:center; min-height:28px; border:1px solid #cbd6e2; border-radius:999px; padding:4px 10px; color:#32465a; background:#f8fafb; font-size:12px; white-space:nowrap; }}
+    .review-state.saved {{ border-color:#7db28a; background:#eef6ef; color:#2f6c41; }}
+    .review-state.unsaved {{ border-color:#e1c36a; background:#fff8df; color:#725b10; }}
+    .candidate-workspace {{ display:grid; grid-template-columns:minmax(260px,320px) minmax(0,1fr); gap:16px; align-items:start; }}
+    .candidate-preview-panel {{ display:grid; gap:10px; align-content:start; }}
+    .confirm-thumb {{ min-height:240px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:8px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
     .confirm-thumb.picker-active {{ outline:2px solid #cf1f1f; cursor:crosshair; }}
     .confirm-thumb.picker-active img {{ cursor:crosshair; }}
-    .confirm-thumb img {{ max-height:112px; max-width:112px; object-fit:contain; background:transparent; }}
-    .confirm-fields {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; align-items:end; min-width:0; }}
-    .confirm-fields strong, .confirm-fields .candidate-meta {{ grid-column:1 / -1; }}
-    .confirm-fields button {{ grid-column:1 / -1; }}
-    .review-colour-filter {{ grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding-top:2px; }}
-    .review-colour-chip {{ display:inline-flex; align-items:center; gap:7px; border:1px solid #cbd6e2; border-radius:999px; background:#fff; color:#32465a; padding:7px 10px; font-size:12px; line-height:1.2; cursor:pointer; max-width:100%; }}
+    .confirm-thumb img {{ max-height:210px; max-width:230px; object-fit:contain; background:transparent; }}
+    .candidate-preview-meta {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }}
+    .candidate-preview-meta span {{ border:1px solid #e4e9ed; border-radius:6px; padding:8px; color:#66727d; font-size:12px; background:#f8fafb; }}
+    .candidate-preview-meta strong {{ display:block; color:#172026; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }}
+    .candidate-preview-panel label {{ display:block; }}
+    .candidate-preview-panel input {{ width:100%; box-sizing:border-box; }}
+    .manual-confirm-btn {{ width:100%; }}
+    .candidate-match-panel {{ min-width:0; }}
+    .review-colour-filter {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; padding:10px; border:1px solid #e4e9ed; border-radius:8px; background:#f8fafb; }}
+    .review-colour-chip {{ display:inline-flex; align-items:center; gap:7px; border:1px solid #cbd6e2; border-radius:999px; background:#fff; color:#32465a; padding:8px 12px; font-size:12px; line-height:1.2; cursor:pointer; max-width:100%; }}
     .review-colour-chip.active {{ border-color:#cf1f1f; background:#fff1f1; color:#7d1d1d; box-shadow:0 0 0 2px rgba(207,31,31,.08); }}
     .review-colour-swatch {{ width:14px; height:14px; border-radius:999px; border:1px solid rgba(0,0,0,.2); flex:0 0 14px; }}
-    .part-suggestions {{ display:grid; gap:8px; max-height:420px; overflow:auto; padding-right:4px; }}
-    .part-suggestion {{ display:grid; grid-template-columns:70px minmax(0,1fr); gap:10px; border:1px solid #e4e9ed; border-radius:6px; padding:8px; }}
+    .part-suggestions {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; max-height:640px; overflow:auto; padding:2px 6px 2px 2px; align-content:start; }}
+    .part-suggestion {{ display:grid; grid-template-rows:128px auto; gap:10px; border:1px solid #d8dee3; border-radius:8px; padding:10px; background:#fff; min-width:0; }}
     .part-suggestion.hidden {{ display:none; }}
-    .part-suggestion-img {{ display:flex; align-items:center; justify-content:center; }}
-    .part-suggestion-img img {{ max-height:58px; max-width:66px; object-fit:contain; background:transparent; }}
-    .part-suggestion-body {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 8px; font-size:12px; color:#66727d; min-width:0; }}
-    .part-suggestion-body strong {{ color:#172026; }}
-    .part-suggestion-body button {{ grid-column:1 / -1; padding:6px 8px; font-size:12px; }}
+    .part-suggestion-img {{ display:flex; align-items:center; justify-content:center; background:#f4f7fb; border:1px solid #e4e9ed; border-radius:6px; overflow:hidden; }}
+    .part-suggestion-img img {{ max-height:116px; max-width:140px; object-fit:contain; background:transparent; }}
+    .part-suggestion-body {{ display:grid; gap:4px; font-size:12px; color:#66727d; min-width:0; }}
+    .part-suggestion-body strong {{ color:#172026; font-size:16px; line-height:1.15; }}
+    .part-colour {{ color:#32465a; font-weight:600; }}
+    .part-name, .part-meta, .part-score {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .part-score {{ color:#1f6fc9; font-weight:700; }}
+    .part-suggestion-body button {{ margin-top:6px; padding:8px 10px; font-size:13px; width:100%; }}
     .ocr-table {{ width:100%; border-collapse:collapse; background:white; border:1px solid #d8dee3; border-radius:6px; overflow:hidden; margin:8px 0 14px; }}
     .ocr-table th, .ocr-table td {{ text-align:left; border-bottom:1px solid #e4e9ed; padding:7px 8px; font-size:13px; }}
     .ocr-table th {{ color:#66727d; background:#f8fafb; }}
@@ -5950,17 +5978,18 @@ def training_store_review_ui(
     button {{ background:#1f6fc9; color:white; border-color:#1f6fc9; cursor:pointer; }}
     .missing {{ padding:18px; color:#66727d; background:#f3f5f6; border-radius:6px; }}
     @media (max-width: 1180px) {{
-      .confirm-card {{ grid-template-columns:112px minmax(220px,1fr); }}
-      .part-suggestions {{ grid-column:1 / -1; }}
+      .candidate-workspace {{ grid-template-columns:1fr; }}
+      .confirm-thumb {{ min-height:220px; }}
     }}
     @media (max-width: 760px) {{
       main {{ grid-template-columns:1fr; }}
       aside {{ display:none; }}
-      .confirm-card {{ grid-template-columns:92px minmax(0,1fr); }}
-      .confirm-thumb {{ min-height:92px; }}
-      .confirm-thumb img {{ max-width:82px; max-height:82px; }}
-      .confirm-fields {{ grid-template-columns:1fr; }}
-      .review-colour-filter, .part-suggestions {{ grid-column:1 / -1; }}
+      .confirm-card-head {{ align-items:flex-start; flex-direction:column; }}
+      .confirm-thumb {{ min-height:180px; }}
+      .confirm-thumb img {{ max-width:170px; max-height:160px; }}
+      .candidate-preview-meta {{ grid-template-columns:1fr; }}
+      .part-suggestions {{ grid-template-columns:repeat(auto-fill,minmax(145px,1fr)); max-height:520px; }}
+      .part-suggestion {{ grid-template-rows:104px auto; }}
       .meta, .images {{ grid-template-columns:1fr; }}
     }}
   </style>
