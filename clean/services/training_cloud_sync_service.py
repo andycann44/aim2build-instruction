@@ -12,6 +12,7 @@ from clean.services.training_store_service import (
     _utc_timestamp,
     _write_json_atomic,
 )
+from clean.services.training_bundle_index_service import register_bundle
 
 
 _R2_REQUIRED_KEYS = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
@@ -216,13 +217,32 @@ def upload_bundle_to_r2(bundle_id: str, *, dry_run: bool = True) -> Dict[str, An
             "error": type(exc).__name__,
         }
 
-    _update_r2_upload_status(str(prepared.get("bundle_id") or bundle_id), "uploaded", uploaded_paths)
+    uploaded_bundle_id = str(prepared.get("bundle_id") or bundle_id)
+    _update_r2_upload_status(uploaded_bundle_id, "uploaded", uploaded_paths)
+    entry = _approved_entry(uploaded_bundle_id)
+    metadata_path = str(((entry.get("artifact_paths") or {}).get("metadata") if isinstance(entry.get("artifact_paths"), dict) else "") or "")
+    metadata = _read_json_file(Path(metadata_path)) if metadata_path else {}
+    r2_prefix = f"training-bundles/{uploaded_bundle_id}/"
+    azure_registration: Dict[str, Any]
+    try:
+        azure_registration = register_bundle(
+            entry,
+            metadata=metadata,
+            r2_prefix=r2_prefix,
+            manifest_path=metadata_path,
+        )
+    except Exception as exc:
+        azure_registration = {
+            "ok": False,
+            "error": type(exc).__name__,
+        }
     return {
         **prepared,
         "ok": True,
         "would_upload": False,
         "uploaded": True,
         "r2_paths": uploaded_paths,
+        "azure_postgres_registration": azure_registration,
     }
 
 

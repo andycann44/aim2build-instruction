@@ -168,6 +168,37 @@ def register_analysis_bundle(bundle_id: str) -> Dict[str, Any]:
     }
 
 
+def list_registered_bundles(
+    *,
+    set_num: str = "",
+    bag: Optional[int] = None,
+    review_status: str = "",
+) -> Dict[str, Any]:
+    index = _read_json_file(_TRAINING_STORE_INDEX)
+    entries = index.get("entries") if isinstance(index.get("entries"), list) else []
+    filtered_entries: List[Dict[str, Any]] = []
+    set_filter = str(set_num or "").strip()
+    status_filter = str(review_status or "").strip()
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        if set_filter and str(entry.get("set_num") or "") != set_filter:
+            continue
+        if bag is not None and int(entry.get("bag", 0) or 0) != int(bag):
+            continue
+        if status_filter and str(entry.get("review_status") or "") != status_filter:
+            continue
+        filtered_entries.append(entry)
+    filtered_entries.sort(key=lambda item: str(item.get("bundle_id") or ""))
+    return {
+        "ok": True,
+        "entries": filtered_entries,
+        "index_path": str(_TRAINING_STORE_INDEX),
+        "entry_count": len(filtered_entries),
+    }
+
+
 def update_bundle_review(
     bundle_id: str,
     review_status: str,

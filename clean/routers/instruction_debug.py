@@ -47,8 +47,20 @@ from clean.routers.debug import (
     _response_text_to_json_debug,
 )
 from clean.services import debug_service, step_detector_service
-from clean.services.training_store_service import register_analysis_bundle, update_bundle_review
+from clean.services.training_store_service import list_registered_bundles, register_analysis_bundle, update_bundle_review
 from clean.services.training_cloud_sync_service import prepare_bundle_for_azure, prepare_bundle_for_r2, upload_bundle_to_r2
+from clean.services.training_bundle_index_service import (
+    get_bundle as get_training_bundle_index_row,
+    get_review_stats,
+    list_review_queue,
+    update_review as update_training_bundle_review,
+)
+from clean.services.training_ai_review_service import (
+    analyse_reviewed_bundle,
+    generate_split_candidates,
+    mark_split_candidate,
+    scrub_candidate_qty,
+)
 from clean.services.azure_openai_service import rank_crop_candidates
 from clean.services.ai_snap_crop_service import (
     create_shape_mask_for_slot_crop,
@@ -1619,6 +1631,19 @@ def _dedupe_qty_tokens_high_overlap_only(tokens: List[Dict[str, Any]]) -> List[D
             normalized_token["source_region"] = str(token.get("source_region") or "")
         if "confidence" in token:
             normalized_token["confidence"] = token.get("confidence")
+        for key in (
+            "raw_ocr_object",
+            "raw_box",
+            "normalized_box",
+            "converted_bbox",
+            "raw_polygon",
+            "normalized_polygon",
+            "coordinate_source",
+            "coordinate_space",
+            "crop_image_size",
+        ):
+            if key in token:
+                normalized_token[key] = token.get(key)
         if any(
             _normalize_qty_token_text(existing.get("text")) == normalized
             and _token_overlap_ratio(existing, normalized_token) >= 0.75
@@ -3061,6 +3086,184 @@ def _copy_analysis_bundle_file(path_value: Any, bundle_dir: Path, name: str) -> 
     dest = bundle_dir / name
     shutil.copy2(str(source), str(dest))
     return str(dest)
+
+
+def _normalize_qty_token_boxes_for_bundle(
+    qty_token_boxes: List[Dict[str, Any]],
+    *,
+    crop_box: Any,
+    original_crop_path: Any,
+) -> List[Dict[str, Any]]:
+    crop_dims = [0, 0]
+    original_path = Path(str(original_crop_path or "").strip())
+    if original_path.exists() and original_path.is_file():
+        img = cv2.imread(str(original_path))
+        if img is not None and getattr(img, "size", 0) != 0:
+            crop_dims = [int(img.shape[1]), int(img.shape[0])]
+    crop_box_list = _coerce_box_list(crop_box) or [0, 0, crop_dims[0], crop_dims[1]]
+    crop_x, crop_y, crop_w, crop_h = [int(value) for value in crop_box_list]
+    if crop_dims[0] <= 0 or crop_dims[1] <= 0:
+        crop_dims = [max(0, crop_w), max(0, crop_h)]
+    crop_width, crop_height = crop_dims
+
+    def clip_xywh(x: float, y: float, w: float, h: float) -> List[int]:
+        x1 = max(0, min(crop_width, int(round(x))))
+        y1 = max(0, min(crop_height, int(round(y))))
+        x2 = max(0, min(crop_width, int(round(x + max(0, w)))))
+        y2 = max(0, min(crop_height, int(round(y + max(0, h)))))
+        if x2 <= x1 or y2 <= y1:
+            return []
+        return [x1, y1, x2 - x1, y2 - y1]
+
+    normalized: List[Dict[str, Any]] = []
+    for token in list(qty_token_boxes or []):
+        if not isinstance(token, dict):
+            continue
+        raw = dict(token)
+        try:
+            x = float(raw.get("x", raw.get("left", 0)) or 0)
+            y = float(raw.get("y", raw.get("top", 0)) or 0)
+            w = float(raw.get("w", raw.get("width", 0)) or 0)
+            h = float(raw.get("h", raw.get("height", 0)) or 0)
+        except Exception:
+            continue
+        source = "crop_local_xywh"
+        box = clip_xywh(x, y, w, h)
+        if not box and 0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1:
+            source = "crop_local_normalized_xywh"
+            box = clip_xywh(x * crop_width, y * crop_height, w * crop_width, h * crop_height)
+        if not box and x >= crop_x and y >= crop_y:
+            source = "page_xywh_minus_crop_origin"
+            box = clip_xywh(x - crop_x, y - crop_y, w, h)
+        if not box and w > x and h > y:
+            source = "crop_local_xyxy"
+            box = clip_xywh(x, y, w - x, h - y)
+        if not box and w > x and h > y and x >= crop_x and y >= crop_y:
+            source = "page_xyxy_minus_crop_origin"
+            box = clip_xywh(x - crop_x, y - crop_y, w - x, h - y)
+        if not box:
+            box = clip_xywh(x, y, max(1, w), max(1, h))
+            source = "best_effort_crop_local_xywh"
+        if not box:
+            continue
+        item = dict(raw)
+        item["raw_box"] = [raw.get("x"), raw.get("y"), raw.get("w"), raw.get("h")]
+        item["raw_ocr_object"] = raw
+        item["raw_polygon"] = [
+            [int(round(x)), int(round(y))],
+            [int(round(x + w)), int(round(y))],
+            [int(round(x + w)), int(round(y + h))],
+            [int(round(x)), int(round(y + h))],
+        ]
+        item["normalized_box"] = box
+        item["converted_bbox"] = box
+        item["normalized_polygon"] = [
+            [box[0], box[1]],
+            [box[0] + box[2], box[1]],
+            [box[0] + box[2], box[1] + box[3]],
+            [box[0], box[1] + box[3]],
+        ]
+        item["coordinate_source"] = source
+        item["coordinate_space"] = "original_crop_local_xywh"
+        item["crop_box"] = [crop_x, crop_y, crop_w, crop_h]
+        item["crop_image_size"] = [crop_width, crop_height]
+        item["x"], item["y"], item["w"], item["h"] = box
+        item["cx"] = int(box[0] + box[2] / 2)
+        item["cy"] = int(box[1] + box[3] / 2)
+        normalized.append(item)
+    return normalized
+
+
+def _direct_qty_ocr_boxes_from_crop_image(image_path: Any) -> List[Dict[str, Any]]:
+    path = Path(str(image_path or "").strip())
+    if not path.exists() or not path.is_file():
+        return []
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None or getattr(img, "size", 0) == 0:
+        return []
+    try:
+        import pytesseract
+    except Exception:
+        return []
+
+    height, width = img.shape[:2]
+    variants: List[Tuple[str, Any, float]] = [("original_psm6", img, 1.0)]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    for scale in (2.0, 3.0):
+        enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        thresholded = cv2.adaptiveThreshold(
+            enlarged,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            6,
+        )
+        variants.append((f"gray_s{int(scale)}_psm11", enlarged, scale))
+        variants.append((f"adaptive_s{int(scale)}_psm11", thresholded, scale))
+        variants.append((f"adaptive_s{int(scale)}_psm12", thresholded, scale))
+
+    tokens: List[Dict[str, Any]] = []
+    for name, variant, scale in variants:
+        psm = 6 if "psm6" in name else (12 if "psm12" in name else 11)
+        try:
+            data = pytesseract.image_to_data(
+                variant,
+                config=f"--psm {psm} -c tessedit_char_whitelist=0123456789xX",
+                output_type=pytesseract.Output.DICT,
+            )
+        except Exception:
+            continue
+        for idx in range(len(data.get("text", []) or [])):
+            raw_text = str((data.get("text", [""])[idx] or "")).strip()
+            normalized = _normalize_qty_token_text(raw_text)
+            if not normalized or not re.match(r"^\d{1,2}x$", normalized):
+                continue
+            try:
+                confidence = float(data.get("conf", ["-1"])[idx] or -1)
+            except Exception:
+                confidence = -1.0
+            if confidence < 20:
+                continue
+            x = int(round(float(data.get("left", [0])[idx] or 0) / scale))
+            y = int(round(float(data.get("top", [0])[idx] or 0) / scale))
+            w = int(round(float(data.get("width", [0])[idx] or 0) / scale))
+            h = int(round(float(data.get("height", [0])[idx] or 0) / scale))
+            if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
+                continue
+            raw_ocr_object = {
+                "text": raw_text,
+                "conf": confidence,
+                "left": data.get("left", [0])[idx],
+                "top": data.get("top", [0])[idx],
+                "width": data.get("width", [0])[idx],
+                "height": data.get("height", [0])[idx],
+                "ocr_variant": name,
+                "scale": scale,
+                "psm": psm,
+            }
+            tokens.append(
+                {
+                    "text": normalized,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "cx": x + (w // 2),
+                    "cy": y + (h // 2),
+                    "confidence": confidence,
+                    "raw_ocr_object": raw_ocr_object,
+                    "raw_box": [x, y, w, h],
+                    "normalized_box": [x, y, w, h],
+                    "converted_bbox": [x, y, w, h],
+                    "raw_polygon": [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
+                    "normalized_polygon": [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
+                    "coordinate_source": f"direct_original_crop_image_to_data:{name}",
+                    "coordinate_space": "original_crop_local_xywh",
+                    "crop_image_size": [width, height],
+                }
+            )
+    return _dedupe_qty_tokens_high_overlap_only(tokens)
 
 
 def _master_islands_from_mask(mask_path: str) -> List[Dict[str, Any]]:
@@ -4540,6 +4743,12 @@ def export_crop_analysis_bundle(
                 temp_crop_path.unlink(missing_ok=True)
             except Exception:
                 pass
+    normalized_qty_token_boxes = _normalize_qty_token_boxes_for_bundle(
+        qty_token_boxes,
+        crop_box=crop.get("crop_box"),
+        original_crop_path=original_crop_path,
+    )
+    direct_qty_ocr_boxes = _direct_qty_ocr_boxes_from_crop_image(original_crop_path)
 
     full_crop_mask_path = str(result.get("full_crop_mask_path") or "")
     full_crop_overlay_path = str(result.get("full_crop_mask_overlay_path") or "")
@@ -4615,7 +4824,9 @@ def export_crop_analysis_bundle(
             "crop_box": crop.get("crop_box"),
             "crop_image_path": str(crop.get("crop_image_path") or ""),
         },
-        "qty_token_boxes": qty_token_boxes,
+        "qty_token_boxes": normalized_qty_token_boxes,
+        "qty_token_boxes_raw": qty_token_boxes,
+        "direct_qty_ocr_boxes": direct_qty_ocr_boxes,
         "master_islands": _master_islands_from_mask(raw_master_mask_path or full_crop_mask_path),
         "slot_assignments": slot_assignments,
         "cutout_paths": [item for item in copied_files["slot_cutouts"] if item],
@@ -4652,6 +4863,87 @@ def training_store_register_bundle(bundle_id: str = Query(...)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(result)
+
+
+@router.post("/debug/training-store/export-batch")
+def training_store_export_batch(
+    set_num: str = Query("70618"),
+    bag_num: int = Query(1),
+    force: int = Query(0),
+):
+    set_text = str(set_num or "70618").strip() or "70618"
+    bag_number = int(bag_num or 1)
+    force_export = int(force or 0) == 1
+    try:
+        rendered_pages, start_page, end_page = _resolve_bag_page_range(set_text, bag_number)
+        crops = _build_instruction_callout_crops(set_text, bag_number, ai_enabled=False)
+        _write_crop_detection_cache(set_text, bag_number, crops)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"batch crop discovery failed: {type(exc).__name__}")
+
+    analysis_root = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+    )
+    exported_bundle_ids: List[str] = []
+    skipped_bundle_ids: List[str] = []
+    registered_bundle_ids: List[str] = []
+    failed: List[Dict[str, Any]] = []
+
+    for crop in list(crops or []):
+        crop_id = str((crop or {}).get("crop_id") or "").strip()
+        if not crop_id:
+            continue
+        bundle_id = _analysis_bundle_slug(set_text, bag_number, crop_id)
+        metadata_path = analysis_root / bundle_id / "metadata.json"
+        if metadata_path.exists() and not force_export:
+            skipped_bundle_ids.append(bundle_id)
+            try:
+                register_result = register_analysis_bundle(bundle_id)
+                if bool(register_result.get("ok")):
+                    registered_bundle_ids.append(bundle_id)
+            except Exception as exc:
+                failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": type(exc).__name__})
+            continue
+        try:
+            response = export_crop_analysis_bundle(set_num=set_text, bag=bag_number, crop_id=crop_id)
+            payload = json.loads(response.body.decode("utf-8")) if isinstance(response, JSONResponse) else {}
+            if not bool(payload.get("ok")):
+                failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": str(payload.get("error") or "export_failed")})
+                continue
+            register_result = register_analysis_bundle(bundle_id)
+            exported_bundle_ids.append(bundle_id)
+            if bool(register_result.get("ok")):
+                registered_bundle_ids.append(bundle_id)
+        except HTTPException as exc:
+            failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": str(exc.detail)})
+        except Exception as exc:
+            failed.append({"bundle_id": bundle_id, "crop_id": crop_id, "error": type(exc).__name__})
+
+    return JSONResponse(
+        {
+            "ok": not failed,
+            "set_num": set_text,
+            "bag_num": bag_number,
+            "page_range": {
+                "rendered_pages": [int(page) for page in list(rendered_pages or [])],
+                "start_page": int(start_page),
+                "end_page": int(end_page),
+            },
+            "force": force_export,
+            "crop_count": len(list(crops or [])),
+            "exported_count": len(exported_bundle_ids),
+            "registered_count": len(registered_bundle_ids),
+            "skipped_existing_count": len(skipped_bundle_ids),
+            "failed_count": len(failed),
+            "exported_bundle_ids": exported_bundle_ids,
+            "registered_bundle_ids": registered_bundle_ids,
+            "skipped_bundle_ids": skipped_bundle_ids,
+            "failed": failed,
+        }
+    )
 
 
 def _parse_slot_indexes(value: Any) -> List[int]:
@@ -4786,6 +5078,77 @@ def training_store_upload_r2(
     return JSONResponse(result)
 
 
+@router.post("/debug/training-store/upload-r2-batch")
+def training_store_upload_r2_batch(
+    set_num: str = Query("70618"),
+    bag_num: int = Query(1),
+    dry_run: str = Query("1"),
+):
+    set_text = str(set_num or "70618").strip() or "70618"
+    bag_number = int(bag_num or 1)
+    dry_run_enabled = _dry_run_enabled(dry_run)
+    listed = list_registered_bundles(
+        set_num=set_text,
+        bag=bag_number,
+        review_status="approved",
+    )
+    entries = [
+        dict(item)
+        for item in list(listed.get("entries") or [])
+        if isinstance(item, dict) and str(item.get("bundle_id") or "").strip()
+    ]
+    results: List[Dict[str, Any]] = []
+    success_count = 0
+    failed_count = 0
+    for entry in entries:
+        bundle_id = str(entry.get("bundle_id") or "").strip()
+        try:
+            upload_result = upload_bundle_to_r2(bundle_id, dry_run=dry_run_enabled)
+            ok = bool(upload_result.get("ok"))
+            if ok:
+                success_count += 1
+            else:
+                failed_count += 1
+            results.append(
+                {
+                    "bundle_id": bundle_id,
+                    "ok": ok,
+                    "dry_run": dry_run_enabled,
+                    "uploaded": bool(upload_result.get("uploaded")),
+                    "would_upload": bool(upload_result.get("would_upload")),
+                    "error": str(upload_result.get("error") or ""),
+                    "r2_status": str(upload_result.get("r2_status") or entry.get("r2_status") or ""),
+                    "azure_postgres_registration": upload_result.get("azure_postgres_registration"),
+                }
+            )
+        except Exception as exc:
+            failed_count += 1
+            results.append(
+                {
+                    "bundle_id": bundle_id,
+                    "ok": False,
+                    "dry_run": dry_run_enabled,
+                    "uploaded": False,
+                    "would_upload": False,
+                    "error": type(exc).__name__,
+                }
+            )
+
+    return JSONResponse(
+        {
+            "ok": failed_count == 0,
+            "set_num": set_text,
+            "bag_num": bag_number,
+            "dry_run": dry_run_enabled,
+            "approved_bundle_count": len(entries),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "bundle_ids": [str(item.get("bundle_id") or "") for item in entries],
+            "results": results,
+        }
+    )
+
+
 @router.get("/debug/training-store/prepare-azure-index")
 def training_store_prepare_azure_index(bundle_id: str = Query(...)):
     try:
@@ -4795,6 +5158,574 @@ def training_store_prepare_azure_index(bundle_id: str = Query(...)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(result)
+
+
+@router.get("/debug/training-store/bundle-index-row")
+def training_store_bundle_index_row(bundle_id: str = Query(...)):
+    try:
+        result = get_training_bundle_index_row(bundle_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.get("/debug/training-store/review-queue")
+def training_store_review_queue(
+    review_status: str = Query(""),
+    set_num: str = Query(""),
+    bag_num: str = Query(""),
+    limit: int = Query(100),
+):
+    try:
+        result = list_review_queue(
+            review_status=review_status,
+            set_num=set_num,
+            bag_num=bag_num,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/review")
+async def training_store_review(req: Request):
+    payload: Dict[str, Any] = {}
+    try:
+        body = await req.json()
+        if isinstance(body, dict):
+            payload = dict(body)
+    except Exception:
+        payload = {}
+    try:
+        result = update_training_bundle_review(
+            str(payload.get("bundle_id") or ""),
+            review_status=str(payload.get("review_status") or ""),
+            review_notes=str(payload.get("review_notes") or ""),
+            mask_quality=payload.get("mask_quality"),
+            split_quality=payload.get("split_quality"),
+            qty_text_present=bool(payload.get("qty_text_present")),
+            multi_part_merge=bool(payload.get("multi_part_merge")),
+            reviewed_by=str(payload.get("reviewed_by") or ""),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.get("/debug/training-store/review-stats")
+def training_store_review_stats():
+    try:
+        result = get_review_stats()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/analyse-bundle")
+def training_store_analyse_bundle(bundle_id: str = Query(...)):
+    try:
+        result = analyse_reviewed_bundle(bundle_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/analyze-bundle")
+def training_store_analyze_bundle(bundle_id: str = Query(...)):
+    return training_store_analyse_bundle(bundle_id)
+
+
+@router.post("/debug/training-store/generate-split-candidates")
+def training_store_generate_split_candidates(bundle_id: str = Query(...)):
+    try:
+        result = generate_split_candidates(bundle_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/accept-split-candidate")
+def training_store_accept_split_candidate(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+):
+    try:
+        result = mark_split_candidate(bundle_id, candidate_index, "accepted")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/reject-split-candidate")
+def training_store_reject_split_candidate(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+):
+    try:
+        result = mark_split_candidate(bundle_id, candidate_index, "rejected")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/scrub-candidate-qty")
+def training_store_scrub_candidate_qty(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+):
+    try:
+        result = scrub_candidate_qty(bundle_id, candidate_index)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+def _training_review_metadata_path(row: Dict[str, Any]) -> Path:
+    manifest_path = Path(str(row.get("manifest_path") or "").strip())
+    if manifest_path.exists() and manifest_path.is_file():
+        return manifest_path
+    bundle_id = str(row.get("bundle_id") or "").strip()
+    return (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+        / bundle_id
+        / "metadata.json"
+    )
+
+
+def _read_training_review_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+    path = _training_review_metadata_path(row)
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _training_review_img(path_value: Any, alt: str) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return '<div class="missing">missing</div>'
+    src = f"/debug/ai-snap-artifact?path={_url_quote(path_text)}"
+    return f'<img src="{src}" alt="{escape(alt)}" loading="lazy">'
+
+
+def _training_review_qty_overlay(copied_files: Dict[str, Any], qty_token_boxes: List[Dict[str, Any]], bundle_id: str) -> str:
+    original_path = Path(str(copied_files.get("original_crop") or "").strip())
+    if not original_path.exists() or not original_path.is_file() or not qty_token_boxes:
+        return ""
+    image = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+    if image is None or getattr(image, "size", 0) == 0:
+        return ""
+    for index, token in enumerate(qty_token_boxes):
+        x = int(_coerce_int(token.get("x")) or 0)
+        y = int(_coerce_int(token.get("y")) or 0)
+        w = int(_coerce_int(token.get("w")) or 0)
+        h = int(_coerce_int(token.get("h")) or 0)
+        if w <= 0 or h <= 0:
+            continue
+        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.putText(image, str(index + 1), (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+    out_path = original_path.with_name(f"{bundle_id}_qty_overlay.png")
+    cv2.imwrite(str(out_path), image)
+    return str(out_path)
+
+
+def _training_review_qty_overlay_html(copied_files: Dict[str, Any], qty_token_boxes: List[Dict[str, Any]]) -> str:
+    original_path = str(copied_files.get("original_crop") or "").strip()
+    if not original_path:
+        return '<div class="missing">no original crop</div>'
+    src = f"/debug/ai-snap-artifact?path={_url_quote(original_path)}"
+    boxes_html: List[str] = []
+    for index, token in enumerate(qty_token_boxes):
+        box = token.get("normalized_box") if isinstance(token.get("normalized_box"), list) else [token.get("x"), token.get("y"), token.get("w"), token.get("h")]
+        try:
+            x, y, w, h = [float(value) for value in list(box)[:4]]
+            crop_size = token.get("crop_image_size") if isinstance(token.get("crop_image_size"), list) else []
+            crop_w = float(crop_size[0]) if len(crop_size) >= 2 else 0.0
+            crop_h = float(crop_size[1]) if len(crop_size) >= 2 else 0.0
+        except Exception:
+            continue
+        if crop_w <= 0 or crop_h <= 0 or w <= 0 or h <= 0:
+            continue
+        label = f"{index + 1}: {token.get('text') or token.get('value') or ''}"
+        raw_box = token.get("raw_box") or [token.get("x"), token.get("y"), token.get("w"), token.get("h")]
+        normalized_box = token.get("normalized_box") or [token.get("x"), token.get("y"), token.get("w"), token.get("h")]
+        source = str(token.get("coordinate_source") or "unknown")
+        raw_polygon = token.get("raw_polygon") if isinstance(token.get("raw_polygon"), list) else []
+        title = f"raw={raw_box} raw_polygon={raw_polygon} normalized={normalized_box} source={source}"
+        raw_box_values = []
+        try:
+            raw_box_values = [float(value) for value in list(raw_box)[:4]]
+        except Exception:
+            raw_box_values = []
+        if len(raw_box_values) == 4:
+            rx, ry, rw, rh = raw_box_values
+            if rw > 0 and rh > 0:
+                boxes_html.append(
+                    '<div class="qty-box raw" '
+                    f'style="left:{(rx / crop_w) * 100:.4f}%;top:{(ry / crop_h) * 100:.4f}%;width:{(rw / crop_w) * 100:.4f}%;height:{(rh / crop_h) * 100:.4f}%;" '
+                    f'title="{escape(title)}"></div>'
+                )
+        boxes_html.append(
+            '<div class="qty-box" '
+            f'style="left:{(x / crop_w) * 100:.4f}%;top:{(y / crop_h) * 100:.4f}%;width:{(w / crop_w) * 100:.4f}%;height:{(h / crop_h) * 100:.4f}%;" '
+            f'title="{escape(title)}"><span>{escape(label)}</span></div>'
+        )
+        cx = x + (w / 2.0)
+        cy = y + (h / 2.0)
+        boxes_html.append(
+            '<div class="qty-center" '
+            f'style="left:{(cx / crop_w) * 100:.4f}%;top:{(cy / crop_h) * 100:.4f}%;" '
+            f'title="{escape(title)}"></div>'
+        )
+    return (
+        '<div class="ocr-overlay-wrap">'
+        '<div class="ocr-overlay-stage">'
+        f'<img src="{src}" alt="original crop with OCR qty overlay" loading="lazy">'
+        f'{"".join(boxes_html)}'
+        '</div>'
+        '</div>'
+    )
+
+
+@router.get("/debug/training-store/review-ui")
+def training_store_review_ui(
+    bundle_id: str = Query(""),
+    review_status: str = Query("pending"),
+    set_num: str = Query(""),
+    bag_num: str = Query(""),
+    limit: int = Query(50),
+):
+    try:
+        queue = list_review_queue(
+            review_status=review_status,
+            set_num=set_num,
+            bag_num=bag_num,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    rows = [dict(row) for row in list(queue.get("rows") or []) if isinstance(row, dict)]
+    selected = next((row for row in rows if str(row.get("bundle_id") or "") == str(bundle_id or "").strip()), None)
+    if selected is None and bundle_id:
+        try:
+            selected = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        except Exception:
+            selected = None
+    if selected is None and rows:
+        selected = rows[0]
+
+    selected_bundle_id = str((selected or {}).get("bundle_id") or "")
+    metadata = _read_training_review_metadata(selected or {}) if selected else {}
+    copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
+    qty_token_boxes = [
+        dict(item)
+        for item in list(metadata.get("qty_token_boxes") or [])
+        if isinstance(item, dict)
+    ]
+    qty_token_boxes = _normalize_qty_token_boxes_for_bundle(
+        qty_token_boxes,
+        crop_box=(metadata.get("source_crop") or {}).get("crop_box") if isinstance(metadata.get("source_crop"), dict) else None,
+        original_crop_path=copied_files.get("original_crop"),
+    )
+    direct_qty_ocr_boxes = [
+        dict(item)
+        for item in list(metadata.get("direct_qty_ocr_boxes") or [])
+        if isinstance(item, dict)
+    ]
+    if not direct_qty_ocr_boxes:
+        direct_qty_ocr_boxes = _direct_qty_ocr_boxes_from_crop_image(copied_files.get("original_crop"))
+        if direct_qty_ocr_boxes and selected:
+            metadata["direct_qty_ocr_boxes"] = direct_qty_ocr_boxes
+            try:
+                _training_review_metadata_path(selected).write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+            except Exception:
+                pass
+    slot_cutouts = list(copied_files.get("slot_cutouts") or metadata.get("cutout_paths") or [])
+    split_candidate_paths = (selected or {}).get("split_candidate_paths") if isinstance((selected or {}).get("split_candidate_paths"), dict) else {}
+    split_candidates = [
+        dict(item)
+        for item in list(split_candidate_paths.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    baseline_slot_candidates = [
+        dict(item)
+        for item in list(split_candidate_paths.get("baseline_slot_candidates") or [])
+        if isinstance(item, dict)
+    ]
+    ai_suggested_candidates = [
+        dict(item)
+        for item in list(split_candidate_paths.get("ai_suggested_candidates") or [])
+        if isinstance(item, dict)
+    ]
+    if not baseline_slot_candidates and split_candidates:
+        baseline_slot_candidates = [
+            item for item in split_candidates if str(item.get("group") or "") == "baseline_slot"
+        ]
+        ai_suggested_candidates = [
+            item for item in split_candidates if str(item.get("group") or "") == "ai_suggested"
+        ]
+    bundle_match = re.search(r"_p(\d+)_s(\d+)_c(\d+)", selected_bundle_id)
+    selected_page_num = (selected or {}).get("page_num") or (bundle_match.group(1) if bundle_match else "")
+    selected_step_num = (selected or {}).get("step_num") or (bundle_match.group(2) if bundle_match else "")
+    selected_crop_num = (selected or {}).get("crop_num") or (bundle_match.group(3) if bundle_match else "")
+    selected_slot_count = (selected or {}).get("slot_count") or len(slot_cutouts)
+    queue_links = []
+    for row in rows:
+        row_bundle_id = str(row.get("bundle_id") or "")
+        row_match = re.search(r"_p(\d+)_s(\d+)_c(\d+)", row_bundle_id)
+        row_page_num = row.get("page_num") or (row_match.group(1) if row_match else "")
+        row_step_num = row.get("step_num") or (row_match.group(2) if row_match else "")
+        row_slot_count = row.get("slot_count") or ""
+        href = (
+            f"/debug/training-store/review-ui?bundle_id={_url_quote(row_bundle_id)}"
+            f"&review_status={_url_quote(review_status)}&set_num={_url_quote(set_num)}"
+            f"&bag_num={_url_quote(bag_num)}&limit={int(limit or 50)}"
+        )
+        active = " active" if row_bundle_id == selected_bundle_id else ""
+        queue_links.append(
+            f'<a class="queue-item{active}" href="{href}">'
+            f'<strong>{escape(row_bundle_id)}</strong>'
+            f'<span>p{escape(str(row_page_num))} s{escape(str(row_step_num))} slots {escape(str(row_slot_count))}</span>'
+            f'</a>'
+        )
+
+    slot_html = "".join(
+        f'<figure><div class="slot-img">{_training_review_img(path, f"Slot {index + 1}")}</div><figcaption>Slot {index + 1}</figcaption></figure>'
+        for index, path in enumerate(slot_cutouts)
+    ) or '<div class="missing">no slot cutouts</div>'
+    split_overlay_html = (
+        f'<figure>{_training_review_img(split_candidate_paths.get("overlay_path"), "split candidate overlay")}<figcaption>split candidate overlay</figcaption></figure>'
+        if split_candidate_paths.get("overlay_path")
+        else '<div class="missing">no split candidate overlay</div>'
+    )
+    old_qty_overlay_html = _training_review_qty_overlay_html(copied_files, qty_token_boxes)
+    direct_qty_overlay_html = _training_review_qty_overlay_html(copied_files, direct_qty_ocr_boxes)
+    qty_rows_html = "".join(
+        (
+            f'<tr>'
+            f'<td>{escape(str(index + 1))}</td>'
+            f'<td>{escape(str(token.get("text") or token.get("value") or ""))}</td>'
+            f'<td>{escape(str(token.get("raw_box") or [token.get("x"), token.get("y"), token.get("w"), token.get("h")]))}</td>'
+            f'<td>{escape(str(token.get("normalized_box") or [token.get("x"), token.get("y"), token.get("w"), token.get("h")]))}</td>'
+            f'<td>{escape(str(token.get("coordinate_source") or ""))}</td>'
+            f'<td>{escape(str(token.get("raw_polygon") or ""))}</td>'
+            f'<td>{escape(str(token.get("converted_bbox") or token.get("normalized_box") or ""))}</td>'
+            f'<td>{escape(str(token.get("confidence") or ""))}</td>'
+            f'</tr>'
+        )
+        for index, token in enumerate(qty_token_boxes)
+    ) or '<tr><td colspan="8">No qty token boxes in metadata.</td></tr>'
+    direct_qty_rows_html = "".join(
+        (
+            f'<tr>'
+            f'<td>{escape(str(index + 1))}</td>'
+            f'<td>{escape(str(token.get("text") or token.get("value") or ""))}</td>'
+            f'<td>{escape(str(token.get("raw_box") or [token.get("x"), token.get("y"), token.get("w"), token.get("h")]))}</td>'
+            f'<td>{escape(str(token.get("normalized_box") or [token.get("x"), token.get("y"), token.get("w"), token.get("h")]))}</td>'
+            f'<td>{escape(str(token.get("coordinate_source") or ""))}</td>'
+            f'<td>{escape(str(token.get("raw_polygon") or ""))}</td>'
+            f'<td>{escape(str(token.get("converted_bbox") or token.get("normalized_box") or ""))}</td>'
+            f'<td>{escape(str(token.get("confidence") or ""))}</td>'
+            f'</tr>'
+        )
+        for index, token in enumerate(direct_qty_ocr_boxes)
+    ) or '<tr><td colspan="8">No direct OCR qty boxes.</td></tr>'
+
+    def _candidate_display_index(candidate: Dict[str, Any], fallback: int) -> int:
+        parsed = _coerce_int(candidate.get("index"))
+        display = _coerce_int(candidate.get("display_index"))
+        return int(display if display is not None else int(parsed if parsed is not None else fallback) + 1)
+
+    def _render_candidate_cards(candidates: List[Dict[str, Any]]) -> str:
+        return "".join(
+            (
+                f'<figure>'
+                f'<div class="slot-img">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+                f'<figcaption>Candidate {escape(str(_candidate_display_index(candidate, index)))} · {escape(str(candidate.get("status") or "pending"))}</figcaption>'
+                f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}<br>Qty scrub: {escape(str(candidate.get("qty_scrub_status") or "not run"))}</div>'
+                f'<div class="candidate-actions">'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Needs Qty Scrub / Scrub Qty</button>'
+                f'</div>'
+                f'</figure>'
+            )
+            for index, candidate in enumerate(candidates)
+        )
+
+    baseline_candidate_html = _render_candidate_cards(baseline_slot_candidates) or '<div class="missing">no baseline slot candidates generated</div>'
+    ai_candidate_html = _render_candidate_cards(ai_suggested_candidates) or '<div class="missing">no AI suggested candidates generated</div>'
+    legacy_split_candidate_html = "".join(
+        (
+            f'<figure>'
+            f'<div class="slot-img">{_training_review_img(candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+            f'<figcaption>Candidate {escape(str(_candidate_display_index(candidate, index)))} · {escape(str(candidate.get("status") or "pending"))}</figcaption>'
+            f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}</div>'
+            f'<div class="candidate-actions">'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Needs Qty Scrub / Scrub Qty</button>'
+            f'</div>'
+            f'</figure>'
+        )
+        for index, candidate in enumerate(split_candidates)
+    ) if not baseline_slot_candidates and not ai_suggested_candidates else ""
+    title = escape(selected_bundle_id or "Training Review")
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Training Review</title>
+  <style>
+    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#172026; background:#f5f7f8; }}
+    header {{ padding:14px 18px; background:#18212b; color:white; display:flex; justify-content:space-between; gap:16px; align-items:center; }}
+    main {{ display:grid; grid-template-columns:320px 1fr; min-height:calc(100vh - 54px); }}
+    aside {{ border-right:1px solid #d8dee3; background:white; overflow:auto; padding:12px; }}
+    .queue-item {{ display:block; padding:10px; border-radius:6px; color:#172026; text-decoration:none; border:1px solid transparent; }}
+    .queue-item span {{ display:block; color:#66727d; font-size:12px; margin-top:3px; }}
+    .queue-item.active {{ border-color:#2f7dd1; background:#eef6ff; }}
+    section {{ padding:16px; }}
+    .meta {{ display:grid; grid-template-columns:repeat(5,minmax(90px,1fr)); gap:8px; margin-bottom:14px; }}
+    .meta div {{ background:white; border:1px solid #d8dee3; border-radius:6px; padding:8px; }}
+    .label {{ display:block; color:#66727d; font-size:12px; }}
+    .images {{ display:grid; grid-template-columns:repeat(3,minmax(180px,1fr)); gap:12px; margin-bottom:14px; }}
+    figure {{ margin:0; background:white; border:1px solid #d8dee3; border-radius:6px; padding:8px; }}
+    figcaption {{ color:#66727d; font-size:12px; margin-top:6px; }}
+    img {{ max-width:100%; height:auto; image-rendering:auto; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
+    .slots {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }}
+    .split-candidates {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px; margin-top:10px; }}
+    .candidate-actions {{ display:flex; gap:6px; margin-top:8px; }}
+    .candidate-actions button {{ padding:6px 8px; font-size:12px; }}
+    .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
+    .ocr-table {{ width:100%; border-collapse:collapse; background:white; border:1px solid #d8dee3; border-radius:6px; overflow:hidden; margin:8px 0 14px; }}
+    .ocr-table th, .ocr-table td {{ text-align:left; border-bottom:1px solid #e4e9ed; padding:7px 8px; font-size:13px; }}
+    .ocr-table th {{ color:#66727d; background:#f8fafb; }}
+    .ocr-overlay-wrap {{ display:inline-block; max-width:100%; background:white; border:1px solid #d8dee3; border-radius:6px; padding:0; overflow:visible; }}
+    .ocr-overlay-stage {{ position:relative; display:inline-block; max-width:100%; line-height:0; }}
+    .ocr-overlay-stage img {{ display:block; width:100%; height:auto; }}
+    .qty-box {{ position:absolute; border:2px solid #e02020; box-sizing:border-box; pointer-events:auto; z-index:2; }}
+    .qty-box.raw {{ border:2px dashed #19a552; z-index:1; }}
+    .qty-box span {{ position:absolute; left:0; top:-18px; background:#e02020; color:white; font-size:11px; line-height:1; padding:3px 4px; border-radius:3px; white-space:nowrap; }}
+    .qty-center {{ position:absolute; width:7px; height:7px; margin-left:-3.5px; margin-top:-3.5px; border-radius:999px; background:#1267ff; box-shadow:0 0 0 1px white; z-index:3; }}
+    form {{ background:white; border:1px solid #d8dee3; border-radius:6px; padding:12px; margin-top:14px; display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:10px; align-items:end; }}
+    input, select, textarea, button {{ font:inherit; padding:8px; border:1px solid #c8d0d7; border-radius:6px; }}
+    textarea {{ grid-column:span 2; min-height:42px; }}
+    button {{ background:#1f6fc9; color:white; border-color:#1f6fc9; cursor:pointer; }}
+    .missing {{ padding:18px; color:#66727d; background:#f3f5f6; border-radius:6px; }}
+  </style>
+</head>
+<body>
+  <header><strong>Training Review Queue</strong><span>{escape(str(queue.get("count", 0)))} queued</span></header>
+  <main>
+    <aside>{''.join(queue_links) or '<div class="missing">No bundles match the current filters.</div>'}</aside>
+    <section>
+      <h2>{title}</h2>
+      <div class="meta">
+        <div><span class="label">status</span>{escape(str((selected or {}).get("review_status") or ""))}</div>
+        <div><span class="label">set</span>{escape(str((selected or {}).get("set_num") or ""))}</div>
+        <div><span class="label">bag</span>{escape(str((selected or {}).get("bag_num") or ""))}</div>
+        <div><span class="label">page/step</span>{escape(str(selected_page_num))} / {escape(str(selected_step_num))}</div>
+        <div><span class="label">crop</span>{escape(str(selected_crop_num))}</div>
+        <div><span class="label">slots</span>{escape(str(selected_slot_count))}</div>
+      </div>
+      <div class="images">
+        <figure>{_training_review_img(copied_files.get("original_crop"), "original crop")}<figcaption>original crop</figcaption></figure>
+        <figure>{_training_review_img(copied_files.get("full_mask_overlay"), "full mask overlay")}<figcaption>overlay</figcaption></figure>
+        <figure>{_training_review_img(copied_files.get("raw_master_mask"), "raw master mask")}<figcaption>mask</figcaption></figure>
+      </div>
+      <h3>OCR / Qty Tokens</h3>
+      <h4>Direct Qty OCR Boxes (source of truth)</h4>
+      <div>{direct_qty_overlay_html}</div>
+      <table class="ocr-table"><thead><tr><th>#</th><th>text/value</th><th>raw bbox</th><th>normalized bbox</th><th>source</th><th>raw polygon</th><th>converted bbox</th><th>confidence</th></tr></thead><tbody>{direct_qty_rows_html}</tbody></table>
+      <h4>Old Qty Token Boxes</h4>
+      <div>{old_qty_overlay_html}</div>
+      <table class="ocr-table"><thead><tr><th>#</th><th>text/value</th><th>raw bbox</th><th>normalized bbox</th><th>source</th><th>raw polygon</th><th>converted bbox</th><th>confidence</th></tr></thead><tbody>{qty_rows_html}</tbody></table>
+      <div class="slots">{slot_html}</div>
+      <h3>Split Candidates</h3>
+      <div class="images">{split_overlay_html}</div>
+      <h4>Baseline Slot Candidates</h4>
+      <div class="split-candidates">{baseline_candidate_html}</div>
+      <h4>AI Suggested Candidates</h4>
+      <div class="split-candidates">{ai_candidate_html}</div>
+      {f'<h4>Legacy Candidates</h4><div class="split-candidates">{legacy_split_candidate_html}</div>' if legacy_split_candidate_html else ''}
+      <form id="review-form">
+        <input type="hidden" name="bundle_id" value="{escape(selected_bundle_id)}">
+        <label><span class="label">status</span><select name="review_status"><option>approved</option><option>rejected</option><option>needs_split_fix</option><option>bad_mask</option></select></label>
+        <label><span class="label">mask quality</span><input name="mask_quality" type="number" min="1" max="5" value="5"></label>
+        <label><span class="label">split quality</span><input name="split_quality" type="number" min="1" max="5" value="5"></label>
+        <label><span class="label">reviewed by</span><input name="reviewed_by" value="andy"></label>
+        <label><input name="qty_text_present" type="checkbox"> qty text present</label>
+        <label><input name="multi_part_merge" type="checkbox"> multi-part merge</label>
+        <textarea name="review_notes" placeholder="review notes"></textarea>
+        <button type="submit">Save review</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    document.getElementById('review-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const form = event.currentTarget;
+      const payload = Object.fromEntries(new FormData(form).entries());
+      payload.qty_text_present = form.qty_text_present.checked;
+      payload.multi_part_merge = form.multi_part_merge.checked;
+      payload.mask_quality = Number(payload.mask_quality || 0);
+      payload.split_quality = Number(payload.split_quality || 0);
+      const res = await fetch('/debug/training-store/review', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify(payload)
+      }});
+      if (!res.ok) {{
+        alert(await res.text());
+        return;
+      }}
+      location.reload();
+    }});
+    document.querySelectorAll('[data-candidate-action]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const action = button.dataset.candidateAction;
+        const index = button.dataset.candidateIndex;
+        const endpoint = action === 'accept'
+          ? '/debug/training-store/accept-split-candidate'
+          : (action === 'scrub'
+            ? '/debug/training-store/scrub-candidate-qty'
+            : '/debug/training-store/reject-split-candidate');
+        const params = new URLSearchParams({{bundle_id: "{escape(selected_bundle_id)}", candidate_index: String(index || "")}});
+        const res = await fetch(endpoint + '?' + params.toString(), {{method: 'POST'}});
+        if (!res.ok) {{
+          alert(await res.text());
+          return;
+        }}
+        location.reload();
+      }});
+    }});
+  </script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
 
 
 @router.get("/debug/manual-page-image")
