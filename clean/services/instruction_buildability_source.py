@@ -46,13 +46,12 @@ def load_instruction_set_parts(set_num: str) -> Dict:
     parts = cur.execute(
         """
         SELECT part_num, color_id, SUM(quantity) AS quantity
-        FROM inventory_parts
-        WHERE inventory_id = ?
-          AND COALESCE(is_spare, 0) = 0
+        FROM v_set_requirements
+        WHERE set_num = ?
         GROUP BY part_num, color_id
         HAVING COALESCE(SUM(quantity), 0) > 0
         """,
-        (inventory_id,),
+        (set_id,),
     ).fetchall()
 
     out: List[Dict] = []
@@ -107,6 +106,7 @@ def load_instruction_set_parts(set_num: str) -> Dict:
                 "color_name": color_name,
                 "rgb": rgb,
                 "element_id": element_id,
+                "set_required_qty": qty,
                 "qty": qty,
                 "img_url": img_url,
                 "needs_image": img_url is None,

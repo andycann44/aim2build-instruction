@@ -175,6 +175,13 @@ def _box_intersection_area(a: List[int], b: List[int]) -> int:
     return max(0, ix2 - ix1) * max(0, iy2 - iy1)
 
 
+def _point_in_box(px: float, py: float, box: List[int]) -> bool:
+    if len(box) != 4:
+        return False
+    x, y, w, h = box
+    return float(x) <= px <= float(x + w) and float(y) <= py <= float(y + h)
+
+
 def _box_iou(a: List[int], b: List[int]) -> float:
     if not _boxes_intersect(a, b):
         return 0.0
@@ -754,6 +761,9 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
             ],
         }
         rejected_reason = ""
+        qty_overlap_ratio = 0.0
+        bbox_overlap_ratio = 0.0
+        center_inside_qty = False
         if area <= 0:
             rejected_reason = "no_mask_pixels"
         elif area < min_component_area:
@@ -763,12 +773,40 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
         elif h < 6:
             rejected_reason = "component_height_too_small"
         else:
-            bbox_area = max(1, w * h)
-            qty_overlap = max((_box_intersection_area([x, y, w, h], qty_box) for qty_box in padded_qty_boxes), default=0)
-            if qty_overlap / float(bbox_area) > 0.45 and area < max(min_component_area * 4, 220):
+            component_box = [x, y, w, h]
+            component_pixel_area = max(1, area)
+            component_overlap_pixels = 0
+            if padded_qty_boxes:
+                component_pixels = component_labels == component_label
+                for qty_box in padded_qty_boxes:
+                    qx, qy, qw, qh = qty_box
+                    ix1, iy1 = max(x, qx), max(y, qy)
+                    ix2, iy2 = min(x + w, qx + qw), min(y + h, qy + qh)
+                    if ix2 <= ix1 or iy2 <= iy1:
+                        continue
+                    component_overlap_pixels = max(
+                        component_overlap_pixels,
+                        int(np.count_nonzero(component_pixels[iy1:iy2, ix1:ix2])),
+                    )
+            qty_overlap_ratio = float(component_overlap_pixels) / float(component_pixel_area)
+            center_inside_qty = any(
+                _point_in_box(float(component["centroid"][0]), float(component["centroid"][1]), qty_box)
+                for qty_box in padded_qty_boxes
+            )
+            bbox_overlap_ratio = max(
+                (_box_intersection_area(component_box, qty_box) / float(max(1, w * h)) for qty_box in padded_qty_boxes),
+                default=0.0,
+            )
+            if qty_overlap_ratio > 0.5 or center_inside_qty:
                 rejected_reason = "qty_text_component"
         if rejected_reason:
-            rejected_components.append({**component, "rejected_reason": rejected_reason})
+            rejected_components.append({
+                **component,
+                "rejected_reason": rejected_reason,
+                "qty_overlap_ratio": qty_overlap_ratio,
+                "bbox_overlap_ratio": bbox_overlap_ratio,
+                "center_inside_qty": center_inside_qty,
+            })
             continue
         components.append(component)
     components.sort(key=lambda item: (int(item["box"][1]), int(item["box"][0])))

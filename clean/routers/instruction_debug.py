@@ -48,12 +48,19 @@ from clean.routers.debug import (
 )
 from clean.services import debug_service, step_detector_service
 from clean.services.training_store_service import list_registered_bundles, register_analysis_bundle, update_bundle_review
-from clean.services.training_cloud_sync_service import prepare_bundle_for_azure, prepare_bundle_for_r2, upload_bundle_to_r2
+from clean.services.training_cloud_sync_service import (
+    prepare_bundle_for_azure,
+    prepare_bundle_for_r2,
+    upload_bundle_to_r2,
+    upload_confirmed_candidate_assets,
+)
 from clean.services.training_bundle_index_service import (
     confirm_candidate_part,
     get_bundle as get_training_bundle_index_row,
     get_review_stats,
     list_candidate_training_examples,
+    list_confirmed_part_totals_for_set,
+    list_confirmed_part_usage,
     list_review_queue,
     reset_bag_index_rows,
     unconfirm_candidate_part,
@@ -2415,7 +2422,7 @@ def _debug_bag_specific_part_rows(set_num: str, bag: int) -> List[Dict[str, Any]
             {
                 "part_num": part_num,
                 "color_id": int(color_id),
-                "qty": int(row["qty_total"] or 0),
+                "bag_required_qty": int(row["qty_total"] or 0),
             }
         )
     return out
@@ -2448,7 +2455,8 @@ def _slot_mask_candidate_pool(set_num: str, bag: int) -> Tuple[List[Dict[str, An
             {
                 "part_num": part_num,
                 "color_id": int(color_id),
-                "qty": int(row.get("qty", meta.get("qty", 0)) or 0),
+                "set_required_qty": int(meta.get("set_required_qty", 0) or 0),
+                "bag_required_qty": int(row.get("bag_required_qty", meta.get("set_required_qty", 0) if source == "set_fallback" else 0) or 0),
             }
         )
         if not str(candidate.get("img_url") or "").strip():
@@ -5337,6 +5345,27 @@ def training_store_review_stats():
     return JSONResponse(result)
 
 
+@router.get("/debug/training-store/confirmed-part-usage")
+def training_store_confirmed_part_usage(
+    set_num: str = Query(...),
+    part_num: str = Query(...),
+    color_id: int = Query(...),
+    element_id: str = Query(""),
+    required_qty: str = Query(""),
+):
+    try:
+        result = list_confirmed_part_usage(
+            set_num=set_num,
+            part_num=part_num,
+            color_id=color_id,
+            element_id=element_id,
+            required_qty=required_qty,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
 @router.post("/debug/training-store/analyse-bundle")
 def training_store_analyse_bundle(bundle_id: str = Query(...)):
     try:
@@ -5483,6 +5512,29 @@ async def training_store_confirm_candidate_part(req: Request):
             r2_path=str(payload.get("r2_path") or query.get("r2_path") or candidate.get("r2_path") or ""),
             confirmed_by=str(payload.get("confirmed_by") or query.get("confirmed_by") or "andy"),
         )
+        dry_run_value = payload.get("dry_run", query.get("dry_run", "0"))
+        upload_result: Dict[str, Any]
+        try:
+            upload_result = upload_confirmed_candidate_assets(
+                bundle_id=bundle_id,
+                candidate_index=candidate_index,
+                candidate=candidate,
+                confirmation=dict(result.get("row") or {}),
+                row=row,
+                dry_run=_dry_run_enabled(str(dry_run_value)),
+            )
+        except Exception as exc:
+            upload_result = {
+                "ok": False,
+                "uploaded": False,
+                "error": type(exc).__name__,
+                "detail": str(exc),
+            }
+        result["candidate_r2_upload"] = upload_result
+        if not bool(upload_result.get("ok")):
+            result["warning"] = "candidate confirmation saved, but R2 upload failed"
+        elif bool(upload_result.get("skipped")):
+            result["warning"] = "candidate confirmation saved, but R2 upload was skipped"
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
@@ -5618,6 +5670,8 @@ def _training_review_candidate_part_matches(
     candidate: Dict[str, Any],
     confirmed_rows: List[Dict[str, Any]],
     limit: int = 5,
+    scope: str = "bag",
+    confirmed_totals_override: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     set_num = str(row.get("set_num") or "").strip()
     bag = _coerce_int(row.get("bag_num")) or 1
@@ -5634,13 +5688,21 @@ def _training_review_candidate_part_matches(
     if query_profile is None:
         return []
 
-    candidate_rows, _pool_source = _slot_mask_candidate_pool(set_num, int(bag))
+    if scope == "set":
+        parts_payload = load_instruction_set_parts(str(set_num))
+        candidate_rows = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
+        bag_required_by_key = {
+            _candidate_part_key(row.get("part_num"), row.get("color_id")): int(row.get("bag_required_qty") or 0)
+            for row in _debug_bag_specific_part_rows(str(set_num), int(bag))
+        }
+        for candidate_row in candidate_rows:
+            key = _candidate_part_key(candidate_row.get("part_num"), candidate_row.get("color_id"))
+            candidate_row["bag_required_qty"] = int(bag_required_by_key.get(key, 0) or 0)
+    else:
+        candidate_rows, _pool_source = _slot_mask_candidate_pool(set_num, int(bag))
     if not candidate_rows:
         return []
-    labels_path = _label_store_path(set_num, int(bag))
-    labels_payload = _load_existing_labels(labels_path)
-    assigned_totals = _assigned_part_totals_from_labels(labels_payload)
-    confirmed_totals = _training_review_confirmed_example_totals(confirmed_rows)
+    confirmed_totals = dict(confirmed_totals_override or _training_review_confirmed_example_totals(confirmed_rows))
     color_ids = [int(part.get("color_id", 0) or 0) for part in candidate_rows]
     color_bgr_by_id = {
         int(item["color_id"]): _slot_mask_hex_to_bgr(item.get("rgb"))
@@ -5662,9 +5724,11 @@ def _training_review_candidate_part_matches(
         if not part_num or color_id is None:
             continue
         key = _candidate_part_key(part_num, color_id)
-        required_qty = int(part.get("qty", 0) or 0)
-        assigned_qty = int(assigned_totals.get(key, 0) or 0) + int(confirmed_totals.get(key, 0) or 0)
-        remaining_qty = required_qty - assigned_qty
+        set_required_qty = int(part.get("set_required_qty", 0) or 0)
+        bag_required_qty = int(part.get("bag_required_qty", 0) or 0)
+        confirmed_qty = int(confirmed_totals.get(key, 0) or 0)
+        remaining_qty = set_required_qty - confirmed_qty
+        effective_remaining_qty = max(0, remaining_qty)
         catalog_color = color_catalog_by_id.get(int(color_id), {})
         scores = _slot_mask_score_candidate(query_profile, part, color_bgr_by_id)
         ranked.append(
@@ -5678,9 +5742,13 @@ def _training_review_candidate_part_matches(
                 "part_name": str(part.get("part_name") or part.get("name") or part.get("part_name_en") or part.get("description") or ""),
                 "image_url": str(part.get("img_url") or "").strip(),
                 "image_path": str(_slot_mask_resolve_local_image_path(part.get("img_url")) or ""),
-                "required_qty": required_qty,
-                "assigned_qty": assigned_qty,
+                "set_required_qty": set_required_qty,
+                "bag_required_qty": bag_required_qty,
+                "required_qty": set_required_qty,
+                "confirmed_qty": confirmed_qty,
                 "remaining_qty": remaining_qty,
+                "effective_remaining_qty": effective_remaining_qty,
+                "over_confirmed": confirmed_qty > set_required_qty,
                 "confidence": scores["confidence"],
                 "score_breakdown": {
                     "colour": scores["colour"],
@@ -5701,6 +5769,79 @@ def _training_review_candidate_part_matches(
     if limit is None or int(limit or 0) <= 0:
         return ranked
     return ranked[: max(1, int(limit or 5))]
+
+
+def _training_review_required_part_rows(
+    *,
+    set_num: str,
+    bag_num: int,
+    scope: str,
+    confirmed_totals: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    parts_payload = load_instruction_set_parts(str(set_num))
+    set_parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
+    set_by_key = {
+        _candidate_part_key(part.get("part_num"), part.get("color_id")): dict(part or {})
+        for part in set_parts
+    }
+    bag_rows = _debug_bag_specific_part_rows(str(set_num), int(bag_num or 1))
+    bag_required_by_key = {
+        _candidate_part_key(row.get("part_num"), row.get("color_id")): int(row.get("bag_required_qty") or 0)
+        for row in list(bag_rows or [])
+    }
+    if scope == "bag":
+        seed_rows = bag_rows if bag_rows else set_parts
+    else:
+        seed_rows = set_parts
+    color_ids = [
+        int(row.get("color_id", 0) or 0)
+        for row in list(seed_rows or [])
+        if _coerce_int(row.get("color_id")) is not None
+    ]
+    color_catalog_by_id = {
+        int(item.get("color_id", 0) or 0): dict(item)
+        for item in _load_catalog_colors_for_ids(color_ids)
+    }
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_row in list(seed_rows or []):
+        row = dict(raw_row or {})
+        part_num = str(row.get("part_num") or "").strip()
+        color_id = _coerce_int(row.get("color_id"))
+        if not part_num or color_id is None:
+            continue
+        key = _candidate_part_key(part_num, color_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        meta = dict(set_by_key.get(key, {}) or {})
+        catalog_color = color_catalog_by_id.get(int(color_id), {})
+        set_required_qty = int(meta.get("set_required_qty", 0) or 0)
+        bag_required_qty = int(row.get("bag_required_qty", bag_required_by_key.get(key, 0)) or 0)
+        confirmed_qty = int(confirmed_totals.get(key, 0) or 0)
+        remaining_qty = set_required_qty - confirmed_qty
+        rows.append(
+            {
+                "part_num": part_num,
+                "display_part_num": str(meta.get("display_part_num") or part_num),
+                "color_id": int(color_id),
+                "color_name": str(meta.get("color_name") or catalog_color.get("color_name") or f"color {int(color_id)}"),
+                "color_rgb": str(catalog_color.get("rgb") or meta.get("rgb") or ""),
+                "element_id": str(meta.get("element_id") or row.get("element_id") or ""),
+                "part_name": str(meta.get("part_name") or meta.get("name") or meta.get("description") or ""),
+                "image_url": str(meta.get("img_url") or row.get("img_url") or "").strip(),
+                "image_path": str(_slot_mask_resolve_local_image_path(meta.get("img_url") or row.get("img_url")) or ""),
+                "set_required_qty": set_required_qty,
+                "bag_required_qty": bag_required_qty,
+                "confirmed_qty": confirmed_qty,
+                "remaining_qty": remaining_qty,
+                "effective_remaining_qty": max(0, remaining_qty),
+                "completed": set_required_qty > 0 and remaining_qty <= 0,
+                "scope": scope,
+            }
+        )
+    rows.sort(key=lambda item: (str(item.get("part_num") or ""), int(item.get("color_id", 0) or 0)))
+    return rows
 
 
 def _training_review_qty_overlay(copied_files: Dict[str, Any], qty_token_boxes: List[Dict[str, Any]], bundle_id: str) -> str:
@@ -5919,6 +6060,17 @@ def training_store_review_ui(
         if split_candidate_paths.get("overlay_path")
         else '<div class="missing">no split candidate overlay</div>'
     )
+    original_crop_ready = bool(str(copied_files.get("original_crop") or "").strip() and Path(str(copied_files.get("original_crop") or "").strip()).exists())
+    raw_master_mask_ready = bool(str(copied_files.get("raw_master_mask") or "").strip() and Path(str(copied_files.get("raw_master_mask") or "").strip()).exists())
+    split_action_html = (
+        '<div class="split-actions">'
+        f'<button type="button" data-generate-split-candidates="true" '
+        f'{"disabled" if not (selected_bundle_id and original_crop_ready and raw_master_mask_ready) else ""}>'
+        'Generate Split Candidates'
+        '</button>'
+        f'<span>{escape("ready to generate/regenerate" if selected_bundle_id and original_crop_ready and raw_master_mask_ready else "original crop or raw mask missing")}</span>'
+        '</div>'
+    )
     old_qty_overlay_html = _training_review_qty_overlay_html(copied_files, qty_token_boxes)
     direct_qty_overlay_html = _training_review_qty_overlay_html(copied_files, direct_qty_ocr_boxes)
     qty_rows_html = "".join(
@@ -6042,10 +6194,69 @@ def training_store_review_ui(
         and not str(candidate.get("review_state") or "").strip()
         and (not bool(candidate.get("qty_detected")) or bool(str(candidate.get("qty_scrubbed_path") or "").strip()))
     ]
-    selected_set_num = str((selected or {}).get("set_num") or (metadata.get("set_num") if isinstance(metadata, dict) else "") or "")
+    selected_set_num = str((selected or {}).get("set_num") or (metadata.get("set_num") if isinstance(metadata, dict) else "") or set_num or "")
     selected_bag_num = _coerce_int((selected or {}).get("bag_num") or (metadata.get("bag") if isinstance(metadata, dict) else None))
     if selected_bag_num is None:
         selected_bag_num = _coerce_int((metadata.get("bag_num") if isinstance(metadata, dict) else None))
+    if selected_bag_num is None:
+        selected_bag_num = _coerce_int(bag_num)
+    set_confirmed_totals: Dict[str, int] = {}
+    if selected_set_num:
+        try:
+            totals_rows = list(list_confirmed_part_totals_for_set(selected_set_num).get("rows") or [])
+        except Exception:
+            totals_rows = []
+        for total_row in totals_rows:
+            if not isinstance(total_row, dict):
+                continue
+            part_num = str(total_row.get("part_num") or "").strip()
+            color_id = _coerce_int(total_row.get("color_id"))
+            if not part_num or color_id is None:
+                continue
+            set_confirmed_totals[_candidate_part_key(part_num, color_id)] = int(total_row.get("confirmed_qty") or 0)
+    full_set_part_rows = _training_review_required_part_rows(
+        set_num=selected_set_num,
+        bag_num=int(selected_bag_num or 1),
+        scope="set",
+        confirmed_totals=set_confirmed_totals,
+    ) if selected_set_num else []
+    full_bag_part_rows = _training_review_required_part_rows(
+        set_num=selected_set_num,
+        bag_num=int(selected_bag_num or 1),
+        scope="bag",
+        confirmed_totals=set_confirmed_totals,
+    ) if selected_set_num else []
+    next_pending_href = ""
+    if selected_set_num and selected_bag_num is not None:
+        try:
+            pending_queue = list_review_queue(
+                review_status="pending",
+                set_num=selected_set_num,
+                bag_num=selected_bag_num,
+                limit=500,
+            )
+            pending_rows = [
+                dict(row)
+                for row in list(pending_queue.get("rows") or [])
+                if isinstance(row, dict)
+            ]
+        except Exception:
+            pending_rows = []
+        pending_bundle_ids = [str(row.get("bundle_id") or "") for row in pending_rows]
+        next_pending_row: Optional[Dict[str, Any]] = None
+        if selected_bundle_id in pending_bundle_ids:
+            selected_queue_index = pending_bundle_ids.index(selected_bundle_id)
+            if selected_queue_index + 1 < len(pending_rows):
+                next_pending_row = pending_rows[selected_queue_index + 1]
+        elif pending_rows:
+            next_pending_row = pending_rows[0]
+        if next_pending_row:
+            next_pending_bundle_id = str(next_pending_row.get("bundle_id") or "")
+            next_pending_href = (
+                f"/debug/training-store/review-ui?bundle_id={_url_quote(next_pending_bundle_id)}"
+                f"&review_status=pending&set_num={_url_quote(selected_set_num)}"
+                f"&bag_num={_url_quote(str(int(selected_bag_num)))}&limit={int(limit or 50)}"
+            )
     step_href = ""
     if selected_set_num and selected_bag_num is not None and selected_page_num and selected_step_num:
         step_href = (
@@ -6059,6 +6270,48 @@ def training_store_review_ui(
         f'<a class="view-step-link" href="{escape(step_href)}" target="_blank" rel="noopener">View Step</a>'
         if step_href
         else ""
+    )
+    def _render_required_part_rows(rows: List[Dict[str, Any]]) -> str:
+        rendered: List[str] = []
+        for row in rows:
+            color_id = str(row.get("color_id") or "")
+            completed = bool(row.get("completed"))
+            rendered.append(
+                f'<tr data-required-part-row="true" data-scope="{escape(str(row.get("scope") or ""))}" '
+                f'data-color-id="{escape(color_id)}" data-completed="{escape("1" if completed else "0")}">'
+                f'<td><div class="required-part-img">{_training_review_catalog_img(row.get("image_path") or row.get("image_url"), str(row.get("part_num") or ""))}</div></td>'
+                f'<td><strong>{escape(str(row.get("part_num") or ""))}</strong></td>'
+                f'<td>{escape(color_id)}</td>'
+                f'<td>{escape(str(row.get("color_name") or ""))}</td>'
+                f'<td>{escape(str(row.get("element_id") or ""))}</td>'
+                f'<td>{escape(str(row.get("set_required_qty") or 0))}</td>'
+                f'<td>{escape(str(row.get("confirmed_qty") or 0))}</td>'
+                f'<td>{escape(str(row.get("remaining_qty") or 0))}</td>'
+                f'</tr>'
+            )
+        return "".join(rendered)
+
+    required_parts_rows_html = _render_required_part_rows(full_bag_part_rows) + _render_required_part_rows(full_set_part_rows)
+    if not required_parts_rows_html:
+        required_parts_rows_html = '<tr><td colspan="8">No required parts found.</td></tr>'
+    required_parts_panel_html = (
+        '<section class="required-parts-panel">'
+        '<div class="section-heading-row"><h3>Full Bag Parts / Full Set Parts</h3>'
+        '<div class="required-part-toggles">'
+        '<label><input type="radio" name="required-scope" value="set" checked> Full set</label>'
+        '<label style="opacity:0.45" title="Bag estimate is unreliable — hidden from main UI"><input type="radio" name="required-scope" value="bag"> Bag estimate</label>'
+        '<label><input type="checkbox" data-required-current-colour="true"> Current colour</label>'
+        '<label><input type="checkbox" data-required-show-completed="true"> Show already completed</label>'
+        '</div></div>'
+        f'<div class="inventory-debug-counts">full_set_part_count: <strong>{escape(str(len(full_set_part_rows)))}</strong> · '
+        f'full_bag_part_count: <strong>{escape(str(len(full_bag_part_rows)))}</strong> · '
+        '<span>rendered_match_count: <strong data-rendered-match-count>0</strong></span> · '
+        '<span>hidden_due_to_limit_count: <strong data-hidden-due-limit-count>0</strong></span></div>'
+        '<div class="required-parts-table-wrap"><table class="required-parts-table">'
+        '<thead><tr><th>image</th><th>part_num</th><th>color_id</th><th>color_name</th><th>element_id</th><th>Set qty</th><th>Confirmed qty</th><th>Remaining qty</th></tr></thead>'
+        f'<tbody>{required_parts_rows_html}</tbody>'
+        '</table></div>'
+        '</section>'
     )
     confirm_cards: List[str] = []
     for index, candidate in enumerate(clean_accepted_candidates):
@@ -6074,14 +6327,32 @@ def training_store_review_ui(
         qty_values = list(candidate.get("qty_values") or [])
         qty_value = str((qty_values or [""])[0])
         try:
-            matches = _training_review_candidate_part_matches(
+            bag_matches = _training_review_candidate_part_matches(
                 row=selected or {},
                 candidate=candidate,
                 confirmed_rows=confirmed_example_rows,
-                limit=5000,
+                limit=0,
+                scope="bag",
+                confirmed_totals_override=set_confirmed_totals,
             )
         except Exception:
-            matches = []
+            bag_matches = []
+        try:
+            set_matches = _training_review_candidate_part_matches(
+                row=selected or {},
+                candidate=candidate,
+                confirmed_rows=confirmed_example_rows,
+                limit=0,
+                scope="set",
+                confirmed_totals_override=set_confirmed_totals,
+            )
+        except Exception:
+            set_matches = []
+        matches = bag_matches + [
+            match for match in set_matches
+            if _candidate_part_key(match.get("part_num"), match.get("color_id"))
+            not in {_candidate_part_key(item.get("part_num"), item.get("color_id")) for item in bag_matches}
+        ]
         initial_selected_color_id = _coerce_int(confirmed.get("color_id"))
         initial_selected_color_text = str(initial_selected_color_id) if initial_selected_color_id is not None else ""
         initial_filtered_count = (
@@ -6089,6 +6360,8 @@ def training_store_review_ui(
             if initial_selected_color_id is not None
             else len(matches)
         )
+        server_total_card_count = len(matches)
+        server_color_308_count = sum(1 for match in matches if _coerce_int(match.get("color_id")) == 308)
         color_buttons: List[str] = []
         seen_match_colors: set[int] = set()
         for match in matches:
@@ -6115,18 +6388,40 @@ def training_store_review_ui(
         )
         suggestion_cards: List[str] = []
         for match in matches:
+            match_key = _candidate_part_key(match.get("part_num"), match.get("color_id"))
+            match_scope = "bag" if any(_candidate_part_key(item.get("part_num"), item.get("color_id")) == match_key for item in bag_matches) else "set"
             match_color_value = match.get("color_id")
             match_color_text = str(match_color_value) if match_color_value is not None else ""
+            set_required_qty = int(match.get("set_required_qty", 0) or 0)
+            bag_required_qty = int(match.get("bag_required_qty", 0) or 0)
+            confirmed_qty = int(match.get("confirmed_qty", 0) or 0)
+            remaining_qty = int(match.get("remaining_qty", set_required_qty - confirmed_qty) or 0)
+            effective_remaining_qty = max(0, int(match.get("effective_remaining_qty", remaining_qty) or 0))
+            over_confirmed = bool(match.get("over_confirmed")) or confirmed_qty > set_required_qty
+            over_confirmed_html = '<span class="over-confirmed-badge">over-confirmed</span>' if over_confirmed else ""
+            _card_color_match = bool(initial_selected_color_text and match_color_text == initial_selected_color_text)
+            print(
+                f"[training-review-card] candidate={candidate_index}"
+                f" part_num={match.get('part_num')} color_id={match_color_text}"
+                f" set_required_qty={set_required_qty} confirmed_qty={confirmed_qty}"
+                f" remaining_qty={remaining_qty} rendered=True color_match={_card_color_match}"
+            )
             suggestion_cards.append(
-                f'<article class="part-suggestion{escape(" hidden" if initial_selected_color_text and match_color_text != initial_selected_color_text else "")}" data-part-color-id="{escape(match_color_text)}">'
+                f'<article class="part-suggestion{escape(" colour-match-highlight" if _card_color_match else "")}" '
+                f'data-part-color-id="{escape(match_color_text)}" data-match-scope="{escape(match_scope)}">'
                 f'<div class="part-suggestion-img">{_training_review_catalog_img(match.get("image_path") or match.get("image_url"), str(match.get("part_num") or ""))}</div>'
                 f'<div class="part-suggestion-body">'
                 f'<strong>{escape(str(match.get("part_num") or ""))}</strong>'
                 f'<span class="part-colour">{escape(str(match.get("color_name") or ("color " + match_color_text)))} ({escape(match_color_text)})</span>'
                 f'<span class="part-name">{escape(str(match.get("part_name") or ""))}</span>'
                 f'<span class="part-meta">element: {escape(str(match.get("element_id") or "n/a"))}</span>'
-                f'<span class="part-meta">remaining: {escape(str(match.get("remaining_qty") or 0))} of {escape(str(match.get("required_qty") or 0))}</span>'
+                f'<span class="part-meta">Set qty: {escape(str(set_required_qty))}</span>'
+                f'<span class="part-meta">Confirmed qty: {escape(str(confirmed_qty))}; Remaining qty: {escape(str(effective_remaining_qty))} {over_confirmed_html}</span>'
+                f'<span class="part-meta debug-meta">raw remaining_qty: {escape(str(remaining_qty))}; bag_qty: {escape(str(bag_required_qty))}; scope: {escape(match_scope)}</span>'
                 f'<span class="part-score">match {escape(str(match.get("confidence") or ""))}</span>'
+                f'<button type="button" class="usage-toggle" data-show-confirmations="true" data-usage-set-num="{escape(selected_set_num)}" '
+                f'data-usage-part-num="{escape(str(match.get("part_num") or ""))}" data-usage-color-id="{escape(match_color_text)}" '
+                f'data-usage-element-id="{escape(str(match.get("element_id") or ""))}" data-usage-required-qty="{escape(str(set_required_qty))}">Show confirmations</button>'
                 f'<button type="button" data-suggest-confirm="true"{disabled_attr} data-suggestion-color-id="{escape(match_color_text)}" '
                 f'data-suggestion-color-rgb="{escape(str(match.get("color_rgb") or "").strip().replace("#", ""))}" '
                 f'data-confirm-candidate="{escape(str(candidate_index))}" '
@@ -6138,21 +6433,29 @@ def training_store_review_ui(
                 f'</article>'
             )
         suggestion_html = "".join(suggestion_cards)
-        no_color_matches_html = (
-            f'<div class="missing" data-colour-empty-message="true">No set-needed parts found for color_id {escape(initial_selected_color_text)}</div>'
-            if initial_selected_color_text and initial_filtered_count == 0
-            else '<div class="missing hidden" data-colour-empty-message="true"></div>'
-        )
+        no_color_matches_html = '<div class="missing hidden" data-colour-empty-message="true"></div>'
         if not suggestion_html:
             suggestion_html = '<div class="missing">No required-part matches available.</div>'
         match_debug_html = (
             f'<div class="match-debug" data-match-debug="true" '
             f'data-total-matches="{escape(str(len(matches)))}" '
+            f'data-full-set-part-count="{escape(str(len(full_set_part_rows)))}" '
+            f'data-full-bag-part-count="{escape(str(len(full_bag_part_rows)))}" '
+            f'data-server-total-card-count="{escape(str(server_total_card_count))}" '
+            f'data-server-color-308-count="{escape(str(server_color_308_count))}" '
+            f'data-hidden-due-to-limit-count="0" '
             f'data-selected-color-id="{escape(initial_selected_color_text)}" '
             f'data-filtered-match-count="{escape(str(initial_filtered_count))}">'
-            f'total_matches: {escape(str(len(matches)))} · '
+            f'full_set_part_count: {escape(str(len(full_set_part_rows)))} · '
+            f'full_bag_part_count: {escape(str(len(full_bag_part_rows)))} · '
+            f'rendered_match_count: <span data-rendered-match-count-local>{escape(str(server_total_card_count))}</span> · '
+            f'hidden_due_to_limit_count: 0 · '
             f'selected_color_id: <span data-debug-selected-color>{escape(initial_selected_color_text or "all")}</span> · '
-            f'filtered_match_count: <span data-debug-filtered-count>{escape(str(initial_filtered_count))}</span>'
+            f'colour_match_count: <span data-debug-filtered-count>{escape(str(initial_filtered_count))}</span> · '
+            f'total_cards_rendered_server_side: <span data-server-total-card-count-text>{escape(str(server_total_card_count))}</span> · '
+            f'total_cards_in_DOM: <span data-dom-total-card-count>{escape(str(server_total_card_count))}</span> · '
+            f'cards_with_data_part_color_id_308: <span data-dom-color-308-count>{escape(str(server_color_308_count))}</span> · '
+            f'visible_cards_after_clicking_color_308: <span data-dom-visible-after-308-count>{escape(str(server_color_308_count))}</span>'
             f'</div>'
         )
         unconfirm_html = (
@@ -6199,6 +6502,12 @@ def training_store_review_ui(
         if direct_lookup_warning
         else ""
     )
+    next_pending_button_html = (
+        f'<a class="top-action-link" data-next-pending="true" href="{escape(next_pending_href)}">Next pending</a>'
+        if next_pending_href
+        else '<button type="button" class="top-action-link" data-next-pending="true">Next pending</button>'
+    )
+    next_pending_url_js = json.dumps(next_pending_href)
     html = f"""
 <!doctype html>
 <html>
@@ -6214,6 +6523,10 @@ def training_store_review_ui(
     .queue-item span {{ display:block; color:#66727d; font-size:12px; margin-top:3px; }}
     .queue-item.active {{ border-color:#2f7dd1; background:#eef6ff; }}
     section {{ padding:16px; }}
+    .title-row {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }}
+    .title-row h2 {{ margin:0; min-width:0; overflow-wrap:anywhere; }}
+    .top-actions {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+    .top-action-link {{ display:inline-flex; align-items:center; justify-content:center; min-height:36px; box-sizing:border-box; padding:8px 12px; border:1px solid #1f6fc9; border-radius:6px; background:#1f6fc9; color:white; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; white-space:nowrap; }}
     .meta {{ display:grid; grid-template-columns:repeat(5,minmax(90px,1fr)); gap:8px; margin-bottom:14px; }}
     .meta div {{ background:white; border:1px solid #d8dee3; border-radius:6px; padding:8px; }}
     .label {{ display:block; color:#66727d; font-size:12px; }}
@@ -6222,6 +6535,11 @@ def training_store_review_ui(
     figcaption {{ color:#66727d; font-size:12px; margin-top:6px; }}
     img {{ max-width:100%; height:auto; image-rendering:auto; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
     .slots {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }}
+    .section-heading-row {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:16px; }}
+    .section-heading-row h3 {{ margin:0; }}
+    .split-actions {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
+    .split-actions button {{ padding:8px 12px; font-size:13px; font-weight:700; }}
+    .split-actions span {{ color:#66727d; font-size:12px; }}
     .split-candidates {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px; margin-top:10px; align-items:start; }}
     .split-candidate-card {{ display:grid; gap:9px; padding:10px; }}
     .split-candidate-card.has-review-state {{ border-color:#d59a20; background:#fff8e8; }}
@@ -6267,15 +6585,52 @@ def training_store_review_ui(
     .review-colour-swatch {{ width:14px; height:14px; border-radius:999px; border:1px solid rgba(0,0,0,.2); flex:0 0 14px; }}
     .part-suggestions {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; max-height:640px; overflow:auto; padding:2px 6px 2px 2px; align-content:start; }}
     .part-suggestion {{ display:grid; grid-template-rows:128px auto; gap:10px; border:1px solid #d8dee3; border-radius:8px; padding:10px; background:#fff; min-width:0; }}
-    .part-suggestion.hidden {{ display:none; }}
+    .part-suggestion.colour-match-highlight {{ border-color:#1f6fc9; box-shadow:0 0 0 2px rgba(31,111,201,.12); background:#f7fbff; }}
     .part-suggestion-img {{ display:flex; align-items:center; justify-content:center; background:#f4f7fb; border:1px solid #e4e9ed; border-radius:6px; overflow:hidden; }}
     .part-suggestion-img img {{ max-height:116px; max-width:140px; object-fit:contain; background:transparent; }}
     .part-suggestion-body {{ display:grid; gap:4px; font-size:12px; color:#66727d; min-width:0; }}
     .part-suggestion-body strong {{ color:#172026; font-size:16px; line-height:1.15; }}
     .part-colour {{ color:#32465a; font-weight:600; }}
     .part-name, .part-meta, .part-score {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .part-meta.debug-meta {{ color:#8a6a28; }}
+    .over-confirmed-badge {{ display:inline-flex; align-items:center; margin-left:5px; padding:2px 5px; border-radius:999px; background:#fff1d2; color:#8a5a00; font-size:11px; font-weight:700; }}
     .part-score {{ color:#1f6fc9; font-weight:700; }}
     .part-suggestion-body button {{ margin-top:6px; padding:8px 10px; font-size:13px; width:100%; }}
+    .usage-toggle {{ background:#f8fafb; color:#1f6fc9; border-color:#b9cee7; }}
+    .usage-modal-backdrop {{ position:fixed; inset:0; z-index:80; display:none; align-items:center; justify-content:center; padding:28px; background:rgba(15,24,33,.58); }}
+    .usage-modal-backdrop.open {{ display:flex; }}
+    .usage-modal {{ width:min(1120px, calc(100vw - 56px)); max-height:calc(100vh - 56px); display:grid; grid-template-rows:auto auto minmax(0,1fr); overflow:hidden; background:white; border-radius:8px; box-shadow:0 18px 48px rgba(15,24,33,.32); }}
+    .usage-modal-head {{ display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 16px; border-bottom:1px solid #d8dee3; }}
+    .usage-modal-head h3 {{ margin:0; font-size:18px; overflow-wrap:anywhere; }}
+    .usage-modal-close {{ width:auto; min-width:88px; background:#f8fafb; color:#32465a; border-color:#c8d0d7; }}
+    .usage-summary {{ display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:10px; padding:12px 16px; border-bottom:1px solid #e4e9ed; background:#f8fafb; }}
+    .usage-summary span {{ display:grid; gap:3px; padding:9px; border:1px solid #e4e9ed; border-radius:6px; background:white; color:#66727d; font-size:12px; }}
+    .usage-summary strong {{ color:#172026; font-size:18px; }}
+    .usage-table-wrap {{ overflow:auto; padding:0 16px 16px; }}
+    .usage-table {{ width:100%; border-collapse:collapse; table-layout:fixed; background:white; }}
+    .usage-table th, .usage-table td {{ padding:10px 9px; border-bottom:1px solid #e4e9ed; text-align:left; vertical-align:middle; font-size:13px; }}
+    .usage-table th {{ position:sticky; top:0; z-index:1; background:white; color:#66727d; font-size:12px; }}
+    .usage-table th:nth-child(1), .usage-table td:nth-child(1) {{ width:86px; }}
+    .usage-table th:nth-child(2), .usage-table td:nth-child(2) {{ width:44%; }}
+    .usage-table a {{ color:#1f6fc9; font-weight:700; overflow-wrap:anywhere; }}
+    .usage-thumb {{ width:58px; height:58px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:#f8fafb; overflow:hidden; }}
+    .usage-thumb img {{ max-width:56px; max-height:56px; object-fit:contain; background:transparent; }}
+    .usage-empty {{ padding:18px; color:#66727d; }}
+    .required-parts-panel {{ padding:0; margin:18px 0; }}
+    .required-part-toggles {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:13px; }}
+    .required-part-toggles label {{ display:inline-flex; align-items:center; gap:5px; padding:6px 8px; border:1px solid #d8dee3; border-radius:6px; background:white; }}
+    .inventory-debug-counts {{ margin:8px 0; color:#66727d; font-size:13px; }}
+    .required-parts-table-wrap {{ max-height:420px; overflow:auto; border:1px solid #d8dee3; border-radius:6px; background:white; }}
+    .required-parts-table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+    .required-parts-table th, .required-parts-table td {{ padding:8px; border-bottom:1px solid #e4e9ed; text-align:left; vertical-align:middle; font-size:13px; }}
+    .required-parts-table th {{ position:sticky; top:0; z-index:1; background:#f8fafb; color:#66727d; font-size:12px; }}
+    .required-parts-table th:nth-child(1), .required-parts-table td:nth-child(1) {{ width:72px; }}
+    .required-parts-table th:nth-child(2), .required-parts-table td:nth-child(2) {{ width:110px; }}
+    .required-parts-table th:nth-child(5), .required-parts-table td:nth-child(5) {{ width:110px; }}
+    .required-parts-table tr.hidden {{ display:none; }}
+    .required-parts-table tr.colour-match-highlight td {{ background:#f7fbff; }}
+    .required-part-img {{ width:52px; height:52px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:#f8fafb; overflow:hidden; }}
+    .required-part-img img {{ max-width:50px; max-height:50px; object-fit:contain; background:transparent; }}
     .ocr-table {{ width:100%; border-collapse:collapse; background:white; border:1px solid #d8dee3; border-radius:6px; overflow:hidden; margin:8px 0 14px; }}
     .ocr-table th, .ocr-table td {{ text-align:left; border-bottom:1px solid #e4e9ed; padding:7px 8px; font-size:13px; }}
     .ocr-table th {{ color:#66727d; background:#f8fafb; }}
@@ -6290,6 +6645,7 @@ def training_store_review_ui(
     input, select, textarea, button {{ font:inherit; padding:8px; border:1px solid #c8d0d7; border-radius:6px; }}
     textarea {{ grid-column:span 2; min-height:42px; }}
     button {{ background:#1f6fc9; color:white; border-color:#1f6fc9; cursor:pointer; }}
+    .save-next-btn {{ background:#155da8; border-color:#155da8; font-weight:700; }}
     .missing {{ padding:18px; color:#66727d; background:#f3f5f6; border-radius:6px; }}
     @media (max-width: 1180px) {{
       .candidate-workspace {{ grid-template-columns:1fr; }}
@@ -6305,6 +6661,10 @@ def training_store_review_ui(
       .part-suggestions {{ grid-template-columns:repeat(auto-fill,minmax(145px,1fr)); max-height:520px; }}
       .part-suggestion {{ grid-template-rows:104px auto; }}
       .meta, .images {{ grid-template-columns:1fr; }}
+      .usage-modal-backdrop {{ padding:12px; align-items:stretch; }}
+      .usage-modal {{ width:100%; max-height:calc(100vh - 24px); }}
+      .usage-summary {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+      .usage-table {{ min-width:760px; }}
     }}
   </style>
 </head>
@@ -6313,7 +6673,10 @@ def training_store_review_ui(
   <main>
     <aside>{''.join(queue_links) or '<div class="missing">No bundles match the current filters.</div>'}</aside>
     <section>
-      <h2>{title}</h2>
+      <div class="title-row">
+        <h2>{title}</h2>
+        <div class="top-actions">{next_pending_button_html}</div>
+      </div>
       {direct_lookup_warning_html}
       <div class="meta">
         <div><span class="label">status</span>{escape(str((selected or {}).get("review_status") or ""))}</div>
@@ -6336,13 +6699,14 @@ def training_store_review_ui(
       <div>{old_qty_overlay_html}</div>
       <table class="ocr-table"><thead><tr><th>#</th><th>text/value</th><th>raw bbox</th><th>normalized bbox</th><th>source</th><th>raw polygon</th><th>converted bbox</th><th>confidence</th></tr></thead><tbody>{qty_rows_html}</tbody></table>
       <div class="slots">{slot_html}</div>
-      <h3>Split Candidates</h3>
+      <div class="section-heading-row"><h3>Split Candidates</h3>{split_action_html}</div>
       <div class="images">{split_overlay_html}</div>
       <h4>Baseline Slot Candidates</h4>
       <div class="split-candidates">{baseline_candidate_html}</div>
       <h4>AI Suggested Candidates</h4>
       <div class="split-candidates">{ai_candidate_html}</div>
       {f'<h4>Legacy Candidates</h4><div class="split-candidates">{legacy_split_candidate_html}</div>' if legacy_split_candidate_html else ''}
+      {required_parts_panel_html}
       <h3>Confirm LEGO Part</h3>
       <div class="confirm-grid">{confirm_candidate_html}</div>
       <form id="review-form">
@@ -6355,18 +6719,35 @@ def training_store_review_ui(
         <label><input name="multi_part_merge" type="checkbox"> multi-part merge</label>
         <textarea name="review_notes" placeholder="review notes"></textarea>
         <button type="submit">Save review</button>
+        <button type="button" class="save-next-btn" data-save-review-next="true">Save review + next</button>
       </form>
     </section>
   </main>
+  <div class="usage-modal-backdrop" data-usage-modal="true" aria-hidden="true">
+    <div class="usage-modal" role="dialog" aria-modal="true" aria-labelledby="usage-modal-title">
+      <div class="usage-modal-head">
+        <h3 id="usage-modal-title" data-usage-modal-title="true">Confirmations</h3>
+        <button type="button" class="usage-modal-close" data-usage-modal-close="true">Close</button>
+      </div>
+      <div class="usage-summary" data-usage-modal-summary="true"></div>
+      <div class="usage-table-wrap" data-usage-modal-body="true"></div>
+    </div>
+  </div>
   <script>
-    document.getElementById('review-form').addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const form = event.currentTarget;
+    const nextPendingUrl = {next_pending_url_js};
+    function showNoNextPending() {{
+      alert('No more pending bundles in this filter');
+    }}
+    function buildReviewPayload(form) {{
       const payload = Object.fromEntries(new FormData(form).entries());
       payload.qty_text_present = form.qty_text_present.checked;
       payload.multi_part_merge = form.multi_part_merge.checked;
       payload.mask_quality = Number(payload.mask_quality || 0);
       payload.split_quality = Number(payload.split_quality || 0);
+      return payload;
+    }}
+    async function saveReview(form) {{
+      const payload = buildReviewPayload(form);
       const res = await fetch('/debug/training-store/review', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
@@ -6374,9 +6755,173 @@ def training_store_review_ui(
       }});
       if (!res.ok) {{
         alert(await res.text());
+        return false;
+      }}
+      return true;
+    }}
+    function escapeHtml(value) {{
+      return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({{
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }}[ch]));
+    }}
+    function artifactUrl(path) {{
+      const text = String(path || '').trim();
+      return text ? '/debug/ai-snap-artifact?path=' + encodeURIComponent(text) : '';
+    }}
+    const usageModal = document.querySelector('[data-usage-modal]');
+    const usageModalTitle = document.querySelector('[data-usage-modal-title]');
+    const usageModalSummary = document.querySelector('[data-usage-modal-summary]');
+    const usageModalBody = document.querySelector('[data-usage-modal-body]');
+    function openUsageModal(title) {{
+      if (usageModalTitle) {{
+        usageModalTitle.textContent = title;
+      }}
+      if (usageModal) {{
+        usageModal.classList.add('open');
+        usageModal.setAttribute('aria-hidden', 'false');
+      }}
+    }}
+    function closeUsageModal() {{
+      if (usageModal) {{
+        usageModal.classList.remove('open');
+        usageModal.setAttribute('aria-hidden', 'true');
+      }}
+    }}
+    function renderUsageSummary(data) {{
+      return '<span>Set qty <strong>' + escapeHtml(data.required_qty ?? 'n/a') + '</strong></span>'
+        + '<span>Confirmed qty <strong>' + escapeHtml(data.confirmed_qty ?? data.total_confirmed_qty ?? 0) + '</strong></span>'
+        + '<span>Remaining qty <strong>' + escapeHtml(data.effective_remaining_qty ?? 'n/a') + '</strong></span>'
+        + '<span>Over-confirmed by <strong>' + escapeHtml(data.over_confirmed_by ?? 'n/a') + '</strong></span>';
+    }}
+    function renderUsageTable(data) {{
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      if (!rows.length) {{
+        return '<div class="usage-empty">No matching confirmations.</div>';
+      }}
+      return '<table class="usage-table">'
+        + '<thead><tr><th>thumbnail</th><th>bundle_id</th><th>candidate_index</th><th>qty</th><th>confirmed_by</th><th>created_at</th></tr></thead>'
+        + '<tbody>'
+        + rows.map((row) => {{
+        const thumbUrl = artifactUrl(row.thumbnail_path);
+        const reviewUrl = '/debug/training-store/review-ui?bundle_id=' + encodeURIComponent(String(row.bundle_id || ''));
+        const thumbHtml = thumbUrl
+          ? '<img src="' + escapeHtml(thumbUrl) + '" alt="confirmed thumbnail" loading="lazy">'
+          : '';
+        return '<tr>'
+          + '<td><div class="usage-thumb">' + thumbHtml + '</div></td>'
+          + '<td><a href="' + escapeHtml(reviewUrl) + '" target="_blank" rel="noopener">' + escapeHtml(row.bundle_id || '') + '</a></td>'
+          + '<td>' + escapeHtml(row.candidate_index ?? '') + '</td>'
+          + '<td>' + escapeHtml(row.qty ?? '') + '</td>'
+          + '<td>' + escapeHtml(row.confirmed_by || '') + '</td>'
+          + '<td>' + escapeHtml(row.created_at || '') + '</td>'
+          + '</tr>';
+      }}).join('')
+        + '</tbody></table>';
+    }}
+    document.getElementById('review-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const form = event.currentTarget;
+      const saved = await saveReview(form);
+      if (!saved) {{
         return;
       }}
       location.reload();
+    }});
+    document.querySelectorAll('[data-save-review-next]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const form = document.getElementById('review-form');
+        const saved = await saveReview(form);
+        if (!saved) {{
+          return;
+        }}
+        if (!nextPendingUrl) {{
+          showNoNextPending();
+          return;
+        }}
+        window.location.href = nextPendingUrl;
+      }});
+    }});
+    document.querySelectorAll('[data-next-pending]').forEach((button) => {{
+      button.addEventListener('click', (event) => {{
+        if (!nextPendingUrl) {{
+          event.preventDefault();
+          showNoNextPending();
+        }}
+      }});
+    }});
+    document.querySelectorAll('[data-usage-modal-close]').forEach((button) => {{
+      button.addEventListener('click', closeUsageModal);
+    }});
+    if (usageModal) {{
+      usageModal.addEventListener('click', (event) => {{
+        if (event.target === usageModal) {{
+          closeUsageModal();
+        }}
+      }});
+    }}
+    document.addEventListener('keydown', (event) => {{
+      if (event.key === 'Escape' && usageModal && usageModal.classList.contains('open')) {{
+        closeUsageModal();
+      }}
+    }});
+    document.querySelectorAll('[data-show-confirmations]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const partNum = button.dataset.usagePartNum || '';
+        const colorId = button.dataset.usageColorId || '';
+        openUsageModal('Confirmations for ' + partNum + ' / ' + colorId);
+        if (usageModalSummary) {{
+          usageModalSummary.innerHTML = renderUsageSummary({{}});
+        }}
+        if (usageModalBody) {{
+          usageModalBody.innerHTML = '<div class="usage-empty">Loading confirmations...</div>';
+        }}
+        const params = new URLSearchParams({{
+          set_num: button.dataset.usageSetNum || '',
+          part_num: partNum,
+          color_id: colorId,
+          required_qty: button.dataset.usageRequiredQty || ''
+        }});
+        if (button.dataset.usageElementId) {{
+          params.set('element_id', button.dataset.usageElementId);
+        }}
+        const res = await fetch('/debug/training-store/confirmed-part-usage?' + params.toString());
+        if (!res.ok) {{
+          if (usageModalBody) {{
+            usageModalBody.innerHTML = '<div class="usage-empty">' + escapeHtml(await res.text()) + '</div>';
+          }}
+          return;
+        }}
+        const data = await res.json();
+        if (usageModalSummary) {{
+          usageModalSummary.innerHTML = renderUsageSummary(data);
+        }}
+        if (usageModalBody) {{
+          usageModalBody.innerHTML = renderUsageTable(data);
+        }}
+      }});
+    }});
+    document.querySelectorAll('[data-generate-split-candidates]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        if (button.disabled) {{
+          return;
+        }}
+        button.disabled = true;
+        const originalText = button.textContent;
+        button.textContent = 'Generating...';
+        const params = new URLSearchParams({{bundle_id: "{escape(selected_bundle_id)}"}});
+        const res = await fetch('/debug/training-store/generate-split-candidates?' + params.toString(), {{method: 'POST'}});
+        if (!res.ok) {{
+          button.disabled = false;
+          button.textContent = originalText;
+          alert(await res.text());
+          return;
+        }}
+        location.reload();
+      }});
     }});
     document.querySelectorAll('[data-candidate-action]').forEach((button) => {{
       button.addEventListener('click', async () => {{
@@ -6455,6 +7000,71 @@ def training_store_review_ui(
         + Math.pow(Number(left[1] || 0) - Number(right[1] || 0), 2)
         + Math.pow(Number(left[2] || 0) - Number(right[2] || 0), 2);
     }}
+    function currentRequiredScope() {{
+      const checked = document.querySelector('input[name="required-scope"]:checked');
+      return checked ? checked.value : 'set';
+    }}
+    function currentSelectedColour() {{
+      const active = document.querySelector('.review-colour-chip.active[data-color-id]');
+      return active ? String(active.dataset.colorId || '') : '';
+    }}
+    function updateRequiredPartsPanel() {{
+      const scope = currentRequiredScope();
+      const currentColourOnly = Boolean(document.querySelector('[data-required-current-colour]') && document.querySelector('[data-required-current-colour]').checked);
+      const showCompleted = Boolean(document.querySelector('[data-required-show-completed]') && document.querySelector('[data-required-show-completed]').checked);
+      const selectedColor = currentSelectedColour();
+      let rendered = 0;
+      document.querySelectorAll('[data-required-part-row]').forEach((row) => {{
+        const scopeMatch = String(row.dataset.scope || '') === scope;
+        const completedMatch = showCompleted || String(row.dataset.completed || '') !== '1';
+        const colorMatch = !!selectedColor && String(row.dataset.colorId || '') === selectedColor;
+        const hidden = !(scopeMatch && completedMatch);
+        row.classList.toggle('hidden', hidden);
+        row.classList.toggle('colour-match-highlight', currentColourOnly && colorMatch);
+        row.style.order = currentColourOnly && colorMatch ? '-1' : '';
+        if (!hidden) {{
+          rendered += 1;
+        }}
+      }});
+      document.querySelectorAll('[data-rendered-match-count]').forEach((node) => {{
+        node.textContent = String(rendered);
+      }});
+      document.querySelectorAll('[data-hidden-due-limit-count]').forEach((node) => {{
+        node.textContent = '0';
+      }});
+    }}
+    function updateReviewCardScope(card) {{
+      if (!card) {{
+        return;
+      }}
+      const active = card.querySelector('.review-colour-chip.active[data-color-id]');
+      const selected = active ? String(active.dataset.colorId || '') : '';
+      setReviewCardColour(card, selected);
+    }}
+    function updateReviewCardDomDebug(card) {{
+      if (!card) {{
+        return;
+      }}
+      const debug = card.querySelector('[data-match-debug]');
+      if (!debug) {{
+        return;
+      }}
+      const nodes = Array.from(card.querySelectorAll('.part-suggestion'));
+      const color308Nodes = nodes.filter((node) => String(node.dataset.partColorId || '') === '308');
+      const visibleColor308Nodes = color308Nodes.filter((node) => {{
+        const style = window.getComputedStyle(node);
+        return !node.hidden && style.display !== 'none' && style.visibility !== 'hidden';
+      }});
+      const writeDebugCount = (selector, value) => {{
+        const target = debug.querySelector(selector);
+        if (target) {{
+          target.textContent = String(value);
+        }}
+      }};
+      writeDebugCount('[data-dom-total-card-count]', nodes.length);
+      writeDebugCount('[data-dom-color-308-count]', color308Nodes.length);
+      writeDebugCount('[data-dom-visible-after-308-count]', visibleColor308Nodes.length);
+    }}
     function setReviewCardColour(card, colorId) {{
       if (!card) {{
         return;
@@ -6469,12 +7079,16 @@ def training_store_review_ui(
         clearButton.classList.toggle('active', !selected);
       }}
       let filteredCount = 0;
+      let selectedColorCount = 0;
       card.querySelectorAll('.part-suggestion').forEach((node) => {{
         const matchColor = node.dataset.partColorId === undefined ? '' : String(node.dataset.partColorId);
-        const hidden = !!selected && matchColor !== selected;
-        node.classList.toggle('hidden', hidden);
-        if (!hidden) {{
-          filteredCount += 1;
+        const colorMatch = !!selected && matchColor === selected;
+        node.classList.remove('hidden');
+        node.classList.toggle('colour-match-highlight', colorMatch);
+        node.style.order = colorMatch ? '-1' : '';
+        filteredCount += 1;
+        if (colorMatch) {{
+          selectedColorCount += 1;
         }}
       }});
       const debug = card.querySelector('[data-match-debug]');
@@ -6483,25 +7097,28 @@ def training_store_review_ui(
         debug.dataset.filteredMatchCount = String(filteredCount);
         const selectedNode = debug.querySelector('[data-debug-selected-color]');
         const countNode = debug.querySelector('[data-debug-filtered-count]');
+        const renderedNode = debug.querySelector('[data-rendered-match-count-local]');
         if (selectedNode) {{
           selectedNode.textContent = selected || 'all';
         }}
         if (countNode) {{
-          countNode.textContent = String(filteredCount);
+          countNode.textContent = selected ? String(selectedColorCount) : String(filteredCount);
+        }}
+        if (renderedNode) {{
+          renderedNode.textContent = String(filteredCount);
         }}
       }}
+      updateReviewCardDomDebug(card);
       const emptyMessage = card.querySelector('[data-colour-empty-message]');
       if (emptyMessage) {{
-        const showEmpty = !!selected && filteredCount === 0;
-        emptyMessage.classList.toggle('hidden', !showEmpty);
-        if (showEmpty) {{
-          emptyMessage.textContent = 'No set-needed parts found for color_id ' + selected;
-        }}
+        emptyMessage.classList.add('hidden');
+        emptyMessage.textContent = '';
       }}
       const colorInput = card.querySelector('[data-confirm-field="color_id"]');
       if (colorInput && selected) {{
         colorInput.value = selected;
       }}
+      updateRequiredPartsPanel();
     }}
     document.querySelectorAll('[data-review-colour-clear]').forEach((button) => {{
       button.addEventListener('click', () => {{
@@ -6522,6 +7139,14 @@ def training_store_review_ui(
         setReviewCardColour(button.closest('.confirm-card'), button.dataset.colorId || '');
       }});
     }});
+    document.querySelectorAll('input[name="required-scope"], [data-required-current-colour], [data-required-show-completed]').forEach((control) => {{
+      control.addEventListener('change', () => {{
+        document.querySelectorAll('.confirm-card').forEach((card) => updateReviewCardScope(card));
+        updateRequiredPartsPanel();
+      }});
+    }});
+    document.querySelectorAll('.confirm-card').forEach((card) => updateReviewCardScope(card));
+    updateRequiredPartsPanel();
     document.querySelectorAll('[data-review-colour-pick]').forEach((button) => {{
       button.addEventListener('click', () => {{
         if (button.disabled) {{
@@ -7045,7 +7670,7 @@ async def buildability_clip_suggest(req: Request):
             if not part_num:
                 continue
             key = _candidate_part_key(part_num, color_id)
-            required_qty = int(part.get("qty", 0) or 0)
+            required_qty = int(part.get("set_required_qty", part.get("qty", 0)) or 0)
             assigned_qty = int(assigned_totals.get(key, 0) or 0)
             remaining_qty = required_qty - assigned_qty
             if remaining_qty <= 0:

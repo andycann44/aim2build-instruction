@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List
@@ -12,7 +13,7 @@ from clean.services.training_store_service import (
     _utc_timestamp,
     _write_json_atomic,
 )
-from clean.services.training_bundle_index_service import register_bundle
+from clean.services.training_bundle_index_service import get_bundle, register_bundle, update_split_candidates
 
 
 _R2_REQUIRED_KEYS = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
@@ -130,6 +131,416 @@ def _update_r2_upload_status(bundle_id: str, status: str, r2_paths: Dict[str, st
             "entries": updated_entries,
         },
     )
+
+
+def _public_or_key(values: Dict[str, str], r2_key: str) -> str:
+    public_base = str(values.get("R2_PUBLIC_BASE_URL") or "").rstrip("/")
+    return f"{public_base}/{r2_key}" if public_base else r2_key
+
+
+def _safe_r2_segment(value: Any, fallback: str = "unknown") -> str:
+    text = str(value or "").strip()
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)
+    return safe.strip("._") or fallback
+
+
+def _candidate_upload_timestamp(status: str) -> str:
+    return _utc_timestamp() if status in {"uploaded", "upload_failed"} else ""
+
+
+def _candidate_assets_dir(bundle_id: str, candidate_index: int, fallback_path: str = "") -> Path:
+    fallback = Path(str(fallback_path or "").strip())
+    if fallback.parent and str(fallback.parent) not in {"", "."}:
+        return fallback.parent
+    return _REPO_ROOT / "debug" / "ai_training" / str(bundle_id) / "confirmed_candidates" / str(candidate_index)
+
+
+def _candidate_asset_file(role: str, path_value: Any, r2_key: str) -> Dict[str, Any]:
+    path_text = str(path_value or "").strip()
+    path = Path(path_text) if path_text else Path("")
+    exists = bool(path_text and path.exists() and path.is_file())
+    return {
+        "role": role,
+        "local_path": path_text,
+        "exists": exists,
+        "size_bytes": int(path.stat().st_size) if exists else 0,
+        "r2_key": r2_key,
+    }
+
+
+def _write_candidate_confirmation_metadata(
+    *,
+    row: Dict[str, Any],
+    candidate: Dict[str, Any],
+    confirmation: Dict[str, Any],
+    metadata_path: Path,
+    image_path: str,
+    mask_path: str,
+) -> Dict[str, Any]:
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": "1.0",
+        "kind": "confirmed_candidate_part",
+        "bundle_id": str(row.get("bundle_id") or confirmation.get("bundle_id") or ""),
+        "set_num": str(row.get("set_num") or ""),
+        "bag_num": row.get("bag_num"),
+        "page_num": row.get("page_num"),
+        "step_num": row.get("step_num"),
+        "crop_num": row.get("crop_num"),
+        "candidate_index": confirmation.get("candidate_index"),
+        "part_num": str(confirmation.get("part_num") or ""),
+        "color_id": confirmation.get("color_id"),
+        "element_id": str(confirmation.get("element_id") or ""),
+        "qty": confirmation.get("qty"),
+        "confirmed_by": str(confirmation.get("confirmed_by") or ""),
+        "confirmed_at": str(confirmation.get("confirmed_at") or ""),
+        "candidate_status": str(candidate.get("status") or ""),
+        "candidate_review_state": str(candidate.get("review_state") or ""),
+        "local_paths": {
+            "thumbnail": str(image_path or ""),
+            "mask": str(mask_path or ""),
+        },
+    }
+    metadata_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return payload
+
+
+def _set_candidate_r2_status(
+    *,
+    bundle_id: str,
+    candidate_index: int,
+    status: str,
+    r2_paths: Dict[str, str],
+    metadata_path: str = "",
+    error: str = "",
+) -> Dict[str, Any]:
+    row = dict(get_bundle(bundle_id).get("row") or {})
+    paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+    candidates = list(paths.get("candidates") or [])
+    target_pos = -1
+    for pos, raw_candidate in enumerate(candidates):
+        candidate = raw_candidate if isinstance(raw_candidate, dict) else {}
+        try:
+            candidate_idx = int(candidate.get("index"))
+        except Exception:
+            candidate_idx = pos
+        if candidate_idx == int(candidate_index):
+            target_pos = pos
+            break
+    if target_pos < 0 and 0 <= int(candidate_index) < len(candidates):
+        target_pos = int(candidate_index)
+    if target_pos < 0 or target_pos >= len(candidates):
+        raise ValueError("candidate_index is out of range")
+
+    candidate = dict(candidates[target_pos]) if isinstance(candidates[target_pos], dict) else {}
+    candidate["r2_status"] = status
+    candidate["r2_uploaded_at"] = _candidate_upload_timestamp(status)
+    candidate["r2_paths"] = dict(r2_paths)
+    if metadata_path:
+        candidate["confirmation_metadata_path"] = str(metadata_path)
+    if error:
+        candidate["r2_error"] = str(error)
+    elif "r2_error" in candidate:
+        candidate.pop("r2_error", None)
+    candidates[target_pos] = candidate
+
+    def update_group(raw_items: Any) -> List[Dict[str, Any]]:
+        updated: List[Dict[str, Any]] = []
+        for pos, raw_item in enumerate(list(raw_items or [])):
+            item = dict(raw_item) if isinstance(raw_item, dict) else {}
+            try:
+                item_idx = int(item.get("index"))
+            except Exception:
+                item_idx = pos
+            if item_idx == int(candidate_index):
+                item.update(candidate)
+            updated.append(item)
+        return updated
+
+    paths["candidates"] = candidates
+    paths["baseline_slot_candidates"] = update_group(paths.get("baseline_slot_candidates"))
+    paths["ai_suggested_candidates"] = update_group(paths.get("ai_suggested_candidates"))
+    paths["r2_status"] = status
+    paths["r2_uploaded_at"] = candidate["r2_uploaded_at"]
+    paths["r2_paths"] = dict(r2_paths)
+    stored = update_split_candidates(bundle_id, split_candidate_paths=paths)
+    return {"ok": True, "row": stored.get("row"), "candidate": candidate}
+
+
+def _update_bundle_metadata_candidate_upload(
+    *,
+    row: Dict[str, Any],
+    candidate_index: int,
+    status: str,
+    r2_paths: Dict[str, str],
+    metadata_path: str = "",
+    error: str = "",
+) -> None:
+    manifest_path = Path(str(row.get("manifest_path") or "").strip())
+    if not manifest_path.exists() or not manifest_path.is_file():
+        return
+    payload = _read_json_file(manifest_path)
+    if not isinstance(payload, dict):
+        payload = {}
+    uploads = payload.get("confirmed_candidate_uploads")
+    if not isinstance(uploads, dict):
+        uploads = {}
+    upload_row = {
+        "candidate_index": int(candidate_index),
+        "r2_status": status,
+        "r2_uploaded_at": _candidate_upload_timestamp(status),
+        "r2_paths": dict(r2_paths),
+        "confirmation_metadata_path": str(metadata_path or ""),
+    }
+    if error:
+        upload_row["r2_error"] = str(error)
+    uploads[str(int(candidate_index))] = upload_row
+    payload["confirmed_candidate_uploads"] = uploads
+    payload["r2_status"] = status
+    payload["r2_uploaded_at"] = upload_row["r2_uploaded_at"]
+    payload["r2_paths"] = dict(r2_paths)
+    manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def upload_confirmed_candidate_assets(
+    *,
+    bundle_id: str,
+    candidate_index: int,
+    candidate: Dict[str, Any],
+    confirmation: Dict[str, Any],
+    row: Dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    row = dict(row or get_bundle(bundle_id).get("row") or {})
+    safe_bundle_id = str(row.get("bundle_id") or bundle_id or "").strip()
+    if not safe_bundle_id:
+        raise ValueError("bundle_id is required")
+    review_state = str(candidate.get("review_state") or "").strip()
+    status = str(candidate.get("status") or "").strip()
+    blocked_states = {"needs_mask_expand", "needs_ocr_review", "needs_manual_crop"}
+    if status == "rejected" or review_state in blocked_states:
+        return {
+            "ok": True,
+            "skipped": True,
+            "dry_run": bool(dry_run),
+            "reason": "candidate_not_clean",
+            "candidate_status": status,
+            "candidate_review_state": review_state,
+        }
+    if status != "accepted":
+        return {
+            "ok": True,
+            "skipped": True,
+            "dry_run": bool(dry_run),
+            "reason": "candidate_not_accepted",
+            "candidate_status": status,
+            "candidate_review_state": review_state,
+        }
+
+    image_path = str(
+        confirmation.get("thumbnail_path")
+        or candidate.get("qty_scrubbed_path")
+        or candidate.get("thumbnail_path")
+        or candidate.get("candidate_path")
+        or ""
+    ).strip()
+    mask_path = str(
+        candidate.get("qty_scrubbed_mask_path")
+        or candidate.get("v2_mask_path")
+        or candidate.get("mask_path")
+        or ""
+    ).strip()
+
+    metadata_dir = _candidate_assets_dir(safe_bundle_id, int(candidate_index), image_path)
+    metadata_path = metadata_dir / f"candidate_{int(candidate_index)}_confirmation_metadata.json"
+    if not image_path or not Path(image_path).exists():
+        error = "candidate_asset_missing"
+        if dry_run:
+            return {
+                "ok": False,
+                "bundle_id": safe_bundle_id,
+                "candidate_index": int(candidate_index),
+                "dry_run": True,
+                "uploaded": False,
+                "would_upload": False,
+                "error": error,
+            }
+        _set_candidate_r2_status(
+            bundle_id=safe_bundle_id,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths={},
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        _update_bundle_metadata_candidate_upload(
+            row=row,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths={},
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        return {
+            "ok": False,
+            "bundle_id": safe_bundle_id,
+            "candidate_index": int(candidate_index),
+            "dry_run": bool(dry_run),
+            "uploaded": False,
+            "would_upload": False,
+            "error": error,
+        }
+    metadata_payload = _write_candidate_confirmation_metadata(
+        row=row,
+        candidate=candidate,
+        confirmation=confirmation,
+        metadata_path=metadata_path,
+        image_path=image_path,
+        mask_path=mask_path,
+    )
+
+    prefix = (
+        f"confirmed-candidates/{_safe_r2_segment(safe_bundle_id, 'bundle')}/"
+        f"candidate_{int(candidate_index)}_"
+        f"{_safe_r2_segment(confirmation.get('part_num'), 'part')}_"
+        f"{_safe_r2_segment(confirmation.get('color_id'), 'color')}"
+    )
+    files = [
+        _candidate_asset_file("thumbnail", image_path, f"{prefix}/{Path(image_path).name}"),
+        _candidate_asset_file("metadata", str(metadata_path), f"{prefix}/{metadata_path.name}"),
+    ]
+    if mask_path:
+        files.append(_candidate_asset_file("mask", mask_path, f"{prefix}/{Path(mask_path).name}"))
+    manifest = {
+        "provider": "cloudflare_r2",
+        "bundle_id": safe_bundle_id,
+        "candidate_index": int(candidate_index),
+        "part_num": str(confirmation.get("part_num") or ""),
+        "color_id": confirmation.get("color_id"),
+        "element_id": str(confirmation.get("element_id") or ""),
+        "files": files,
+        "metadata": metadata_payload,
+    }
+    config = _load_r2_config()
+    prepared = {
+        "ok": True,
+        "bundle_id": safe_bundle_id,
+        "candidate_index": int(candidate_index),
+        "dry_run": bool(dry_run),
+        "would_upload": True,
+        "manifest": manifest,
+        "r2_config": _r2_config_summary(config),
+    }
+    if dry_run:
+        return prepared
+    if config.get("missing"):
+        error = "missing_r2_config"
+        _set_candidate_r2_status(
+            bundle_id=safe_bundle_id,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths={},
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        _update_bundle_metadata_candidate_upload(
+            row=row,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths={},
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        return {**prepared, "ok": False, "uploaded": False, "would_upload": False, "error": error}
+
+    try:
+        import boto3  # type: ignore
+    except Exception:
+        error = "boto3_unavailable"
+        _set_candidate_r2_status(
+            bundle_id=safe_bundle_id,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths={},
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        _update_bundle_metadata_candidate_upload(
+            row=row,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths={},
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        return {**prepared, "ok": False, "uploaded": False, "would_upload": False, "error": error}
+
+    values = dict(config.get("values") or {})
+    endpoint_url = f"https://{values['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=values["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=values["R2_SECRET_ACCESS_KEY"],
+    )
+    uploaded_paths: Dict[str, str] = {}
+    try:
+        for item in files:
+            local_path = str(item.get("local_path") or "")
+            r2_key = str(item.get("r2_key") or "")
+            if not local_path or not r2_key or not bool(item.get("exists")):
+                continue
+            client.upload_file(local_path, values["R2_BUCKET"], r2_key)
+            uploaded_paths[str(item.get("role") or r2_key)] = _public_or_key(values, r2_key)
+    except Exception as exc:
+        error = type(exc).__name__
+        _set_candidate_r2_status(
+            bundle_id=safe_bundle_id,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths=uploaded_paths,
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        _update_bundle_metadata_candidate_upload(
+            row=row,
+            candidate_index=int(candidate_index),
+            status="upload_failed",
+            r2_paths=uploaded_paths,
+            metadata_path=str(metadata_path),
+            error=error,
+        )
+        return {
+            **prepared,
+            "ok": False,
+            "uploaded": False,
+            "would_upload": False,
+            "r2_paths": uploaded_paths,
+            "error": error,
+        }
+
+    _set_candidate_r2_status(
+        bundle_id=safe_bundle_id,
+        candidate_index=int(candidate_index),
+        status="uploaded",
+        r2_paths=uploaded_paths,
+        metadata_path=str(metadata_path),
+    )
+    _update_bundle_metadata_candidate_upload(
+        row=row,
+        candidate_index=int(candidate_index),
+        status="uploaded",
+        r2_paths=uploaded_paths,
+        metadata_path=str(metadata_path),
+    )
+    return {
+        **prepared,
+        "ok": True,
+        "uploaded": True,
+        "would_upload": False,
+        "r2_status": "uploaded",
+        "r2_paths": uploaded_paths,
+    }
 
 
 def prepare_bundle_for_r2(bundle_id: str) -> Dict[str, Any]:

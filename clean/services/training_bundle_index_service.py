@@ -657,6 +657,131 @@ def list_candidate_training_examples(bundle_id: str) -> Dict[str, Any]:
     }
 
 
+def list_confirmed_part_usage(
+    *,
+    set_num: str,
+    part_num: str,
+    color_id: Any,
+    element_id: str = "",
+    required_qty: Any = None,
+) -> Dict[str, Any]:
+    ensure_schema()
+    resolved_set_num = str(set_num or "").strip()
+    if not resolved_set_num:
+        raise ValueError("set_num is required")
+    resolved_part_num = str(part_num or "").strip()
+    if not resolved_part_num:
+        raise ValueError("part_num is required")
+    parsed_color_id = _coerce_int(color_id)
+    if parsed_color_id is None:
+        raise ValueError("color_id is required")
+    resolved_element_id = str(element_id or "").strip()
+
+    params: Dict[str, Any] = {
+        "set_num": resolved_set_num,
+        "part_num": resolved_part_num,
+        "color_id": parsed_color_id,
+    }
+    element_clause = ""
+    if resolved_element_id:
+        element_clause = "AND COALESCE(e.element_id, '') = %(element_id)s"
+        params["element_id"] = resolved_element_id
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    e.bundle_id,
+                    e.candidate_index,
+                    e.part_num,
+                    e.color_id,
+                    e.element_id,
+                    e.qty,
+                    e.confirmed_by,
+                    e.confirmed_at AS created_at,
+                    e.thumbnail_path,
+                    e.r2_path,
+                    b.set_num,
+                    b.bag_num,
+                    b.page_num,
+                    b.step_num,
+                    b.crop_num,
+                    b.review_status
+                FROM candidate_training_examples e
+                JOIN training_bundle_index b ON b.bundle_id = e.bundle_id
+                WHERE b.set_num = %(set_num)s
+                  AND e.part_num = %(part_num)s
+                  AND e.color_id = %(color_id)s
+                  {element_clause}
+                ORDER BY e.confirmed_at ASC, e.bundle_id ASC, e.candidate_index ASC;
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    safe_rows = [_json_safe_row(dict(row or {})) for row in list(rows or [])]
+    total_confirmed_qty = 0
+    for row in safe_rows:
+        row_qty = _coerce_int(row.get("qty"))
+        total_confirmed_qty += int(row_qty) if row_qty is not None and int(row_qty) > 0 else 1
+    parsed_required_qty = _coerce_int(required_qty)
+    effective_remaining_qty = (
+        max(0, int(parsed_required_qty) - int(total_confirmed_qty))
+        if parsed_required_qty is not None
+        else None
+    )
+    over_confirmed_by = (
+        max(0, int(total_confirmed_qty) - int(parsed_required_qty))
+        if parsed_required_qty is not None
+        else None
+    )
+    return {
+        "ok": True,
+        "set_num": resolved_set_num,
+        "part_num": resolved_part_num,
+        "color_id": parsed_color_id,
+        "element_id": resolved_element_id,
+        "required_qty": parsed_required_qty,
+        "confirmed_qty": total_confirmed_qty,
+        "total_confirmed_qty": total_confirmed_qty,
+        "effective_remaining_qty": effective_remaining_qty,
+        "over_confirmed_by": over_confirmed_by,
+        "rows": safe_rows,
+        "count": len(safe_rows),
+    }
+
+
+def list_confirmed_part_totals_for_set(set_num: str) -> Dict[str, Any]:
+    ensure_schema()
+    resolved_set_num = str(set_num or "").strip()
+    if not resolved_set_num:
+        raise ValueError("set_num is required")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    e.part_num,
+                    e.color_id,
+                    SUM(CASE WHEN COALESCE(e.qty, 0) > 0 THEN e.qty ELSE 1 END) AS confirmed_qty,
+                    COUNT(*) AS confirmation_count
+                FROM candidate_training_examples e
+                JOIN training_bundle_index b ON b.bundle_id = e.bundle_id
+                WHERE b.set_num = %s
+                GROUP BY e.part_num, e.color_id
+                ORDER BY e.part_num ASC, e.color_id ASC;
+                """,
+                (resolved_set_num,),
+            )
+            rows = cur.fetchall()
+    return {
+        "ok": True,
+        "set_num": resolved_set_num,
+        "rows": [_json_safe_row(dict(row or {})) for row in list(rows or [])],
+    }
+
+
 def unconfirm_candidate_part(*, bundle_id: str, candidate_index: Any) -> Dict[str, Any]:
     ensure_schema()
     bundle_id = str(bundle_id or "").strip()
