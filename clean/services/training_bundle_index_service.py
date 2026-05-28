@@ -566,6 +566,39 @@ def update_split_candidate_status(
     return update_split_candidates(bundle_id, split_candidate_paths=paths)
 
 
+def auto_promote_bundle_review_status(bundle_id: str) -> Dict[str, Any]:
+    """Promote bundle review_status to 'approved' when all candidates have been resolved,
+    but only if the bundle is not already in a terminal state (approved / rejected).
+
+    This is a targeted update — only the review_status column is touched.
+    Existing review_notes, quality scores, and other review metadata are preserved.
+
+    Returns:
+        {"ok": True, "promoted": True}  — status was advanced to 'approved'
+        {"ok": True, "promoted": False} — already approved/rejected, no change made
+    """
+    ensure_schema()
+    bundle_id = str(bundle_id or "").strip()
+    if not bundle_id:
+        return {"ok": False, "promoted": False, "error": "bundle_id is required"}
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE training_bundle_index
+                SET review_status = 'approved', updated_at = NOW()
+                WHERE bundle_id = %s
+                  AND COALESCE(review_status, '') NOT IN ('approved', 'rejected')
+                RETURNING bundle_id;
+                """,
+                (bundle_id,),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    promoted = row is not None
+    return {"ok": True, "promoted": promoted}
+
+
 def confirm_candidate_part(
     *,
     bundle_id: str,

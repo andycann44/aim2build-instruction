@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from clean.services.training_bundle_index_service import (
+    auto_promote_bundle_review_status,
     get_bundle,
     update_ai_analysis,
     update_split_candidate_status,
@@ -1057,6 +1058,40 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
     }
 
 
+# review_state values that mean a candidate still needs manual attention.
+# "mask_amended" is intentionally absent — it is informational and does not block resolution.
+_CANDIDATE_BLOCKING_REVIEW_STATES = frozenset({
+    "needs_mask_expand",
+    "needs_ocr_review",
+    "needs_manual_crop",
+})
+
+
+def _bundle_all_candidates_resolved(paths: Dict[str, Any]) -> bool:
+    """Return True if every candidate in the bundle is in a terminal state with no
+    outstanding blocking review_state flag.
+
+    Terminal statuses: accepted, rejected.
+    Blocking review_states: needs_mask_expand, needs_ocr_review, needs_manual_crop.
+    mask_amended is NOT blocking — accepted + mask_amended counts as resolved.
+    """
+    candidates = [
+        dict(c)
+        for c in list((paths or {}).get("candidates") or [])
+        if isinstance(c, dict)
+    ]
+    if not candidates:
+        return False
+    for candidate in candidates:
+        status = str(candidate.get("status") or "").strip()
+        review_state = str(candidate.get("review_state") or "").strip()
+        if status not in {"accepted", "rejected"}:
+            return False
+        if review_state in _CANDIDATE_BLOCKING_REVIEW_STATES:
+            return False
+    return True
+
+
 def mark_split_candidate(bundle_id: str, candidate_index: int, status: str) -> Dict[str, Any]:
     row = dict(get_bundle(bundle_id).get("row") or {})
     paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
@@ -1079,18 +1114,45 @@ def mark_split_candidate(bundle_id: str, candidate_index: int, status: str) -> D
             v2_path = mask_path.with_name(f"split_candidate_{candidate_index}_accepted_v2_mask.png")
             shutil.copy2(str(mask_path), str(v2_path))
             v2_mask_path = str(v2_path)
+    safe_bundle_id = str(row.get("bundle_id") or bundle_id)
     stored = update_split_candidate_status(
-        str(row.get("bundle_id") or bundle_id),
+        safe_bundle_id,
         candidate_index=int(candidate_index),
         status=status,
         v2_mask_path=v2_mask_path,
     )
+
+    # ── Bundle-level auto-promotion ───────────────────────────────────────
+    # After accepting or rejecting a candidate, check whether all candidates
+    # in the bundle are now in a resolved terminal state.  If so, and the
+    # bundle is not already approved/rejected, promote it to 'approved'.
+    # This clears stale bad_mask / needs_split_fix states that were set
+    # during earlier review passes.
+    bundle_promoted = False
+    try:
+        updated_paths = (
+            stored.get("row") or {}
+        )
+        if isinstance(updated_paths, dict):
+            updated_paths = updated_paths.get("split_candidate_paths") or {}
+        else:
+            updated_paths = {}
+        if not isinstance(updated_paths, dict):
+            updated_paths = {}
+        if _bundle_all_candidates_resolved(updated_paths):
+            promote_result = auto_promote_bundle_review_status(safe_bundle_id)
+            bundle_promoted = bool(promote_result.get("promoted"))
+    except Exception:
+        # Promotion is best-effort; don't fail the accept/reject operation.
+        pass
+
     return {
         "ok": True,
-        "bundle_id": str(row.get("bundle_id") or bundle_id),
+        "bundle_id": safe_bundle_id,
         "candidate_index": int(candidate_index),
         "status": status,
         "v2_mask_path": v2_mask_path,
+        "bundle_promoted": bundle_promoted,
         "row": stored.get("row"),
     }
 

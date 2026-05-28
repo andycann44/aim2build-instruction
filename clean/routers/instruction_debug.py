@@ -5574,6 +5574,248 @@ def training_store_bag_completion_audit(
     return HTMLResponse(html)
 
 
+# ── Training Control Panel ──────────────────────────────────────────────────
+
+@router.get("/debug/training-store/control-panel", response_class=HTMLResponse)
+def training_store_control_panel(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+):
+    set_text = str(set_num or "").strip()
+    if not set_text:
+        raise HTTPException(status_code=400, detail="set_num is required")
+    bag_number = int(bag_num or 1)
+
+    # ── 1. Bag-level review status counts (one DB query) ─────────────────
+    queue_result = list_review_queue(set_num=set_text, bag_num=bag_number, limit=500)
+    queue_rows = [dict(r) for r in list(queue_result.get("rows") or []) if isinstance(r, dict)]
+    total_bundles = len(queue_rows)
+    approved_count = sum(1 for r in queue_rows if str(r.get("review_status") or "") == "approved")
+    bad_mask_count = sum(1 for r in queue_rows if str(r.get("review_status") or "") == "bad_mask")
+    pending_count = sum(
+        1 for r in queue_rows
+        if str(r.get("review_status") or "") not in {"approved", "bad_mask", "rejected", "needs_split_fix"}
+    )
+
+    # ── 2. Quick-review cache (file read, best-effort) ────────────────────
+    cache = _read_quick_review_cache(set_text, bag_number)
+    cache_exists = bool(cache)
+    cache_stale = bool(cache.get("stale"))
+    cache_built_at = str(cache.get("built_at") or "")
+    cache_stale_reason = str(cache.get("stale_reason") or "")
+    cache_summary = dict(cache.get("summary") or {})
+    problem_count = int(cache_summary.get("problem_bundle_count", 0) or 0)
+    needs_review_count = int(cache_summary.get("needs_review_count", 0) or 0)
+    missing_candidates_count = int(cache_summary.get("missing_candidates_count", 0) or 0)
+
+    # ── 3. Next bag ───────────────────────────────────────────────────────
+    next_bag_num, next_bag_url = _quick_review_next_bag_url(set_text, bag_number)
+
+    # ── 4. URL helpers ────────────────────────────────────────────────────
+    qs = f"set_num={_url_quote(set_text)}&bag_num={bag_number}"
+    quick_review_url = f"/debug/training-store/quick-review?{qs}"
+    review_queue_url = f"/debug/training-store/review-ui?{qs}&review_status=pending&limit=50"
+    audit_url = f"/debug/training-store/bag-completion-audit?{qs}"
+    export_url = f"/debug/export-training-data?set_num={_url_quote(set_text)}&bag={bag_number}"
+    control_panel_url = f"/debug/training-store/control-panel?{qs}"
+    next_bag_control_panel_url = (
+        f"/debug/training-store/control-panel?set_num={_url_quote(set_text)}&bag_num={next_bag_num}"
+        if next_bag_num else ""
+    )
+
+    # ── 5. Status grid ────────────────────────────────────────────────────
+    def _stat(label: str, value: Any, cls: str = "") -> str:
+        cls_attr = f' class="{escape(cls)}"' if cls else ""
+        return (
+            f'<div{cls_attr}>'
+            f'<span class="stat-label">{escape(label)}</span>'
+            f'<strong class="stat-value">{escape(str(value))}</strong>'
+            f'</div>'
+        )
+
+    status_grid = "".join([
+        _stat("bundles", total_bundles),
+        _stat("problems", problem_count if cache_exists else "—", "warn" if problem_count > 0 else ""),
+        _stat("approved", approved_count, "ok" if approved_count > 0 else ""),
+        _stat("bad mask", bad_mask_count, "warn" if bad_mask_count > 0 else ""),
+        _stat("pending", pending_count, "warn" if pending_count > 0 else ""),
+        _stat("needs review", needs_review_count if cache_exists else "—", "warn" if needs_review_count > 0 else ""),
+        _stat("missing candidates", missing_candidates_count if cache_exists else "—", "warn" if missing_candidates_count > 0 else ""),
+    ])
+
+    if cache_exists:
+        if cache_stale:
+            cache_status_text = f"stale · {escape(cache_stale_reason)} · last built: {escape(cache_built_at)}"
+            cache_status_cls = "cache-status stale"
+        else:
+            cache_status_text = f"cache ready · built: {escape(cache_built_at)}"
+            cache_status_cls = "cache-status ready"
+    else:
+        cache_status_text = "no cache — build it first"
+        cache_status_cls = "cache-status missing"
+
+    next_bag_btn = (
+        f'<a class="btn btn-success" href="{escape(next_bag_control_panel_url)}" target="_blank">'
+        f'Open Next Bag {escape(str(next_bag_num))}</a>'
+        if next_bag_num else
+        '<span class="btn btn-disabled" title="No later bag found">Open Next Bag</span>'
+    )
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Control Panel — {escape(set_text)} bag {escape(str(bag_number))}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:14px; color:#172026; background:#f5f7f8; }}
+    header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; padding:14px 18px; background:#18212b; color:white; }}
+    header strong {{ font-size:18px; }}
+    header a {{ color:#a8c6e8; text-decoration:none; font-size:13px; }}
+    main {{ padding:20px; max-width:860px; margin:0 auto; }}
+    h2 {{ margin:24px 0 10px; font-size:15px; text-transform:uppercase; letter-spacing:.05em; color:#66727d; }}
+    /* Status grid */
+    .status-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; margin-bottom:8px; }}
+    .status-grid div {{ background:white; border:1px solid #d8dee3; border-radius:8px; padding:12px 10px; text-align:center; }}
+    .status-grid div.warn {{ border-color:#e8a020; background:#fffbf3; }}
+    .status-grid div.ok {{ border-color:#3a9a60; background:#f2fbf5; }}
+    .stat-label {{ display:block; font-size:11px; color:#66727d; margin-bottom:4px; text-transform:uppercase; letter-spacing:.04em; }}
+    .stat-value {{ font-size:26px; font-weight:800; }}
+    .cache-status {{ font-size:12px; padding:6px 10px; border-radius:6px; margin-bottom:18px; }}
+    .cache-status.ready {{ background:#f2fbf5; color:#2f6c41; border:1px solid #7db28a; }}
+    .cache-status.stale {{ background:#fffbf3; color:#8a5a00; border:1px solid #e8a020; font-weight:700; }}
+    .cache-status.missing {{ background:#fdf3f3; color:#8a2020; border:1px solid #e09090; }}
+    /* Action groups */
+    .actions {{ display:flex; flex-direction:column; gap:12px; }}
+    .action-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
+    .action-row .label {{ min-width:200px; color:#66727d; font-size:13px; }}
+    /* Buttons */
+    .btn {{ display:inline-flex; align-items:center; justify-content:center; min-height:36px; padding:8px 14px; border-radius:6px; border:1px solid #1f6fc9; background:#1f6fc9; color:white; font:inherit; font-size:13px; font-weight:700; text-decoration:none; cursor:pointer; white-space:nowrap; }}
+    .btn:hover {{ filter:brightness(1.1); }}
+    .btn-secondary {{ background:#f5f7f8; color:#172026; border-color:#c8d0d7; }}
+    .btn-success {{ background:#2f6c41; border-color:#2f6c41; }}
+    .btn-warn {{ background:#755000; border-color:#755000; }}
+    .btn-disabled {{ background:#e4e9ed; border-color:#c8d0d7; color:#9aa6af; cursor:default; pointer-events:none; }}
+    .btn[data-loading]::after {{ content:" ···"; }}
+    /* Log */
+    #action-log {{ margin-top:20px; }}
+    .log-entry {{ padding:10px 12px; border-radius:6px; font-size:12px; margin-bottom:8px; white-space:pre-wrap; word-break:break-all; }}
+    .log-entry.ok {{ background:#f2fbf5; border:1px solid #7db28a; color:#1a4a28; }}
+    .log-entry.err {{ background:#fdf3f3; border:1px solid #e09090; color:#5a1010; }}
+    .log-entry.info {{ background:#f0f4ff; border:1px solid #8aaae8; color:#1a2a6c; }}
+    @media (max-width:640px) {{
+      .status-grid {{ grid-template-columns:repeat(3,1fr); }}
+      .action-row {{ flex-direction:column; align-items:flex-start; }}
+      .action-row .label {{ min-width:0; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Training Control Panel</strong>
+    <span>{escape(set_text)} · bag {escape(str(bag_number))}</span>
+    <a href="{escape(control_panel_url)}">↻ Refresh status</a>
+  </header>
+  <main>
+    <h2>Status</h2>
+    <div class="status-grid">{status_grid}</div>
+    <div class="{escape(cache_status_cls)}">{cache_status_text}</div>
+
+    <h2>Actions</h2>
+    <div class="actions">
+
+      <div class="action-row">
+        <button class="btn" type="button"
+          data-post="/debug/training-store/build-quick-review-cache?{escape(qs)}"
+          data-summary-key="summary"
+        >Build / Refresh Quick Review Cache</button>
+        <a class="btn btn-secondary" href="{escape(quick_review_url)}" target="_blank">Open Quick Review</a>
+      </div>
+
+      <div class="action-row">
+        <a class="btn btn-secondary" href="{escape(review_queue_url)}" target="_blank">Open Review Queue</a>
+      </div>
+
+      <div class="action-row">
+        <a class="btn btn-secondary" href="{escape(audit_url)}" target="_blank">Open Bag Completion Audit</a>
+      </div>
+
+      <div class="action-row">
+        <button class="btn btn-warn" type="button"
+          data-post="/debug/training-store/auto-batch-report?{escape(qs)}&amp;generate_missing=1"
+          data-summary-key="summary"
+          data-confirm="Generate missing split candidates for all eligible bundles in this bag?"
+        >Generate Missing Split Candidates</button>
+      </div>
+
+      <div class="action-row">
+        {next_bag_btn}
+      </div>
+
+      <div class="action-row">
+        <a class="btn btn-secondary" href="{escape(export_url)}" target="_blank">Export Confirmed Training Data</a>
+      </div>
+
+    </div>
+
+    <div id="action-log"></div>
+  </main>
+  <script>
+    const log = document.getElementById('action-log');
+
+    function addLog(text, cls) {{
+      const el = document.createElement('div');
+      el.className = 'log-entry ' + cls;
+      el.textContent = text;
+      log.prepend(el);
+    }}
+
+    document.querySelectorAll('[data-post]').forEach(function(btn) {{
+      btn.addEventListener('click', async function() {{
+        const url = btn.dataset.post;
+        const confirmMsg = btn.dataset.confirm;
+        const summaryKey = btn.dataset.summaryKey;
+        if (confirmMsg && !confirm(confirmMsg)) return;
+        btn.setAttribute('data-loading', '1');
+        btn.disabled = true;
+        addLog('POST ' + url + ' …', 'info');
+        try {{
+          const resp = await fetch(url, {{ method: 'POST' }});
+          const text = await resp.text();
+          let parsed = null;
+          try {{ parsed = JSON.parse(text); }} catch (_) {{}}
+          if (!resp.ok) {{
+            addLog('Error ' + resp.status + ': ' + text.slice(0, 400), 'err');
+          }} else {{
+            let summary = '';
+            if (parsed && summaryKey && parsed[summaryKey]) {{
+              summary = JSON.stringify(parsed[summaryKey], null, 2);
+            }} else if (parsed) {{
+              const short = {{}};
+              ['ok','set_num','bag_num','built_at','stale','cache_path','generate_missing'].forEach(function(k) {{
+                if (parsed[k] !== undefined) short[k] = parsed[k];
+              }});
+              summary = JSON.stringify(short, null, 2);
+            }} else {{
+              summary = text.slice(0, 400);
+            }}
+            addLog('OK ✓\n' + summary, 'ok');
+          }}
+        }} catch (err) {{
+          addLog('Network error: ' + err.message, 'err');
+        }} finally {{
+          btn.removeAttribute('data-loading');
+          btn.disabled = false;
+        }}
+      }});
+    }});
+  </script>
+</body>
+</html>"""
+
+    return HTMLResponse(html)
+
+
 def _auto_batch_report_payload(
     *,
     set_num: str,
@@ -6635,6 +6877,8 @@ def training_store_accept_split_candidate(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    stale_reason = "bundle_promoted_to_approved" if bool(result.get("bundle_promoted")) else "candidate_accepted"
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, stale_reason)
     return JSONResponse(result)
 
 
@@ -6649,6 +6893,8 @@ def training_store_reject_split_candidate(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    stale_reason = "bundle_promoted_to_approved" if bool(result.get("bundle_promoted")) else "candidate_rejected"
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, stale_reason)
     return JSONResponse(result)
 
 
