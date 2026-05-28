@@ -924,6 +924,9 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
                 "raw_alpha_area": int(np.count_nonzero(raw_tight_mask > 0)),
                 "expanded_alpha_area": int(np.count_nonzero(tight_mask > 0)),
             },
+            "base_candidate_path": str(candidate_path),
+            "current_candidate_path": clean_candidate_path or str(candidate_path),
+            "current_alpha_path": clean_mask_candidate_path or str(mask_candidate_path),
             "qty_detected": bool(candidate_qty_tokens),
             "qty_values": qty_values,
             "qty_token_boxes": candidate_qty_tokens,
@@ -932,6 +935,9 @@ def generate_split_candidates(bundle_id: str) -> Dict[str, Any]:
             "qty_scrubbed_mask_path": clean_mask_candidate_path,
             "thumbnail_path": clean_candidate_path or str(candidate_path),
             "qty_scrub_status": qty_scrub_status,
+            "qty_text_state": qty_scrub_status,
+            "mask_review_state": "",
+            "cleanup_history": [],
         }
 
     combined_index = 0
@@ -1058,8 +1064,14 @@ def mark_split_candidate(bundle_id: str, candidate_index: int, status: str) -> D
     if candidate_index < 0 or candidate_index >= len(candidates):
         raise ValueError("candidate_index is out of range")
     candidate = dict(candidates[candidate_index]) if isinstance(candidates[candidate_index], dict) else {}
-    if status == "accepted" and bool(candidate.get("qty_detected")) and not str(candidate.get("qty_scrubbed_path") or "").strip():
-        raise ValueError("candidate has detected qty text; scrub qty before accepting clean")
+    _qty_clean_states = {"auto_scrubbed", "not_needed", "manual_mark_clean", "not_detected", "scrubbed"}
+    _qty_is_clean = (
+        not bool(candidate.get("qty_detected"))
+        or str(candidate.get("qty_text_state") or "") in _qty_clean_states
+        or bool(str(candidate.get("qty_scrubbed_path") or "").strip())
+    )
+    if status == "accepted" and not _qty_is_clean:
+        raise ValueError("candidate has detected qty text; scrub or mark qty clean before accepting")
     v2_mask_path = ""
     if status == "accepted":
         mask_path = Path(str(candidate.get("mask_path") or "").strip())
@@ -1129,7 +1141,11 @@ def scrub_candidate_qty(bundle_id: str, candidate_index: int) -> Dict[str, Any]:
     if candidate_index < 0 or candidate_index >= len(candidates):
         raise ValueError("candidate_index is out of range")
     candidate = dict(candidates[candidate_index]) if isinstance(candidates[candidate_index], dict) else {}
-    candidate_path = Path(str(candidate.get("candidate_path") or "").strip())
+    candidate_path = Path(str(
+        candidate.get("current_candidate_path")
+        or candidate.get("candidate_path")
+        or ""
+    ).strip())
     if not candidate_path.exists() or not candidate_path.is_file():
         raise FileNotFoundError("candidate image not found")
     crop_box = [int(value) for value in list(candidate.get("box") or [])[:4]]
@@ -1164,6 +1180,12 @@ def scrub_candidate_qty(bundle_id: str, candidate_index: int) -> Dict[str, Any]:
         item["qty_scrubbed_path"] = str(scrubbed_path)
         item["qty_scrubbed_mask_path"] = str(scrubbed_mask_path)
         item["qty_scrub_status"] = "scrubbed"
+        item["qty_text_state"] = "auto_scrubbed"
+        item["current_candidate_path"] = str(scrubbed_path)
+        item["current_alpha_path"] = str(scrubbed_mask_path)
+        history = list(item.get("cleanup_history") or [])
+        history.append({"op": "qty_scrub", "path": str(scrubbed_path)})
+        item["cleanup_history"] = history
         return item
 
     paths["candidates"] = [update_candidate(item) for item in list(paths.get("candidates") or [])]

@@ -24,6 +24,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -65,6 +66,7 @@ from clean.services.training_bundle_index_service import (
     reset_bag_index_rows,
     unconfirm_candidate_part,
     update_review as update_training_bundle_review,
+    update_split_candidates,
 )
 from clean.services.training_ai_review_service import (
     analyse_reviewed_bundle,
@@ -4980,6 +4982,1230 @@ def training_store_export_batch(
     )
 
 
+def _training_store_analysis_root() -> Path:
+    return (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+    )
+
+
+def _auto_batch_bundle_candidates(set_num: str, bag_num: int) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, str]]:
+    analysis_root = _training_store_analysis_root()
+    set_text = str(set_num or "").strip()
+    bag_number = int(bag_num or 1)
+    expected_bundle_ids: List[str] = []
+    discovery_errors: List[Dict[str, Any]] = []
+    try:
+        crops = _build_instruction_callout_crops(set_text, bag_number, ai_enabled=False)
+        _write_crop_detection_cache(set_text, bag_number, crops)
+        for crop in list(crops or []):
+            crop_id = str((crop or {}).get("crop_id") or "").strip()
+            if crop_id:
+                expected_bundle_ids.append(_analysis_bundle_slug(set_text, bag_number, crop_id))
+    except Exception as exc:
+        discovery_errors.append({"error": type(exc).__name__, "detail": str(exc)})
+
+    bundle_prefix = f"{set_text}_bag{bag_number}_"
+    local_bundle_ids = [
+        path.name
+        for path in sorted(analysis_root.glob(f"{bundle_prefix}*"))
+        if path.is_dir()
+    ] if analysis_root.exists() else []
+
+    postgres_bundle_ids: List[str] = []
+    try:
+        queue = list_review_queue(set_num=set_text, bag_num=bag_number, limit=500)
+        postgres_bundle_ids = [
+            str(row.get("bundle_id") or "")
+            for row in list(queue.get("rows") or [])
+            if isinstance(row, dict) and str(row.get("bundle_id") or "").startswith(bundle_prefix)
+        ]
+    except Exception as exc:
+        discovery_errors.append({"error": type(exc).__name__, "detail": f"postgres list failed: {exc}"})
+
+    ordered: List[str] = []
+    for bundle_id in expected_bundle_ids + local_bundle_ids + postgres_bundle_ids:
+        if bundle_id and bundle_id not in ordered:
+            ordered.append(bundle_id)
+    local_paths = {bundle_id: str(analysis_root / bundle_id) for bundle_id in ordered}
+    return ordered, discovery_errors, local_paths
+
+
+def _auto_batch_manifest_for_bundle(bundle_id: str, artifact_debug: Dict[str, Any]) -> Dict[str, Any]:
+    metadata_path = Path(str(artifact_debug.get("metadata_path") or "").strip())
+    if metadata_path.exists() and metadata_path.is_file():
+        try:
+            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _auto_batch_split_candidate_counts(split_candidate_paths: Any) -> Dict[str, Any]:
+    paths = split_candidate_paths if isinstance(split_candidate_paths, dict) else {}
+    candidates = [
+        dict(item)
+        for item in list(paths.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    review_state_counts = {
+        "needs_mask_expand": 0,
+        "needs_ocr_review": 0,
+        "needs_manual_crop": 0,
+        "rejected": 0,
+    }
+    accepted_count = 0
+    for candidate in candidates:
+        status = str(candidate.get("status") or "").strip()
+        review_state = str(candidate.get("review_state") or "").strip()
+        if status == "accepted":
+            accepted_count += 1
+        if status == "rejected":
+            review_state_counts["rejected"] += 1
+        if review_state in review_state_counts:
+            review_state_counts[review_state] += 1
+    return {
+        "split_candidate_count": len(candidates),
+        "split_candidates_exist": bool(candidates),
+        "accepted_count": accepted_count,
+        "review_state_counts": review_state_counts,
+        "needs_review_count": sum(int(review_state_counts.get(key, 0) or 0) for key in review_state_counts),
+    }
+
+
+_TRAINING_REVIEW_COMPLETE_STATES = {"needs_mask_expand", "needs_ocr_review", "needs_manual_crop"}
+
+
+def _training_review_candidate_confirmed(confirmed: Dict[str, Any]) -> bool:
+    return any(
+        str(confirmed.get(field) or "").strip()
+        for field in ("part_num", "element_id", "confirmed_by")
+    )
+
+
+def _training_review_bundle_completion(row: Dict[str, Any]) -> Dict[str, Any]:
+    bundle_id = str(row.get("bundle_id") or "").strip()
+    paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+    candidates = [
+        dict(item)
+        for item in list(paths.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    try:
+        confirmed_rows = [
+            dict(item)
+            for item in list(list_candidate_training_examples(bundle_id).get("rows") or [])
+            if isinstance(item, dict)
+        ]
+    except Exception:
+        confirmed_rows = []
+    confirmed_by_index = {
+        int(_coerce_int(item.get("candidate_index"))): item
+        for item in confirmed_rows
+        if _coerce_int(item.get("candidate_index")) is not None
+    }
+    incomplete_indexes: List[int] = []
+    complete_count = 0
+    for pos, candidate in enumerate(candidates):
+        candidate_index = _coerce_int(candidate.get("index"))
+        if candidate_index is None:
+            candidate_index = pos
+        status = str(candidate.get("status") or "").strip()
+        review_state = str(candidate.get("review_state") or "").strip()
+        confirmed = _training_review_candidate_confirmed(confirmed_by_index.get(int(candidate_index), {}))
+        candidate_complete = bool(
+            confirmed
+            or status == "rejected"
+            or review_state in _TRAINING_REVIEW_COMPLETE_STATES
+        )
+        if candidate_complete:
+            complete_count += 1
+        else:
+            incomplete_indexes.append(int(candidate_index))
+    is_complete = bool(candidates) and not incomplete_indexes
+    return {
+        "bundle_id": bundle_id,
+        "complete": is_complete,
+        "candidate_count": len(candidates),
+        "complete_candidate_count": complete_count,
+        "incomplete_candidate_indexes": incomplete_indexes,
+        "confirmed_count": len(confirmed_rows),
+    }
+
+
+def _training_review_url(bundle_id: str, set_num: str, bag_num: Any, limit: int = 50) -> str:
+    return (
+        f"/debug/training-store/review-ui?bundle_id={_url_quote(str(bundle_id or ''))}"
+        f"&review_status=pending&set_num={_url_quote(str(set_num or ''))}"
+        f"&bag_num={_url_quote(str(bag_num or ''))}&limit={int(limit or 50)}"
+    )
+
+
+def _next_pending_bundle_payload(
+    *,
+    set_num: str,
+    bag_num: Any,
+    current_bundle_id: str = "",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    set_text = str(set_num or "").strip()
+    bag_number = _coerce_int(bag_num)
+    if not set_text:
+        raise ValueError("set_num is required")
+    if bag_number is None:
+        raise ValueError("bag_num is required")
+
+    queue = list_review_queue(set_num=set_text, bag_num=bag_number, limit=500)
+    rows = [dict(row) for row in list(queue.get("rows") or []) if isinstance(row, dict)]
+    incomplete_rows: List[Dict[str, Any]] = []
+    completion_by_bundle: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        completion = _training_review_bundle_completion(row)
+        completion_by_bundle[str(row.get("bundle_id") or "")] = completion
+        if not bool(completion.get("complete")):
+            incomplete_rows.append(row)
+
+    incomplete_bundle_ids = [str(row.get("bundle_id") or "") for row in incomplete_rows]
+    current_id = str(current_bundle_id or "").strip()
+    next_row: Optional[Dict[str, Any]] = None
+    if current_id and current_id in incomplete_bundle_ids:
+        current_index = incomplete_bundle_ids.index(current_id)
+        if current_index + 1 < len(incomplete_rows):
+            next_row = incomplete_rows[current_index + 1]
+    elif incomplete_rows:
+        next_row = incomplete_rows[0]
+
+    current_bag_complete = not incomplete_rows
+    next_bag_num: Optional[int] = None
+    next_bag_bundle_id = ""
+    next_bag_url = ""
+    if current_bag_complete:
+        try:
+            set_queue = list_review_queue(set_num=set_text, limit=500)
+            set_rows = [dict(row) for row in list(set_queue.get("rows") or []) if isinstance(row, dict)]
+        except Exception:
+            set_rows = []
+        bag_values = sorted({
+            int(value)
+            for value in (_coerce_int(row.get("bag_num")) for row in set_rows)
+            if value is not None and int(value) > int(bag_number)
+        })
+        for candidate_bag in bag_values:
+            bag_rows = [row for row in set_rows if _coerce_int(row.get("bag_num")) == candidate_bag]
+            for row in bag_rows:
+                if not bool(_training_review_bundle_completion(row).get("complete")):
+                    next_bag_num = int(candidate_bag)
+                    next_bag_bundle_id = str(row.get("bundle_id") or "")
+                    next_bag_url = _training_review_url(next_bag_bundle_id, set_text, next_bag_num, limit)
+                    break
+            if next_bag_bundle_id:
+                break
+
+    next_bundle_id = str(next_row.get("bundle_id") or "") if next_row else ""
+    next_url = _training_review_url(next_bundle_id, set_text, bag_number, limit) if next_bundle_id else ""
+    return {
+        "ok": True,
+        "set_num": set_text,
+        "bag_num": int(bag_number),
+        "current_bundle_id": current_id,
+        "next_bundle_id": next_bundle_id,
+        "next_url": next_url,
+        "current_bag_complete": current_bag_complete,
+        "next_bag_num": next_bag_num,
+        "next_bag_bundle_id": next_bag_bundle_id,
+        "next_bag_url": next_bag_url,
+        "incomplete_bundle_count": len(incomplete_rows),
+        "bundle_completion": completion_by_bundle.get(current_id, {}),
+    }
+
+
+@router.get("/debug/training-store/next-pending-bundle")
+def training_store_next_pending_bundle(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+    current_bundle_id: str = Query(""),
+):
+    try:
+        return JSONResponse(
+            _next_pending_bundle_payload(
+                set_num=set_num,
+                bag_num=bag_num,
+                current_bundle_id=current_bundle_id,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/debug/training-store/bag-completion-audit")
+def training_store_bag_completion_audit(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+):
+    """
+    Bag-level completion audit: verifies OCR qty totals match confirmed mappings
+    and surfaces any unmapped or inconsistent candidates.
+    """
+    set_text = str(set_num or "").strip()
+    bag_number = int(bag_num or 1)
+    if not set_text:
+        raise HTTPException(status_code=400, detail="set_num is required")
+
+    # ── 1. Collect all bundles for this bag ──────────────────────────────
+    queue_result = list_review_queue(set_num=set_text, bag_num=bag_number, limit=500)
+    bundle_rows = [dict(r) for r in list(queue_result.get("rows") or []) if isinstance(r, dict)]
+
+    # ── 2. For each bundle collect candidate + confirmed-example data ────
+    bundle_summaries: List[Dict[str, Any]] = []
+    total_ocr_qty = 0
+    total_confirmed_qty = 0
+    review_state_counts: Dict[str, int] = {}
+    unmapped_accepted: List[Dict[str, Any]] = []   # accepted, qty-clean, no confirmed example
+    qty_no_confirmed: List[Dict[str, Any]] = []    # qty detected but no mapping
+    qty_mismatch: List[Dict[str, Any]] = []        # confirmed qty ≠ detected qty
+    skipped_problem: List[Dict[str, Any]] = []     # rejected / non-empty review_state
+
+    for b_row in bundle_rows:
+        bundle_id = str(b_row.get("bundle_id") or "")
+        paths = b_row.get("split_candidate_paths") if isinstance(b_row.get("split_candidate_paths"), dict) else {}
+        candidates = [dict(c) for c in list(paths.get("candidates") or []) if isinstance(c, dict)]
+
+        # Confirmed examples for this bundle keyed by candidate_index
+        try:
+            ex_rows = [dict(r) for r in list(list_candidate_training_examples(bundle_id).get("rows") or []) if isinstance(r, dict)]
+        except Exception:
+            ex_rows = []
+        confirmed_by_idx: Dict[int, Dict[str, Any]] = {}
+        for ex in ex_rows:
+            idx = _coerce_int(ex.get("candidate_index"))
+            if idx is not None:
+                confirmed_by_idx[int(idx)] = ex
+            total_confirmed_qty += int(ex.get("qty") or 1)
+
+        for c in candidates:
+            cidx = _coerce_int(c.get("index"))
+            status = str(c.get("status") or "pending")
+            review_state = str(c.get("review_state") or "")
+            qty_detected = bool(c.get("qty_detected"))
+            qty_values = list(c.get("qty_values") or [])
+            ocr_qty = int(qty_values[0]) if qty_values else 0
+
+            # review_state counts
+            rs_key = review_state if review_state else "clean"
+            review_state_counts[rs_key] = review_state_counts.get(rs_key, 0) + 1
+
+            # skipped/problem
+            if status == "rejected" or review_state:
+                skipped_problem.append({
+                    "bundle_id": bundle_id,
+                    "candidate_index": cidx,
+                    "status": status,
+                    "review_state": review_state,
+                    "qty_detected": qty_detected,
+                    "qty_values": qty_values,
+                })
+
+            if status != "accepted":
+                continue
+
+            # qty totals (accepted candidates only)
+            if qty_detected and ocr_qty > 0:
+                total_ocr_qty += ocr_qty
+
+            confirmed = confirmed_by_idx.get(int(cidx)) if cidx is not None else None
+            is_confirmed = _training_review_candidate_confirmed(confirmed or {}) if confirmed else False
+
+            if not is_confirmed and _candidate_qty_is_clean(c) and not review_state:
+                unmapped_accepted.append({
+                    "bundle_id": bundle_id,
+                    "candidate_index": cidx,
+                    "qty_values": qty_values,
+                    "qty_scrub_status": c.get("qty_scrub_status"),
+                })
+
+            if qty_detected and not is_confirmed:
+                qty_no_confirmed.append({
+                    "bundle_id": bundle_id,
+                    "candidate_index": cidx,
+                    "qty_values": qty_values,
+                })
+
+            if is_confirmed and qty_detected and confirmed:
+                confirmed_qty_val = int(confirmed.get("qty") or 1)
+                if ocr_qty and confirmed_qty_val != ocr_qty:
+                    qty_mismatch.append({
+                        "bundle_id": bundle_id,
+                        "candidate_index": cidx,
+                        "ocr_qty": ocr_qty,
+                        "confirmed_qty": confirmed_qty_val,
+                        "part_num": str(confirmed.get("part_num") or ""),
+                        "color_id": _coerce_int(confirmed.get("color_id")),
+                    })
+
+        bundle_summaries.append({
+            "bundle_id": bundle_id,
+            "candidate_count": len(candidates),
+            "confirmed_count": len(ex_rows),
+            "review_status": str(b_row.get("review_status") or ""),
+        })
+
+    # ── 3. Per-part summary from set totals ──────────────────────────────
+    per_part_summary: List[Dict[str, Any]] = []
+    try:
+        set_parts_payload = load_instruction_set_parts(set_text)
+        set_parts = _prepare_instruction_parts_for_display(list(set_parts_payload.get("parts", []) or []))
+        totals_rows = [dict(r) for r in list(list_confirmed_part_totals_for_set(set_text).get("rows") or []) if isinstance(r, dict)]
+        confirmed_totals: Dict[str, int] = {}
+        for t in totals_rows:
+            k = _candidate_part_key(t.get("part_num"), t.get("color_id"))
+            confirmed_totals[k] = int(t.get("confirmed_qty") or 0)
+        for part in set_parts:
+            part_num = str(part.get("part_num") or "").strip()
+            color_id = _coerce_int(part.get("color_id"))
+            if not part_num or color_id is None:
+                continue
+            k = _candidate_part_key(part_num, color_id)
+            set_required = int(part.get("set_required_qty") or 0)
+            confirmed = int(confirmed_totals.get(k) or 0)
+            remaining = set_required - confirmed
+            if set_required > 0 or confirmed > 0:
+                per_part_summary.append({
+                    "part_num": part_num,
+                    "color_id": color_id,
+                    "color_name": str(part.get("color_name") or ""),
+                    "set_required_qty": set_required,
+                    "confirmed_qty": confirmed,
+                    "remaining_qty": remaining,
+                    "complete": remaining <= 0,
+                })
+        per_part_summary.sort(key=lambda r: (r["remaining_qty"] < 0, abs(r["remaining_qty"]) == 0, r["part_num"]))
+    except Exception as exc:
+        per_part_summary = [{"error": str(exc)}]
+
+    # ── 4. High-level verdict ─────────────────────────────────────────────
+    incomplete_parts = [p for p in per_part_summary if isinstance(p.get("remaining_qty"), int) and p["remaining_qty"] > 0]
+    over_confirmed_parts = [p for p in per_part_summary if isinstance(p.get("remaining_qty"), int) and p["remaining_qty"] < 0]
+    qty_match = total_ocr_qty == total_confirmed_qty
+
+    audit = {
+        "ok": True,
+        "set_num": set_text,
+        "bag_num": bag_number,
+        "bundle_count": len(bundle_rows),
+        "verdict": {
+            "qty_totals_match": qty_match,
+            "has_unmapped_accepted": len(unmapped_accepted) > 0,
+            "has_incomplete_parts": len(incomplete_parts) > 0,
+            "has_over_confirmed": len(over_confirmed_parts) > 0,
+            "has_qty_mismatch": len(qty_mismatch) > 0,
+        },
+        "totals": {
+            "total_ocr_qty": total_ocr_qty,
+            "total_confirmed_qty": total_confirmed_qty,
+        },
+        "unmapped_accepted": unmapped_accepted,
+        "qty_no_confirmed": qty_no_confirmed,
+        "qty_mismatch": qty_mismatch,
+        "review_state_counts": review_state_counts,
+        "skipped_problem": skipped_problem,
+        "incomplete_parts": incomplete_parts,
+        "over_confirmed_parts": over_confirmed_parts,
+        "per_part_summary": per_part_summary,
+        "bundle_summaries": bundle_summaries,
+    }
+
+    # ── 5. Render HTML ─────────────────────────────────────────────────────
+    def _verdict_row(label: str, ok: bool, ok_text: str = "OK", fail_text: str = "⚠ Issue") -> str:
+        cls = "audit-ok" if ok else "audit-warn"
+        return f'<tr><td>{escape(label)}</td><td class="{cls}">{ok_text if ok else fail_text}</td></tr>'
+
+    def _part_rows(parts: List[Dict[str, Any]]) -> str:
+        out = []
+        for p in parts:
+            if "error" in p:
+                out.append(f'<tr><td colspan="6" class="audit-warn">{escape(str(p["error"]))}</td></tr>')
+                continue
+            remaining = int(p.get("remaining_qty") or 0)
+            cls = "audit-warn" if remaining > 0 else ("audit-over" if remaining < 0 else "audit-ok")
+            out.append(
+                f'<tr>'
+                f'<td>{escape(str(p.get("part_num") or ""))}</td>'
+                f'<td>{escape(str(p.get("color_id") or ""))}</td>'
+                f'<td>{escape(str(p.get("color_name") or ""))}</td>'
+                f'<td>{escape(str(p.get("set_required_qty") or 0))}</td>'
+                f'<td>{escape(str(p.get("confirmed_qty") or 0))}</td>'
+                f'<td class="{cls}">{escape(str(remaining))}</td>'
+                f'</tr>'
+            )
+        return "".join(out) or '<tr><td colspan="6">—</td></tr>'
+
+    def _candidate_list(items: List[Dict[str, Any]], cols: List[str]) -> str:
+        if not items:
+            return '<p class="audit-ok">None.</p>'
+        rows_html = "".join(
+            "<tr>" + "".join(f"<td>{escape(str(item.get(c, '') or ''))}</td>" for c in cols) + "</tr>"
+            for item in items
+        )
+        header = "<tr>" + "".join(f"<th>{escape(c)}</th>" for c in cols) + "</tr>"
+        return f'<table class="audit-table"><thead>{header}</thead><tbody>{rows_html}</tbody></table>'
+
+    qty_match_class = "audit-ok" if qty_match else "audit-warn"
+    next_bag_num_for_url, next_bag_url_for_link = _quick_review_next_bag_url(set_text, bag_number)
+    next_bag_link = (
+        f'<a href="{escape(next_bag_url_for_link)}">Open Next Bag {escape(str(next_bag_num_for_url))}</a>'
+        if next_bag_url_for_link else ""
+    )
+    training_review_link = (
+        f'<a href="/debug/training-store/training-review?set_num={_url_quote(set_text)}&bag_num={bag_number}">Back to Training Review</a>'
+    )
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bag Completion Audit — {escape(set_text)} bag {bag_number}</title>
+  <style>
+    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#f5f7f8; color:#172026; padding:24px; }}
+    h1 {{ font-size:20px; margin:0 0 4px; }}
+    .subtitle {{ color:#66727d; font-size:14px; margin-bottom:20px; }}
+    .nav {{ display:flex; gap:12px; margin-bottom:24px; font-size:13px; }}
+    .nav a {{ color:#0969da; text-decoration:none; }} .nav a:hover {{ text-decoration:underline; }}
+    section {{ background:#fff; border:1px solid #d0d7de; border-radius:8px; padding:16px 20px; margin-bottom:16px; }}
+    h2 {{ font-size:15px; margin:0 0 12px; }}
+    table.verdict-table {{ border-collapse:collapse; width:100%; }}
+    table.verdict-table td {{ padding:6px 10px; border-bottom:1px solid #eee; font-size:13px; }}
+    table.verdict-table td:first-child {{ color:#66727d; width:60%; }}
+    .audit-ok {{ color:#1a7f37; font-weight:600; }}
+    .audit-warn {{ color:#9a6700; font-weight:600; }}
+    .audit-over {{ color:#cf222e; font-weight:600; }}
+    table.audit-table {{ border-collapse:collapse; width:100%; font-size:12px; margin-top:6px; }}
+    table.audit-table th {{ background:#f6f8fa; padding:5px 8px; text-align:left; border-bottom:2px solid #d0d7de; }}
+    table.audit-table td {{ padding:4px 8px; border-bottom:1px solid #eee; }}
+    .totals-row {{ display:flex; gap:24px; font-size:13px; margin-bottom:8px; }}
+    .totals-row span {{ background:#f6f8fa; border:1px solid #d0d7de; border-radius:4px; padding:4px 10px; }}
+    details.raw-json summary {{ cursor:pointer; color:#66727d; font-size:12px; }}
+    pre {{ font-size:11px; overflow-x:auto; background:#f6f8fa; border:1px solid #d0d7de; border-radius:4px; padding:10px; }}
+  </style>
+</head>
+<body>
+  <h1>Bag Completion Audit</h1>
+  <p class="subtitle">{escape(set_text)} · Bag {bag_number} · {len(bundle_rows)} bundle{"s" if len(bundle_rows) != 1 else ""}</p>
+  <nav class="nav">{training_review_link}{(" · " + next_bag_link) if next_bag_link else ""}</nav>
+
+  <section>
+    <h2>Verdict</h2>
+    <table class="verdict-table">
+      {_verdict_row("OCR qty total matches confirmed qty total", qty_match,
+          f"Yes ({total_ocr_qty} = {total_confirmed_qty})",
+          f"No — OCR {total_ocr_qty} vs confirmed {total_confirmed_qty}")}
+      {_verdict_row("All accepted candidates mapped", not unmapped_accepted,
+          "Yes", f"{len(unmapped_accepted)} unmapped accepted candidate(s)")}
+      {_verdict_row("All set parts confirmed", not incomplete_parts,
+          "Yes", f"{len(incomplete_parts)} part(s) still needed")}
+      {_verdict_row("No over-confirmed parts", not over_confirmed_parts,
+          "Yes", f"{len(over_confirmed_parts)} over-confirmed part(s)")}
+      {_verdict_row("No qty mismatches", not qty_mismatch,
+          "Yes", f"{len(qty_mismatch)} mismatch(es)")}
+    </table>
+  </section>
+
+  <section>
+    <h2>Totals</h2>
+    <div class="totals-row">
+      <span>OCR qty total (accepted): <strong>{total_ocr_qty}</strong></span>
+      <span>Confirmed qty total: <strong>{total_confirmed_qty}</strong></span>
+      <span class="{qty_match_class}">{"Match ✓" if qty_match else "Mismatch ✗"}</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Per-Part Summary</h2>
+    <table class="audit-table">
+      <thead><tr><th>part_num</th><th>color_id</th><th>color_name</th><th>set_required_qty</th><th>confirmed_qty</th><th>remaining_qty</th></tr></thead>
+      <tbody>{_part_rows(per_part_summary)}</tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Unmapped Accepted Candidates ({len(unmapped_accepted)})</h2>
+    {_candidate_list(unmapped_accepted, ["bundle_id", "candidate_index", "qty_values", "qty_scrub_status"])}
+  </section>
+
+  <section>
+    <h2>Candidates with Qty but No Confirmed Part ({len(qty_no_confirmed)})</h2>
+    {_candidate_list(qty_no_confirmed, ["bundle_id", "candidate_index", "qty_values"])}
+  </section>
+
+  <section>
+    <h2>Qty Mismatches ({len(qty_mismatch)})</h2>
+    {_candidate_list(qty_mismatch, ["bundle_id", "candidate_index", "part_num", "color_id", "ocr_qty", "confirmed_qty"])}
+  </section>
+
+  <section>
+    <h2>Skipped / Problem Candidates ({len(skipped_problem)})</h2>
+    {_candidate_list(skipped_problem, ["bundle_id", "candidate_index", "status", "review_state", "qty_detected"])}
+  </section>
+
+  <section>
+    <h2>Review State Counts</h2>
+    <table class="audit-table">
+      <thead><tr><th>review_state</th><th>count</th></tr></thead>
+      <tbody>{"".join(f"<tr><td>{escape(str(k))}</td><td>{escape(str(v))}</td></tr>" for k, v in sorted(review_state_counts.items()))}</tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Bundles ({len(bundle_summaries)})</h2>
+    {_candidate_list(bundle_summaries, ["bundle_id", "candidate_count", "confirmed_count", "review_status"])}
+  </section>
+
+  <section>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre>{escape(json.dumps(audit, indent=2, default=str))}</pre>
+    </details>
+  </section>
+</body>
+</html>"""
+
+    return HTMLResponse(html)
+
+
+def _auto_batch_report_payload(
+    *,
+    set_num: str,
+    bag_num: int,
+    generate_missing: int = 0,
+) -> Dict[str, Any]:
+    set_text = str(set_num or "").strip()
+    if not set_text:
+        raise HTTPException(status_code=400, detail="set_num is required")
+    bag_number = int(bag_num or 1)
+    should_generate_missing = int(generate_missing or 0) == 1
+    bundle_ids, discovery_errors, local_bundle_paths = _auto_batch_bundle_candidates(set_text, bag_number)
+
+    rows: List[Dict[str, Any]] = []
+    summary = {
+        "total_bundles": 0,
+        "ready_count": 0,
+        "missing_crop_count": 0,
+        "missing_mask_count": 0,
+        "missing_ocr_count": 0,
+        "missing_candidates_count": 0,
+        "accepted_count": 0,
+        "confirmed_count": 0,
+        "needs_review_count": 0,
+        "failed_count": 0,
+    }
+
+    for bundle_id in bundle_ids:
+        reasons: List[str] = []
+        postgres_row_exists = False
+        postgres_row: Dict[str, Any] = {}
+        try:
+            postgres_row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+            postgres_row_exists = bool(postgres_row)
+        except FileNotFoundError:
+            reasons.append("postgres_row_missing")
+        except Exception as exc:
+            reasons.append(f"postgres_row_error:{type(exc).__name__}")
+
+        try:
+            artifact_debug = _training_bundle_artifact_debug(bundle_id)
+        except Exception as exc:
+            artifact_debug = {
+                "bundle_id": bundle_id,
+                "local_folder": local_bundle_paths.get(bundle_id, ""),
+                "local_folder_exists": False,
+                "metadata_path": "",
+                "metadata_exists": False,
+            }
+            reasons.append(f"artifact_debug_error:{type(exc).__name__}")
+        metadata = _auto_batch_manifest_for_bundle(bundle_id, artifact_debug)
+
+        local_folder_exists = bool(artifact_debug.get("local_folder_exists"))
+        original_crop = artifact_debug.get("original_crop") if isinstance(artifact_debug.get("original_crop"), dict) else {}
+        raw_master_mask = artifact_debug.get("raw_master_mask") if isinstance(artifact_debug.get("raw_master_mask"), dict) else {}
+        original_crop_exists = bool(original_crop.get("exists"))
+        raw_master_mask_exists = bool(raw_master_mask.get("exists"))
+        direct_qty_ocr_boxes_count = len([
+            item for item in list(metadata.get("direct_qty_ocr_boxes") or [])
+            if isinstance(item, dict)
+        ])
+
+        if not local_folder_exists:
+            reasons.append("local_folder_missing")
+        if not original_crop_exists:
+            reasons.append("original_crop_missing")
+        if not raw_master_mask_exists:
+            reasons.append("raw_master_mask_missing")
+        if direct_qty_ocr_boxes_count <= 0:
+            reasons.append("direct_qty_ocr_missing")
+
+        split_candidate_paths = postgres_row.get("split_candidate_paths") if isinstance(postgres_row.get("split_candidate_paths"), dict) else {}
+        split_counts = _auto_batch_split_candidate_counts(split_candidate_paths)
+        generated_missing_candidates = False
+        generate_error = ""
+        if not bool(split_counts.get("split_candidates_exist")):
+            if should_generate_missing and postgres_row_exists and original_crop_exists and raw_master_mask_exists:
+                try:
+                    generate_result = generate_split_candidates(bundle_id)
+                    generated_missing_candidates = bool(generate_result.get("ok"))
+                    updated_row = generate_result.get("row") if isinstance(generate_result.get("row"), dict) else {}
+                    if updated_row:
+                        postgres_row = dict(updated_row)
+                    split_candidate_paths = postgres_row.get("split_candidate_paths") if isinstance(postgres_row.get("split_candidate_paths"), dict) else {}
+                    split_counts = _auto_batch_split_candidate_counts(split_candidate_paths)
+                except Exception as exc:
+                    generate_error = f"{type(exc).__name__}: {exc}"
+                    reasons.append("split_candidate_generation_failed")
+            if not bool(split_counts.get("split_candidates_exist")):
+                reasons.append("split_candidates_missing")
+
+        confirmed_count = 0
+        confirmed_by_index: Dict[int, Dict[str, Any]] = {}
+        if postgres_row_exists:
+            try:
+                confirmed_rows = [
+                    dict(item)
+                    for item in list(list_candidate_training_examples(bundle_id).get("rows") or [])
+                    if isinstance(item, dict)
+                ]
+                confirmed_count = len(confirmed_rows)
+                confirmed_by_index = {
+                    int(_coerce_int(item.get("candidate_index"))): item
+                    for item in confirmed_rows
+                    if _coerce_int(item.get("candidate_index")) is not None
+                }
+            except Exception as exc:
+                reasons.append(f"confirmed_examples_error:{type(exc).__name__}")
+
+        accepted_count = int(split_counts.get("accepted_count", 0) or 0)
+        candidates = [
+            dict(item)
+            for item in list((split_candidate_paths if isinstance(split_candidate_paths, dict) else {}).get("candidates") or [])
+            if isinstance(item, dict)
+        ]
+        unconfirmed_accepted_count = 0
+        for pos, candidate in enumerate(candidates):
+            candidate_index = _coerce_int(candidate.get("index"))
+            if candidate_index is None:
+                candidate_index = pos
+            if str(candidate.get("status") or "").strip() == "accepted" and not _training_review_candidate_confirmed(confirmed_by_index.get(int(candidate_index), {})):
+                unconfirmed_accepted_count += 1
+        if unconfirmed_accepted_count > 0:
+            reasons.append("unconfirmed_accepted_candidates")
+        needs_review_count = int(split_counts.get("needs_review_count", 0) or 0)
+        ready = bool(
+            postgres_row_exists
+            and local_folder_exists
+            and original_crop_exists
+            and raw_master_mask_exists
+            and direct_qty_ocr_boxes_count > 0
+            and bool(split_counts.get("split_candidates_exist"))
+            and needs_review_count == 0
+            and unconfirmed_accepted_count == 0
+        )
+        failed = any(
+            reason.endswith("_missing")
+            or reason.startswith("postgres_row_error")
+            or reason.startswith("artifact_debug_error")
+            or reason == "split_candidate_generation_failed"
+            for reason in reasons
+        )
+
+        summary["missing_crop_count"] += 0 if original_crop_exists else 1
+        summary["missing_mask_count"] += 0 if raw_master_mask_exists else 1
+        summary["missing_ocr_count"] += 0 if direct_qty_ocr_boxes_count > 0 else 1
+        summary["missing_candidates_count"] += 0 if bool(split_counts.get("split_candidates_exist")) else 1
+        summary["accepted_count"] += accepted_count
+        summary["confirmed_count"] += confirmed_count
+        summary["needs_review_count"] += needs_review_count
+        summary["ready_count"] += 1 if ready else 0
+        summary["failed_count"] += 1 if failed else 0
+
+        rows.append({
+            "bundle_id": bundle_id,
+            "postgres_row_exists": postgres_row_exists,
+            "local_folder_exists": local_folder_exists,
+            "local_folder": str(artifact_debug.get("local_folder") or local_bundle_paths.get(bundle_id, "")),
+            "metadata_exists": bool(artifact_debug.get("metadata_exists")),
+            "metadata_path": str(artifact_debug.get("metadata_path") or ""),
+            "original_crop_exists": original_crop_exists,
+            "original_crop_path": str(original_crop.get("path") or ""),
+            "raw_master_mask_exists": raw_master_mask_exists,
+            "raw_master_mask_path": str(raw_master_mask.get("path") or ""),
+            "direct_qty_ocr_boxes_count": direct_qty_ocr_boxes_count,
+            "split_candidates_exist": bool(split_counts.get("split_candidates_exist")),
+            "split_candidate_count": int(split_counts.get("split_candidate_count", 0) or 0),
+            "accepted_count": accepted_count,
+            "confirmed_count": confirmed_count,
+            "unconfirmed_accepted_count": unconfirmed_accepted_count,
+            "review_state_counts": split_counts.get("review_state_counts") or {},
+            "needs_review_count": needs_review_count,
+            "generated_missing_candidates": generated_missing_candidates,
+            "generate_error": generate_error,
+            "ready": ready,
+            "failed": failed,
+            "reasons": reasons,
+        })
+
+    summary["total_bundles"] = len(rows)
+    return {
+        "ok": not discovery_errors,
+        "debug_only": True,
+        "set_num": set_text,
+        "bag_num": bag_number,
+        "generate_missing": should_generate_missing,
+        "summary": summary,
+        "rows": rows,
+        "discovery_errors": discovery_errors,
+    }
+
+
+@router.post("/debug/training-store/auto-batch-report")
+def training_store_auto_batch_report(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+    generate_missing: int = Query(0),
+):
+    return JSONResponse(
+        _auto_batch_report_payload(
+            set_num=set_num,
+            bag_num=bag_num,
+            generate_missing=generate_missing,
+        )
+    )
+
+
+def _quick_review_skip_info(bundle_id: str) -> Dict[str, Any]:
+    try:
+        artifact_debug = _training_bundle_artifact_debug(bundle_id)
+        metadata = _auto_batch_manifest_for_bundle(bundle_id, artifact_debug)
+    except Exception:
+        return {}
+    info = metadata.get("quick_review_skip") if isinstance(metadata.get("quick_review_skip"), dict) else {}
+    return dict(info)
+
+
+def _quick_review_problem_reasons(row: Dict[str, Any]) -> List[str]:
+    if _quick_review_skip_info(str(row.get("bundle_id") or "")):
+        return []
+    reasons: List[str] = []
+    review_state_counts = row.get("review_state_counts") if isinstance(row.get("review_state_counts"), dict) else {}
+    for key in ("needs_mask_expand", "needs_ocr_review", "needs_manual_crop", "rejected"):
+        count = int(review_state_counts.get(key, 0) or 0)
+        if count > 0:
+            reasons.append(f"{key}: {count}")
+    if bool(row.get("failed")):
+        reasons.append("failed report row")
+    if int(row.get("direct_qty_ocr_boxes_count", 0) or 0) <= 0:
+        reasons.append("missing OCR")
+    if not bool(row.get("raw_master_mask_exists")):
+        reasons.append("missing mask")
+    if not bool(row.get("split_candidates_exist")):
+        reasons.append("missing split candidates")
+    unconfirmed = int(row.get("unconfirmed_accepted_count", 0) or 0)
+    if unconfirmed > 0:
+        reasons.append(f"unconfirmed accepted candidates: {unconfirmed}")
+    return reasons
+
+
+def _quick_review_next_bag_url(set_num: str, bag_num: int) -> Tuple[Optional[int], str]:
+    set_text = str(set_num or "").strip()
+    current_bag = int(bag_num or 1)
+    bag_values: set[int] = set()
+    try:
+        queue = list_review_queue(set_num=set_text, limit=500)
+        for row in list(queue.get("rows") or []):
+            if isinstance(row, dict):
+                parsed = _coerce_int(row.get("bag_num"))
+                if parsed is not None and int(parsed) > current_bag:
+                    bag_values.add(int(parsed))
+    except Exception:
+        pass
+    analysis_root = _training_store_analysis_root()
+    if analysis_root.exists():
+        for path in analysis_root.glob(f"{set_text}_bag*_p*_s*_c*"):
+            match = re.match(rf"^{re.escape(set_text)}_bag(?P<bag>\d+)_", path.name)
+            if match:
+                parsed = _coerce_int(match.group("bag"))
+                if parsed is not None and int(parsed) > current_bag:
+                    bag_values.add(int(parsed))
+    if not bag_values:
+        return None, ""
+    next_bag = min(bag_values)
+    return next_bag, f"/debug/training-store/quick-review?set_num={_url_quote(set_text)}&bag_num={int(next_bag)}"
+
+
+def _quick_review_reports_root() -> Path:
+    return Path("/Users/olly/aim2build-instruction") / "debug" / "ai_training" / "reports"
+
+
+def _quick_review_cache_path(set_num: str, bag_num: Any) -> Path:
+    safe_set_num = re.sub(r"[^A-Za-z0-9.-]+", "", str(set_num or "").strip())
+    parsed_bag = _coerce_int(bag_num) or 1
+    return _quick_review_reports_root() / f"{safe_set_num}_bag{int(parsed_bag)}_quick_review.json"
+
+
+def _read_quick_review_cache(set_num: str, bag_num: Any) -> Dict[str, Any]:
+    cache_path = _quick_review_cache_path(set_num, bag_num)
+    if not cache_path.exists() or not cache_path.is_file():
+        return {}
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_quick_review_cache(payload: Dict[str, Any]) -> Path:
+    cache_path = _quick_review_cache_path(str(payload.get("set_num") or ""), payload.get("bag_num"))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return cache_path
+
+
+def _quick_review_bundle_ids(bundle_id: str) -> Tuple[str, Optional[int]]:
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        set_num = str(row.get("set_num") or "").strip()
+        bag_num = _coerce_int(row.get("bag_num"))
+        if set_num and bag_num is not None:
+            return set_num, int(bag_num)
+    except Exception:
+        pass
+    parsed = re.match(r"^(?P<set>[^_]+)_bag(?P<bag>\d+)_", str(bundle_id or ""))
+    if not parsed:
+        return "", None
+    return str(parsed.group("set") or ""), _coerce_int(parsed.group("bag"))
+
+
+def _mark_quick_review_cache_stale_for_bundle(bundle_id: str, reason: str) -> None:
+    set_num, bag_num = _quick_review_bundle_ids(bundle_id)
+    if not set_num or bag_num is None:
+        return
+    cache = _read_quick_review_cache(set_num, bag_num)
+    if not cache:
+        return
+    cache["stale"] = True
+    cache["stale_reason"] = str(reason or "bundle_changed")
+    cache["stale_at"] = _iso_now()
+    try:
+        _write_quick_review_cache(cache)
+    except Exception:
+        pass
+
+
+def _remove_quick_review_problem_from_cache(bundle_id: str) -> None:
+    set_num, bag_num = _quick_review_bundle_ids(bundle_id)
+    if not set_num or bag_num is None:
+        return
+    cache = _read_quick_review_cache(set_num, bag_num)
+    if not cache:
+        return
+    problems = [
+        dict(row)
+        for row in list(cache.get("problem_rows") or [])
+        if isinstance(row, dict) and str(row.get("bundle_id") or "") != str(bundle_id or "")
+    ]
+    cache["problem_rows"] = problems
+    summary = cache.get("summary") if isinstance(cache.get("summary"), dict) else {}
+    summary["problem_bundle_count"] = len(problems)
+    cache["summary"] = summary
+    cache["stale"] = True
+    cache["stale_reason"] = "problem_skipped"
+    cache["stale_at"] = _iso_now()
+    try:
+        _write_quick_review_cache(cache)
+    except Exception:
+        pass
+
+
+def _build_quick_review_cache_payload(set_num: str, bag_num: int) -> Dict[str, Any]:
+    set_text = str(set_num or "").strip()
+    bag_number = int(bag_num or 1)
+    report = _auto_batch_report_payload(set_num=set_text, bag_num=bag_number, generate_missing=0)
+    rows = [dict(row) for row in list(report.get("rows") or []) if isinstance(row, dict)]
+    problem_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        problems = _quick_review_problem_reasons(row)
+        if not problems:
+            continue
+        bundle_id = str(row.get("bundle_id") or "")
+        row["quick_review_problems"] = problems
+        row["review_url"] = _training_review_url(bundle_id, set_text, bag_number, 50)
+        row["generated_candidate_status"] = {
+            "generated_missing_candidates": bool(row.get("generated_missing_candidates")),
+            "generate_error": str(row.get("generate_error") or ""),
+            "split_candidates_exist": bool(row.get("split_candidates_exist")),
+            "split_candidate_count": int(row.get("split_candidate_count", 0) or 0),
+        }
+        problem_rows.append(row)
+    summary = dict(report.get("summary") or {})
+    summary["problem_bundle_count"] = len(problem_rows)
+    summary["skipped_problem_count"] = len(rows) - len(problem_rows) - int(summary.get("ready_count", 0) or 0)
+    next_bag_num, next_bag_url = _quick_review_next_bag_url(set_text, bag_number)
+    return {
+        "ok": True,
+        "debug_only": True,
+        "cache_version": 1,
+        "set_num": set_text,
+        "bag_num": bag_number,
+        "built_at": _iso_now(),
+        "stale": False,
+        "stale_reason": "",
+        "stale_at": "",
+        "summary": summary,
+        "problem_rows": problem_rows,
+        "next_bag_num": next_bag_num,
+        "next_bag_url": next_bag_url,
+        "report_summary": report.get("summary") or {},
+        "discovery_errors": report.get("discovery_errors") or [],
+    }
+
+
+@router.post("/debug/training-store/build-quick-review-cache")
+def training_store_build_quick_review_cache(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+):
+    payload = _build_quick_review_cache_payload(set_num, int(bag_num or 1))
+    cache_path = _write_quick_review_cache(payload)
+    payload["cache_path"] = str(cache_path)
+    return JSONResponse(payload)
+
+
+@router.post("/debug/training-store/quick-review-skip")
+def training_store_quick_review_skip(
+    bundle_id: str = Query(...),
+    reviewed_by: str = Query("andy"),
+):
+    safe_bundle_id = str(bundle_id or "").strip()
+    if not safe_bundle_id:
+        raise HTTPException(status_code=400, detail="bundle_id is required")
+    try:
+        artifact_debug = _training_bundle_artifact_debug(safe_bundle_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    metadata_path = Path(str(artifact_debug.get("metadata_path") or "").strip())
+    if not metadata_path.exists() or not metadata_path.is_file():
+        raise HTTPException(status_code=404, detail="metadata.json not found")
+    metadata = _auto_batch_manifest_for_bundle(safe_bundle_id, artifact_debug)
+    metadata["quick_review_skip"] = {
+        "skipped": True,
+        "skipped_by": str(reviewed_by or "andy"),
+        "skipped_at": _iso_now(),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+    _remove_quick_review_problem_from_cache(safe_bundle_id)
+    return JSONResponse({"ok": True, "bundle_id": safe_bundle_id, "quick_review_skip": metadata["quick_review_skip"]})
+
+
+@router.get("/debug/training-store/quick-review")
+def training_store_quick_review(
+    set_num: str = Query(...),
+    bag_num: int = Query(...),
+):
+    quick_review_started = time.perf_counter()
+    set_text = str(set_num or "").strip()
+    if not set_text:
+        raise HTTPException(status_code=400, detail="set_num is required")
+    bag_number = int(bag_num or 1)
+    cache_path = _quick_review_cache_path(set_text, bag_number)
+    cache = _read_quick_review_cache(set_text, bag_number)
+    quick_review_cache_load_ms = int((time.perf_counter() - quick_review_started) * 1000)
+    cache_exists = bool(cache)
+    problem_rows = [
+        dict(row)
+        for row in list(cache.get("problem_rows") or [])
+        if isinstance(row, dict)
+    ]
+    summary = dict(cache.get("summary") or {})
+    next_bag_num = cache.get("next_bag_num")
+    next_bag_url = str(cache.get("next_bag_url") or "")
+    cache_timestamp = str(cache.get("built_at") or "")
+    cache_stale = bool(cache.get("stale"))
+    cache_status_html = (
+        f'<div class="cache-status {"stale" if cache_stale else ""}">'
+        f'<span>Cache: {escape(cache_timestamp or "not built")}</span>'
+        f'<span>{escape("stale - " + str(cache.get("stale_reason") or "needs refresh") if cache_stale else "ready" if cache_exists else "missing")}</span>'
+        f'</div>'
+    )
+
+    problem_cards = []
+    for row in problem_rows:
+        bundle_id = str(row.get("bundle_id") or "")
+        review_url = str(row.get("review_url") or _training_review_url(bundle_id, set_text, bag_number, 50))
+        problem_text = ", ".join(str(item) for item in list(row.get("quick_review_problems") or []))
+        generated_status = row.get("generated_candidate_status") if isinstance(row.get("generated_candidate_status"), dict) else {}
+        generate_button = (
+            f'<button type="button" data-generate-missing="true" data-bundle-id="{escape(bundle_id)}">Generate missing candidates</button>'
+            if not bool(row.get("split_candidates_exist")) and bool(row.get("original_crop_exists")) and bool(row.get("raw_master_mask_exists")) and bool(row.get("postgres_row_exists"))
+            else ""
+        )
+        problem_cards.append(
+            '<article class="problem-card">'
+            f'<div><h3>{escape(bundle_id)}</h3><p>{escape(problem_text)}</p></div>'
+            '<dl>'
+            f'<div><dt>OCR boxes</dt><dd>{escape(str(row.get("direct_qty_ocr_boxes_count") or 0))}</dd></div>'
+            f'<div><dt>candidates</dt><dd>{escape(str(row.get("split_candidate_count") or 0))}</dd></div>'
+            f'<div><dt>accepted</dt><dd>{escape(str(row.get("accepted_count") or 0))}</dd></div>'
+            f'<div><dt>confirmed</dt><dd>{escape(str(row.get("confirmed_count") or 0))}</dd></div>'
+            '</dl>'
+            f'<div class="generated-status">generated: {escape("yes" if generated_status.get("generated_missing_candidates") else "no")} · error: {escape(str(generated_status.get("generate_error") or "none"))}</div>'
+            '<div class="problem-actions">'
+            f'<a href="{escape(review_url)}">Open Review</a>'
+            f'{generate_button}'
+            f'<button type="button" data-skip-problem="true" data-bundle-id="{escape(bundle_id)}">Mark as OK / Skip problem</button>'
+            '</div>'
+            '</article>'
+        )
+    problem_html = (
+        "".join(problem_cards)
+        if cache_exists
+        else '<div class="empty-state">No cache yet. Build the Quick Review cache to load problem bundles.</div>'
+    ) or '<div class="empty-state">No unresolved problem bundles in this bag.</div>'
+    next_bag_html = (
+        f'<a class="next-bag" href="{escape(next_bag_url)}">Open Next Bag {escape(str(next_bag_num))}</a>'
+        if cache_exists and not problem_rows and next_bag_url
+        else ""
+    )
+    summary_items = [
+        ("total bundles", summary.get("total_bundles", 0)),
+        ("ready", summary.get("ready_count", 0)),
+        ("problems", summary.get("problem_bundle_count", 0)),
+        ("missing OCR", summary.get("missing_ocr_count", 0)),
+        ("missing mask", summary.get("missing_mask_count", 0)),
+        ("missing candidates", summary.get("missing_candidates_count", 0)),
+        ("needs review", summary.get("needs_review_count", 0)),
+        ("failed", summary.get("failed_count", 0)),
+    ]
+    summary_html = "".join(
+        f'<div><span>{escape(label)}</span><strong>{escape(str(value))}</strong></div>'
+        for label, value in summary_items
+    )
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Quick Review {escape(set_text)} bag {escape(str(bag_number))}</title>
+  <style>
+    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#172026; background:#f5f7f8; }}
+    header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; padding:14px 18px; background:#18212b; color:white; }}
+    main {{ padding:18px; max-width:1180px; margin:0 auto; }}
+    .toolbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 14px; }}
+    .cache-status {{ display:flex; gap:10px; flex-wrap:wrap; color:#66727d; font-size:13px; }}
+    .cache-status.stale {{ color:#8a5a00; font-weight:700; }}
+    .summary {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin:0 0 18px; }}
+    .summary div {{ background:white; border:1px solid #d8dee3; border-radius:6px; padding:10px; }}
+    .summary span {{ display:block; color:#66727d; font-size:12px; }}
+    .summary strong {{ font-size:24px; }}
+    .problem-list {{ display:grid; gap:12px; }}
+    .problem-card {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:start; background:white; border:1px solid #d8dee3; border-radius:8px; padding:14px; }}
+    .problem-card h3 {{ margin:0 0 6px; font-size:18px; overflow-wrap:anywhere; }}
+    .problem-card p {{ margin:0; color:#8a5a00; font-weight:700; }}
+    .generated-status {{ grid-column:1 / -1; color:#66727d; font-size:12px; }}
+    dl {{ display:grid; grid-template-columns:repeat(4,86px); gap:8px; margin:0; }}
+    dl div {{ border:1px solid #e4e9ed; border-radius:6px; padding:7px; background:#f8fafb; }}
+    dt {{ color:#66727d; font-size:11px; }}
+    dd {{ margin:0; font-weight:800; }}
+    .problem-actions {{ grid-column:1 / -1; display:flex; gap:8px; flex-wrap:wrap; }}
+    a, button {{ display:inline-flex; align-items:center; justify-content:center; min-height:36px; box-sizing:border-box; padding:8px 12px; border:1px solid #1f6fc9; border-radius:6px; background:#1f6fc9; color:white; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; }}
+    button[data-skip-problem] {{ background:#f8fafb; color:#32465a; border-color:#c8d0d7; }}
+    button[data-generate-missing] {{ background:#755000; border-color:#755000; }}
+    .next-bag {{ background:#2f6c41; border-color:#2f6c41; margin-bottom:14px; }}
+    .empty-state {{ padding:22px; background:#eef6ef; border:1px solid #7db28a; border-radius:8px; color:#2f6c41; font-weight:800; }}
+    @media (max-width:760px) {{
+      .problem-card {{ grid-template-columns:1fr; }}
+      dl {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+    }}
+  </style>
+</head>
+<body>
+  <header><strong>Quick Review</strong><span>{escape(set_text)} bag {escape(str(bag_number))}</span></header>
+  <main>
+    <div class="toolbar">
+      {cache_status_html}
+      <button type="button" data-refresh-cache="true">{escape("Refresh / Rebuild Cache" if cache_exists else "Build Cache")}</button>
+    </div>
+    <section class="summary">{summary_html}</section>
+    {next_bag_html}
+    <section class="problem-list">{problem_html}</section>
+  </main>
+  <script>
+    const buildCacheUrl = '/debug/training-store/build-quick-review-cache?set_num={_url_quote(set_text)}&bag_num={int(bag_number)}';
+    async function rebuildQuickReviewCache(button) {{
+      if (button) {{
+        button.disabled = true;
+        button.textContent = 'Rebuilding...';
+      }}
+      const res = await fetch(buildCacheUrl, {{method: 'POST'}});
+      if (!res.ok) {{
+        alert(await res.text());
+        if (button) {{
+          button.disabled = false;
+          button.textContent = '{escape("Refresh / Rebuild Cache" if cache_exists else "Build Cache")}';
+        }}
+        return false;
+      }}
+      return true;
+    }}
+    document.querySelectorAll('[data-refresh-cache]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const ok = await rebuildQuickReviewCache(button);
+        if (ok) {{
+          location.reload();
+        }}
+      }});
+    }});
+    document.querySelectorAll('[data-generate-missing]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        button.disabled = true;
+        button.textContent = 'Generating...';
+        const bundleId = button.dataset.bundleId || '';
+        const res = await fetch('/debug/training-store/generate-split-candidates?bundle_id=' + encodeURIComponent(bundleId), {{method: 'POST'}});
+        if (!res.ok) {{
+          alert(await res.text());
+          button.disabled = false;
+          button.textContent = 'Generate missing candidates';
+          return;
+        }}
+        await rebuildQuickReviewCache(null);
+        location.reload();
+      }});
+    }});
+    document.querySelectorAll('[data-skip-problem]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const bundleId = button.dataset.bundleId || '';
+        const res = await fetch('/debug/training-store/quick-review-skip?bundle_id=' + encodeURIComponent(bundleId), {{method: 'POST'}});
+        if (!res.ok) {{
+          alert(await res.text());
+          return;
+        }}
+        location.reload();
+      }});
+    }});
+  </script>
+</body>
+</html>
+"""
+    quick_review_render_ms = int((time.perf_counter() - quick_review_started) * 1000)
+    print(
+        "[quick-review-cache] "
+        f"set_num={set_text} bag_num={bag_number} cache_path={cache_path} "
+        f"cache_exists={cache_exists} stale={cache_stale} "
+        f"quick_review_cache_load_ms={quick_review_cache_load_ms} "
+        f"quick_review_render_ms={quick_review_render_ms} "
+        f"quick_review_problem_count={len(problem_rows)}"
+    )
+    return HTMLResponse(html)
+
+
 def _parse_slot_indexes(value: Any) -> List[int]:
     if value is None:
         return []
@@ -5055,6 +6281,7 @@ async def training_store_approve_bundle(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "split_candidates_generated")
     return JSONResponse(result)
 
 
@@ -5079,6 +6306,7 @@ async def training_store_reject_bundle(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "split_candidate_accepted")
     return JSONResponse(result)
 
 
@@ -5090,6 +6318,7 @@ def training_store_prepare_r2_upload(bundle_id: str = Query(...)):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "split_candidate_rejected")
     return JSONResponse(result)
 
 
@@ -5109,6 +6338,7 @@ def training_store_upload_r2(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "candidate_review_state_changed")
     return JSONResponse(result)
 
 
@@ -5333,6 +6563,7 @@ async def training_store_review(req: Request):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(str(payload.get("bundle_id") or ""), "review_saved")
     return JSONResponse(result)
 
 
@@ -5447,7 +6678,1039 @@ def training_store_scrub_candidate_qty(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "candidate_qty_scrubbed")
     return JSONResponse(result)
+
+
+def _decode_png_data_url(data_url: Any) -> np.ndarray:
+    text = str(data_url or "").strip()
+    if "," in text:
+        text = text.split(",", 1)[1]
+    if not text:
+        return np.zeros((1, 1), dtype=np.uint8)
+    raw = base64.b64decode(text)
+    buffer = np.frombuffer(raw, dtype=np.uint8)
+    image = cv2.imdecode(buffer, cv2.IMREAD_UNCHANGED)
+    if image is None or getattr(image, "size", 0) == 0:
+        return np.zeros((1, 1), dtype=np.uint8)
+    if image.ndim == 3 and image.shape[2] >= 4:
+        return image[:, :, 3]
+    if image.ndim == 3:
+        return cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2GRAY)
+    return image
+
+
+def _update_candidate_in_split_paths(paths: Dict[str, Any], candidate_index: int, updated_candidate: Dict[str, Any]) -> Dict[str, Any]:
+    updated_paths = dict(paths or {})
+
+    def update_items(raw_items: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for pos, raw_item in enumerate(list(raw_items or [])):
+            item = dict(raw_item) if isinstance(raw_item, dict) else {}
+            item_index = _coerce_int(item.get("index"))
+            if item_index is None:
+                item_index = pos
+            if int(item_index) == int(candidate_index):
+                item.update(updated_candidate)
+            out.append(item)
+        return out
+
+    updated_paths["candidates"] = update_items(updated_paths.get("candidates"))
+    updated_paths["baseline_slot_candidates"] = update_items(updated_paths.get("baseline_slot_candidates"))
+    updated_paths["ai_suggested_candidates"] = update_items(updated_paths.get("ai_suggested_candidates"))
+    return updated_paths
+
+
+def _candidate_for_index_from_row(row: Dict[str, Any], candidate_index: int) -> Dict[str, Any]:
+    paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+    candidates = [
+        dict(item)
+        for item in list(paths.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    for pos, candidate in enumerate(candidates):
+        item_index = _coerce_int(candidate.get("index"))
+        if item_index is None:
+            item_index = pos
+        if int(item_index) == int(candidate_index):
+            return candidate
+    raise ValueError("candidate_index is out of range")
+
+
+def _alpha_debug_for_png(path_value: Any) -> Dict[str, Any]:
+    path = Path(str(path_value or "").strip())
+    if not path.exists() or not path.is_file():
+        return {
+            "path": str(path),
+            "exists": False,
+            "has_alpha": False,
+            "transparent_pixel_count": 0,
+            "opaque_pixel_count": 0,
+            "alpha_bbox": None,
+            "rgb_under_transparent_summary": {},
+            "likely_real_background_leak": False,
+        }
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None or getattr(image, "size", 0) == 0:
+        raise ValueError(f"image is unreadable: {path}")
+    has_alpha = bool(image.ndim == 3 and image.shape[2] >= 4)
+    if has_alpha:
+        alpha = image[:, :, 3]
+        rgb = image[:, :, :3]
+    else:
+        alpha = np.full(image.shape[:2], 255, dtype=np.uint8)
+        rgb = image[:, :, :3] if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    transparent_mask = alpha == 0
+    opaque_mask = alpha > 0
+    transparent_pixel_count = int(np.count_nonzero(transparent_mask))
+    opaque_pixel_count = int(np.count_nonzero(opaque_mask))
+    alpha_bbox = None
+    nz = cv2.findNonZero(opaque_mask.astype(np.uint8))
+    if nz is not None:
+        x, y, w, h = cv2.boundingRect(nz)
+        alpha_bbox = [int(x), int(y), int(w), int(h)]
+    rgb_under_transparent_summary: Dict[str, Any] = {
+        "sample_count": 0,
+        "nonzero_rgb_count": 0,
+        "max_rgb": [0, 0, 0],
+        "mean_rgb": [0.0, 0.0, 0.0],
+        "sample_rgb_values": [],
+    }
+    likely_real_background_leak = False
+    if transparent_pixel_count > 0:
+        transparent_rgb = rgb[transparent_mask]
+        nonzero_rgb = np.any(transparent_rgb > 0, axis=1)
+        nonzero_count = int(np.count_nonzero(nonzero_rgb))
+        sample_values = transparent_rgb[nonzero_rgb][:10].tolist() if nonzero_count else transparent_rgb[:10].tolist()
+        rgb_under_transparent_summary = {
+            "sample_count": int(transparent_rgb.shape[0]),
+            "nonzero_rgb_count": nonzero_count,
+            "max_rgb": [int(v) for v in np.max(transparent_rgb, axis=0).tolist()],
+            "mean_rgb": [round(float(v), 3) for v in np.mean(transparent_rgb, axis=0).tolist()],
+            "sample_rgb_values": [[int(channel) for channel in value] for value in sample_values],
+        }
+        likely_real_background_leak = nonzero_count > 0
+    return {
+        "path": str(path),
+        "exists": True,
+        "shape": [int(value) for value in image.shape],
+        "has_alpha": has_alpha,
+        "transparent_pixel_count": transparent_pixel_count,
+        "opaque_pixel_count": opaque_pixel_count,
+        "alpha_bbox": alpha_bbox,
+        "rgb_under_transparent_summary": rgb_under_transparent_summary,
+        "likely_real_background_leak": likely_real_background_leak,
+    }
+
+
+def _manual_mask_foreground_refinement(original: np.ndarray, amended_mask: np.ndarray) -> Dict[str, np.ndarray]:
+    _, constrained_mask = cv2.threshold(amended_mask, 127, 255, cv2.THRESH_BINARY)
+    cleanup_kernel = np.ones((3, 3), dtype=np.uint8)
+    constrained_mask = cv2.morphologyEx(constrained_mask, cv2.MORPH_CLOSE, cleanup_kernel)
+    constrained_mask = cv2.morphologyEx(constrained_mask, cv2.MORPH_OPEN, cleanup_kernel)
+    _, constrained_mask = cv2.threshold(constrained_mask, 127, 255, cv2.THRESH_BINARY)
+    if int(np.count_nonzero(constrained_mask)) == 0:
+        raise ValueError("amended mask is empty")
+
+    sure_kernel = np.ones((5, 5), dtype=np.uint8)
+    sure_foreground = cv2.erode(constrained_mask, sure_kernel, iterations=1)
+    if int(np.count_nonzero(sure_foreground)) == 0:
+        sure_foreground = constrained_mask.copy()
+
+    probable_background = cv2.dilate(constrained_mask, np.ones((9, 9), dtype=np.uint8), iterations=1)
+    grabcut_mask = np.full(constrained_mask.shape, cv2.GC_BGD, dtype=np.uint8)
+    grabcut_mask[probable_background > 0] = cv2.GC_PR_BGD
+    grabcut_mask[constrained_mask > 0] = cv2.GC_PR_FGD
+    grabcut_mask[sure_foreground > 0] = cv2.GC_FGD
+
+    refined_mask = constrained_mask.copy()
+    try:
+        bg_model = np.zeros((1, 65), dtype=np.float64)
+        fg_model = np.zeros((1, 65), dtype=np.float64)
+        cv2.grabCut(original, grabcut_mask, None, bg_model, fg_model, 4, cv2.GC_INIT_WITH_MASK)
+        refined_mask = np.where(
+            ((grabcut_mask == cv2.GC_FGD) | (grabcut_mask == cv2.GC_PR_FGD)) & (constrained_mask > 0),
+            255,
+            0,
+        ).astype(np.uint8)
+        if int(np.count_nonzero(refined_mask)) == 0:
+            refined_mask = constrained_mask.copy()
+    except Exception:
+        refined_mask = constrained_mask.copy()
+
+    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, cleanup_kernel)
+    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_CLOSE, cleanup_kernel)
+    _, refined_mask = cv2.threshold(refined_mask, 127, 255, cv2.THRESH_BINARY)
+    if int(np.count_nonzero(refined_mask)) == 0:
+        refined_mask = constrained_mask.copy()
+    refined_alpha = cv2.GaussianBlur(refined_mask, (3, 3), 0)
+    refined_alpha[refined_alpha < 16] = 0
+
+    trimap = np.zeros((*constrained_mask.shape, 3), dtype=np.uint8)
+    trimap[probable_background > 0] = [42, 42, 120]
+    trimap[constrained_mask > 0] = [0, 190, 220]
+    trimap[sure_foreground > 0] = [0, 190, 70]
+    return {
+        "constraint_mask": constrained_mask,
+        "refined_mask": refined_mask,
+        "refined_alpha": refined_alpha,
+        "trimap": trimap,
+    }
+
+
+def _manual_mask_output_path(
+    candidate: Dict[str, Any],
+    key: str,
+    bundle_dir: Path,
+    candidate_index: int,
+    suffix: str,
+) -> Path:
+    existing = str(candidate.get(key) or "").strip()
+    return Path(existing) if existing else bundle_dir / f"candidate_{int(candidate_index)}_{suffix}"
+
+
+def _remove_background_fringe_from_manual_mask(
+    original: np.ndarray,
+    alpha_mask: np.ndarray,
+    candidate_index: int,
+    bundle_dir: Path,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Two-pass background fringe removal for manually amended candidates.
+
+    Pass 1 — per-pixel colour removal:
+      Remove opaque pixels that are colour-close to the estimated background AND
+      do NOT sit on a strong local edge/texture. Edge protection uses Sobel magnitude
+      at the individual pixel (no dilation), so only pixels WITH a strong gradient
+      are kept — surrounding soft-edge halos are NOT protected.
+
+    Pass 2 — connected boundary fringe cleanup:
+      Any connected cluster of background-coloured pixels that still touches the
+      alpha boundary after pass 1 is removed, provided the cluster is small relative
+      to the total alpha area. This catches fringe rings that survive pass 1 because
+      they individually pass the colour test by a tiny margin.
+
+    Generic — background colour is estimated from the image border pixels.
+    Does NOT hardcode any colour.
+
+    Returns (cleaned_alpha, debug_info_dict).
+    """
+    h, w = original.shape[:2]
+    if h < 8 or w < 8 or int(np.count_nonzero(alpha_mask)) == 0:
+        return alpha_mask.copy(), {
+            "background_like_removed_pixels": 0,
+            "pass1_removed": 0,
+            "pass2_removed": 0,
+            "background_model_rgb": None,
+            "background_distance_threshold": None,
+            "background_spread": None,
+        }
+
+    # ── 1. Estimate background colour from outer border pixels ─────────────────
+    border_px = max(4, min(10, h // 8, w // 8))
+    border_samples_bgr = np.concatenate(
+        [
+            original[:border_px, :].reshape(-1, 3),
+            original[h - border_px:, :].reshape(-1, 3),
+            original[:, :border_px].reshape(-1, 3),
+            original[:, w - border_px:].reshape(-1, 3),
+        ],
+        axis=0,
+    ).astype(np.uint8)
+
+    border_lab = cv2.cvtColor(
+        border_samples_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB
+    ).reshape(-1, 3).astype(np.float32)
+
+    bg_lab = np.median(border_lab, axis=0)  # (L, a, b)
+    sample_dists = np.linalg.norm(border_lab - bg_lab, axis=1)
+    bg_spread = float(np.percentile(sample_dists, 85))
+
+    # Aggressive threshold — lower minimum, smaller spread multiplier
+    # min 18 LAB units; 1.5× spread (was 22 / 2.0 before)
+    dist_threshold = max(18.0, bg_spread * 1.5)
+
+    # ── 2. Per-pixel LAB distance from background ─────────────────────────────
+    img_lab = cv2.cvtColor(original, cv2.COLOR_BGR2LAB).astype(np.float32)
+    delta = img_lab - bg_lab[np.newaxis, np.newaxis, :]
+    pixel_dist = np.sqrt(np.sum(delta * delta, axis=2))  # (h, w)
+
+    # ── 3. Strong local edge protection (Sobel, per-pixel, NO dilation) ───────
+    # Only the pixel's own gradient determines protection — soft-edge halos
+    # around background colour patches are NOT protected.
+    gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gradient_mag = np.sqrt(sx * sx + sy * sy)
+    strong_local_edge = gradient_mag > 25.0  # only protect actual part edges/studs
+
+    # ── 4. Pass 1: per-pixel colour removal ───────────────────────────────────
+    is_bg_like_p1: np.ndarray = (
+        (pixel_dist < dist_threshold)
+        & (~strong_local_edge)
+        & (alpha_mask > 16)
+    )
+    pass1_removed = int(np.count_nonzero(is_bg_like_p1))
+    cleaned = alpha_mask.copy()
+    cleaned[is_bg_like_p1] = 0
+
+    # ── 5. Pass 2: connected boundary fringe cleanup ──────────────────────────
+    # Looser colour threshold for seeding clusters
+    dist_threshold_loose = max(28.0, bg_spread * 2.5)
+    total_alpha_pixels = int(np.count_nonzero(cleaned > 0))
+    # Cap: never remove a component larger than 12.5% of remaining alpha
+    max_component_px = max(60, total_alpha_pixels // 8)
+
+    fringe_candidates = ((pixel_dist < dist_threshold_loose) & (cleaned > 0)).astype(np.uint8)
+    pass2_removed = 0
+    pass2_remove_mask = np.zeros((h, w), dtype=bool)
+    if int(np.count_nonzero(fringe_candidates)) > 0:
+        # Alpha boundary: opaque pixels adjacent to transparent pixels
+        alpha_binary = (cleaned > 0).astype(np.uint8)
+        dilated_bg = cv2.dilate(
+            (alpha_binary == 0).astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+            iterations=1,
+        )
+        boundary_zone: np.ndarray = (alpha_binary > 0) & (dilated_bg > 0)
+
+        n_labels, labels = cv2.connectedComponents(fringe_candidates, connectivity=8)
+        # Find which labels touch the boundary zone
+        boundary_labels: set = set(int(v) for v in np.unique(labels[boundary_zone]))
+        boundary_labels.discard(0)
+
+        for lbl in boundary_labels:
+            comp_mask = labels == lbl
+            comp_size = int(np.count_nonzero(comp_mask))
+            if comp_size <= max_component_px:
+                pass2_remove_mask |= comp_mask
+                pass2_removed += comp_size
+
+        cleaned[pass2_remove_mask] = 0
+
+    total_removed = pass1_removed + pass2_removed
+
+    # ── 6. Background model → RGB for reporting ───────────────────────────────
+    bg_lab_u8 = np.clip(bg_lab, 0, 255).astype(np.uint8).reshape(1, 1, 3)
+    bg_bgr_u8 = cv2.cvtColor(bg_lab_u8, cv2.COLOR_LAB2BGR).reshape(3)
+    bg_rgb = [int(bg_bgr_u8[2]), int(bg_bgr_u8[1]), int(bg_bgr_u8[0])]
+
+    print(
+        f"[manual-bg-fringe] candidate={candidate_index}"
+        f" border_px={border_px} bg_rgb={bg_rgb}"
+        f" bg_spread={bg_spread:.1f} dist_threshold={dist_threshold:.1f}"
+        f" pass1={pass1_removed} pass2={pass2_removed} total={total_removed}"
+    )
+
+    # ── 7. Debug artifacts ────────────────────────────────────────────────────
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    cyan_bgr = np.array([200, 200, 0], dtype=np.float32)
+
+    # a) Sample preview: border strip tinted cyan
+    preview = original.copy().astype(np.float32)
+    for slc in (
+        np.s_[:border_px, :],
+        np.s_[h - border_px:, :],
+        np.s_[:, :border_px],
+        np.s_[:, w - border_px:],
+    ):
+        preview[slc] = preview[slc] * 0.5 + cyan_bgr * 0.5
+    preview_path = bundle_dir / f"candidate_{candidate_index}_edge_background_sample_preview.png"
+    cv2.imwrite(str(preview_path), preview.clip(0, 255).astype(np.uint8))
+
+    # b) Background likeness mask: bright = background-like; strong-edge pixels black
+    likeness_vis = np.clip(
+        255.0 * np.maximum(0.0, 1.0 - pixel_dist / max(dist_threshold, 1.0)), 0, 255
+    ).astype(np.uint8)
+    likeness_vis[strong_local_edge] = 0
+    likeness_path = bundle_dir / f"candidate_{candidate_index}_background_likeness_mask.png"
+    cv2.imwrite(str(likeness_path), likeness_vis)
+
+    # c) Removed-pixels overlay: pass1 = red, pass2 = magenta
+    minus_bg = original.copy().astype(np.float32)
+    if pass1_removed > 0:
+        minus_bg[is_bg_like_p1] = (
+            minus_bg[is_bg_like_p1] * 0.3 + np.array([0.0, 0.0, 220.0]) * 0.7
+        )
+    if pass2_removed > 0:
+        minus_bg[pass2_remove_mask] = (
+            minus_bg[pass2_remove_mask] * 0.3 + np.array([200.0, 0.0, 200.0]) * 0.7
+        )
+    minus_bg_path = bundle_dir / f"candidate_{candidate_index}_refined_minus_background_mask.png"
+    cv2.imwrite(str(minus_bg_path), minus_bg.clip(0, 255).astype(np.uint8))
+
+    return cleaned, {
+        "background_like_removed_pixels": total_removed,
+        "pass1_removed": pass1_removed,
+        "pass2_removed": pass2_removed,
+        "background_model_rgb": bg_rgb,
+        "background_distance_threshold": round(float(dist_threshold), 2),
+        "background_spread": round(float(bg_spread), 2),
+        "bg_fringe_preview_path": str(preview_path),
+        "bg_likeness_mask_path": str(likeness_path),
+        "bg_minus_mask_path": str(minus_bg_path),
+    }
+
+
+_CANDIDATE_QTY_CLEAN_STATES = {"auto_scrubbed", "not_needed", "manual_mark_clean", "not_detected", "scrubbed"}
+
+
+def _candidate_qty_is_clean(candidate: Dict[str, Any]) -> bool:
+    """Return True if the candidate's qty text is in a clean-enough state to accept."""
+    if not bool(candidate.get("qty_detected")):
+        return True
+    if str(candidate.get("qty_text_state") or "") in _CANDIDATE_QTY_CLEAN_STATES:
+        return True
+    # Legacy: qty_scrubbed_path present
+    if str(candidate.get("qty_scrubbed_path") or "").strip():
+        return True
+    return False
+
+
+def _candidate_display_path(candidate: Dict[str, Any]) -> str:
+    """Return the best current image path for display / tool input."""
+    return str(
+        candidate.get("current_candidate_path")
+        or candidate.get("colour_cleanup_path")
+        or candidate.get("manual_amended_candidate_path")
+        or candidate.get("qty_scrubbed_path")
+        or candidate.get("candidate_path")
+        or ""
+    )
+
+
+def _write_manual_refinement_outputs(
+    *,
+    row: Dict[str, Any],
+    candidate: Dict[str, Any],
+    candidate_index: int,
+    original: np.ndarray,
+    amended_mask: np.ndarray,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    height, width = original.shape[:2]
+    refinement = _manual_mask_foreground_refinement(original, amended_mask)
+    final_binary_mask = refinement["constraint_mask"]
+    refined_mask = refinement["refined_mask"]
+    final_alpha_mask = refinement["refined_alpha"]
+    trimap = refinement["trimap"]
+    nz = cv2.findNonZero((refined_mask > 0).astype(np.uint8))
+    if nz is None:
+        raise ValueError("amended mask is empty")
+    bx, by, bw, bh = cv2.boundingRect(nz)
+    pad = 6
+    tx = max(0, bx - pad)
+    ty = max(0, by - pad)
+    tx2 = min(width, bx + bw + pad)
+    ty2 = min(height, by + bh + pad)
+    amended_box = [tx, ty, tx2 - tx, ty2 - ty]
+
+    bundle_dir = _training_review_metadata_path(row).parent
+
+    # Background fringe removal — generic, colour-estimated from crop border pixels
+    _bg_fringe_debug: Dict[str, Any] = {}
+    try:
+        final_alpha_mask, _bg_fringe_debug = _remove_background_fringe_from_manual_mask(
+            original=original,
+            alpha_mask=final_alpha_mask,
+            candidate_index=candidate_index,
+            bundle_dir=bundle_dir,
+        )
+        # Keep refined_mask binary consistent with cleaned alpha
+        refined_mask = refined_mask.copy()
+        refined_mask[final_alpha_mask == 0] = 0
+    except Exception as _exc:
+        print(f"[manual-bg-fringe] candidate={candidate_index} error={_exc}")
+
+    alpha_path = _manual_mask_output_path(candidate, "manual_mask_alpha_path", bundle_dir, candidate_index, "manual_mask_alpha.png")
+    refined_mask_path = _manual_mask_output_path(candidate, "manual_refined_mask_path", bundle_dir, candidate_index, "manual_refined_mask.png")
+    trimap_path = _manual_mask_output_path(candidate, "manual_trimap_path", bundle_dir, candidate_index, "manual_trimap.png")
+    refined_overlay_path = _manual_mask_output_path(candidate, "manual_refined_overlay_path", bundle_dir, candidate_index, "manual_refined_overlay.png")
+    amended_candidate_path = _manual_mask_output_path(candidate, "manual_amended_candidate_path", bundle_dir, candidate_index, "manual_amended.png")
+    amended_mask_path = _manual_mask_output_path(candidate, "manual_amended_mask_path", bundle_dir, candidate_index, "manual_amended_mask.png")
+
+    cv2.imwrite(str(alpha_path), final_alpha_mask)
+    cv2.imwrite(str(refined_mask_path), refined_mask)
+    cv2.imwrite(str(trimap_path), trimap)
+    refined_overlay = original.copy()
+    refined_overlay_colour = np.zeros_like(original)
+    refined_overlay_colour[:, :, 0] = 40
+    refined_overlay_colour[:, :, 1] = 210
+    refined_overlay_colour[:, :, 2] = 40
+    refined_overlay_mask = refined_mask > 0
+    refined_overlay[refined_overlay_mask] = cv2.addWeighted(original[refined_overlay_mask], 0.62, refined_overlay_colour[refined_overlay_mask], 0.38, 0)
+    cv2.imwrite(str(refined_overlay_path), refined_overlay)
+
+    crop_original = original[ty:ty2, tx:tx2]
+    crop_binary_mask = refined_mask[ty:ty2, tx:tx2]
+    crop_alpha_mask = final_alpha_mask[ty:ty2, tx:tx2]
+    bgra = cv2.cvtColor(crop_original, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = crop_alpha_mask
+    bgra[crop_alpha_mask == 0, 0:3] = 0
+    cv2.imwrite(str(amended_candidate_path), bgra)
+    cv2.imwrite(str(amended_mask_path), crop_binary_mask)
+
+    version = int(_coerce_int(candidate.get("manual_refinement_version")) or 0) + 1
+    refined_at = _iso_now()
+    updated_candidate = dict(candidate)
+    # Preserve base_candidate_path (original crop, never changes)
+    updated_candidate.setdefault("base_candidate_path", str(candidate.get("candidate_path") or ""))
+    updated_candidate.setdefault("original_candidate_path", str(candidate.get("candidate_path") or ""))
+    updated_candidate.setdefault("original_mask_path", str(candidate.get("mask_path") or ""))
+    updated_candidate.setdefault("original_thumbnail_path", str(candidate.get("thumbnail_path") or ""))
+    updated_candidate["box"] = amended_box
+    # Do NOT overwrite candidate_path — it stays as the original crop (base)
+    updated_candidate["mask_path"] = str(amended_mask_path)
+    updated_candidate["thumbnail_path"] = str(amended_candidate_path)
+    updated_candidate["current_candidate_path"] = str(amended_candidate_path)
+    updated_candidate["current_alpha_path"] = str(alpha_path)
+    updated_candidate["mask_review_state"] = "mask_amended"
+    updated_candidate["manual_mask_alpha_path"] = str(alpha_path)
+    updated_candidate["manual_refined_mask_path"] = str(refined_mask_path)
+    updated_candidate["manual_trimap_path"] = str(trimap_path)
+    updated_candidate["manual_refined_overlay_path"] = str(refined_overlay_path)
+    updated_candidate["manual_amended_candidate_path"] = str(amended_candidate_path)
+    updated_candidate["manual_amended_mask_path"] = str(amended_mask_path)
+    updated_candidate["manual_refined_at"] = refined_at
+    updated_candidate["manual_refinement_version"] = version
+    updated_candidate["review_state"] = "mask_amended"
+    updated_candidate["qty_scrubbed_path"] = ""
+    updated_candidate["qty_scrubbed_mask_path"] = ""
+    if bool(updated_candidate.get("qty_detected")):
+        updated_candidate["qty_scrub_status"] = "manual_amended_needs_qty_scrub"
+        updated_candidate["qty_text_state"] = "manual_amended_needs_qty_scrub"
+    history = list(updated_candidate.get("cleanup_history") or [])
+    history.append({"op": "manual_amend", "path": str(amended_candidate_path), "at": refined_at})
+    updated_candidate["cleanup_history"] = history
+    # Store background fringe metrics so candidate-alpha-debug can report them
+    updated_candidate["manual_bg_removed_pixels"] = int(_bg_fringe_debug.get("background_like_removed_pixels") or 0)
+    updated_candidate["manual_bg_pass1_removed"] = int(_bg_fringe_debug.get("pass1_removed") or 0)
+    updated_candidate["manual_bg_pass2_removed"] = int(_bg_fringe_debug.get("pass2_removed") or 0)
+    updated_candidate["manual_bg_model_rgb"] = _bg_fringe_debug.get("background_model_rgb")
+    updated_candidate["manual_bg_dist_threshold"] = _bg_fringe_debug.get("background_distance_threshold")
+    updated_candidate["manual_bg_fringe_preview_path"] = str(_bg_fringe_debug.get("bg_fringe_preview_path") or "")
+    updated_candidate["manual_bg_likeness_mask_path"] = str(_bg_fringe_debug.get("bg_likeness_mask_path") or "")
+    updated_candidate["manual_bg_minus_mask_path"] = str(_bg_fringe_debug.get("bg_minus_mask_path") or "")
+    return updated_candidate, {
+        "manual_mask_alpha_path": str(alpha_path),
+        "manual_refined_mask_path": str(refined_mask_path),
+        "manual_trimap_path": str(trimap_path),
+        "manual_refined_overlay_path": str(refined_overlay_path),
+        "manual_amended_candidate_path": str(amended_candidate_path),
+        "manual_amended_mask_path": str(amended_mask_path),
+        "manual_refined_at": refined_at,
+        "manual_refinement_version": version,
+        "background_like_removed_pixels": int(_bg_fringe_debug.get("background_like_removed_pixels") or 0),
+        "background_model_rgb": _bg_fringe_debug.get("background_model_rgb"),
+        "background_distance_threshold": _bg_fringe_debug.get("background_distance_threshold"),
+        "bg_fringe_preview_path": str(_bg_fringe_debug.get("bg_fringe_preview_path") or ""),
+        "bg_likeness_mask_path": str(_bg_fringe_debug.get("bg_likeness_mask_path") or ""),
+        "bg_minus_mask_path": str(_bg_fringe_debug.get("bg_minus_mask_path") or ""),
+    }
+
+
+@router.get("/debug/training-store/candidate-alpha-debug")
+def training_store_candidate_alpha_debug(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+):
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        candidate = _candidate_for_index_from_row(row, int(candidate_index))
+        candidate_path = _candidate_display_path(candidate)
+        amend_path = str(candidate.get("manual_mask_amend_path") or "")
+        alpha_path = str(candidate.get("manual_mask_alpha_path") or "")
+        refined_path = str(candidate.get("manual_refined_mask_path") or "")
+        result = _alpha_debug_for_png(candidate_path)
+        opaque_background_like_pixel_count = 0
+        refined_foreground_pixel_count = 0
+        if refined_path:
+            refined_image = cv2.imread(refined_path, cv2.IMREAD_GRAYSCALE)
+            candidate_image = cv2.imread(candidate_path, cv2.IMREAD_UNCHANGED)
+            candidate_box = [int(_coerce_int(value) or 0) for value in list(candidate.get("box") or [])[:4]]
+            if (
+                refined_image is not None
+                and candidate_image is not None
+                and candidate_image.ndim == 3
+                and candidate_image.shape[2] >= 4
+                and len(candidate_box) == 4
+            ):
+                x, y, w, h = candidate_box
+                crop_refined = refined_image[y : y + h, x : x + w]
+                alpha = candidate_image[:, :, 3]
+                if crop_refined.shape[:2] != alpha.shape[:2]:
+                    crop_refined = cv2.resize(crop_refined, (alpha.shape[1], alpha.shape[0]), interpolation=cv2.INTER_NEAREST)
+                refined_foreground_pixel_count = int(np.count_nonzero(crop_refined > 0))
+                opaque_background_like_pixel_count = int(np.count_nonzero((alpha >= 192) & (crop_refined <= 0)))
+        result.update(
+            {
+                "ok": True,
+                "bundle_id": str(bundle_id or ""),
+                "candidate_index": int(candidate_index),
+                "candidate_path": candidate_path,
+                "background_like_removed_pixels": int(candidate.get("manual_bg_removed_pixels") or 0),
+                "pass1_removed": int(candidate.get("manual_bg_pass1_removed") or 0),
+                "pass2_removed": int(candidate.get("manual_bg_pass2_removed") or 0),
+                "background_model_rgb": candidate.get("manual_bg_model_rgb"),
+                "background_distance_threshold": candidate.get("manual_bg_dist_threshold"),
+                "bg_fringe_preview_path": str(candidate.get("manual_bg_fringe_preview_path") or ""),
+                "bg_likeness_mask_path": str(candidate.get("manual_bg_likeness_mask_path") or ""),
+                "bg_minus_mask_path": str(candidate.get("manual_bg_minus_mask_path") or ""),
+                "manual_mask_amend_path": amend_path,
+                "manual_mask_alpha_path": alpha_path,
+                "manual_refined_mask_path": refined_path,
+                "manual_mask_amend_debug": _alpha_debug_for_png(amend_path) if amend_path else {},
+                "manual_mask_alpha_debug": _alpha_debug_for_png(alpha_path) if alpha_path else {},
+                "opaque_background_like_pixel_count": opaque_background_like_pixel_count,
+                "refined_foreground_pixel_count": refined_foreground_pixel_count,
+            }
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/debug/training-store/save-manual-mask-amendment")
+async def training_store_save_manual_mask_amendment(req: Request):
+    try:
+        payload = await req.json()
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    bundle_id = str(payload.get("bundle_id") or "").strip()
+    candidate_index = _coerce_int(payload.get("candidate_index"))
+    amended_by = str(payload.get("amended_by") or "andy").strip() or "andy"
+    if not bundle_id or candidate_index is None:
+        raise HTTPException(status_code=400, detail="bundle_id and candidate_index are required")
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        metadata = _read_training_review_metadata(row)
+        copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
+        original_path = Path(str(copied_files.get("original_crop") or "").strip())
+        if not original_path.exists() or not original_path.is_file():
+            raise FileNotFoundError("original crop not found")
+        original = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+        if original is None or getattr(original, "size", 0) == 0:
+            raise ValueError("original crop is unreadable")
+        height, width = original.shape[:2]
+        paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+        candidates = [
+            dict(item)
+            for item in list(paths.get("candidates") or [])
+            if isinstance(item, dict)
+        ]
+        candidate: Optional[Dict[str, Any]] = None
+        for pos, item in enumerate(candidates):
+            item_index = _coerce_int(item.get("index"))
+            if item_index is None:
+                item_index = pos
+            if int(item_index) == int(candidate_index):
+                candidate = dict(item)
+                break
+        if candidate is None:
+            raise ValueError("candidate_index is out of range")
+        box = [int(_coerce_int(value) or 0) for value in list(candidate.get("box") or [])[:4]]
+        if len(box) != 4:
+            raise ValueError("candidate box is missing")
+        x, y, w, h = box
+        x = max(0, min(width - 1, x))
+        y = max(0, min(height - 1, y))
+        w = max(1, min(width - x, w))
+        h = max(1, min(height - y, h))
+        current_full_mask = np.zeros((height, width), dtype=np.uint8)
+        mask_path = Path(str(candidate.get("mask_path") or "").strip())
+        if mask_path.exists() and mask_path.is_file():
+            current_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        else:
+            current_mask = None
+        if current_mask is None or getattr(current_mask, "size", 0) == 0:
+            candidate_path = Path(str(candidate.get("candidate_path") or "").strip())
+            candidate_image = cv2.imread(str(candidate_path), cv2.IMREAD_UNCHANGED) if candidate_path.exists() else None
+            if candidate_image is not None and candidate_image.ndim == 3 and candidate_image.shape[2] >= 4:
+                current_mask = candidate_image[:, :, 3]
+        if current_mask is not None and getattr(current_mask, "size", 0) > 0:
+            if current_mask.shape[:2] != (h, w):
+                current_mask = cv2.resize(current_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            current_full_mask[y : y + h, x : x + w] = (current_mask > 0).astype(np.uint8) * 255
+        add_mask = _decode_png_data_url(payload.get("add_mask_data_url"))
+        erase_mask = _decode_png_data_url(payload.get("erase_mask_data_url"))
+        if add_mask.shape[:2] != (height, width):
+            add_mask = cv2.resize(add_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        if erase_mask.shape[:2] != (height, width):
+            erase_mask = cv2.resize(erase_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        _, add_binary = cv2.threshold(add_mask, 16, 255, cv2.THRESH_BINARY)
+        _, erase_binary = cv2.threshold(erase_mask, 16, 255, cv2.THRESH_BINARY)
+        _, base_binary = cv2.threshold(current_full_mask, 16, 255, cv2.THRESH_BINARY)
+        combined_mask = base_binary.copy()
+        combined_mask[add_binary > 0] = 255
+        combined_mask[erase_binary > 0] = 0
+        bundle_dir = _training_review_metadata_path(row).parent
+        amend_path = bundle_dir / f"candidate_{int(candidate_index)}_manual_mask_amend.png"
+        base_path = bundle_dir / f"candidate_{int(candidate_index)}_manual_mask_base.png"
+        overlay_path = bundle_dir / f"candidate_{int(candidate_index)}_manual_mask_overlay.png"
+        add_path = bundle_dir / f"candidate_{int(candidate_index)}_manual_mask_add.png"
+        erase_path = bundle_dir / f"candidate_{int(candidate_index)}_manual_mask_erase.png"
+        cv2.imwrite(str(amend_path), combined_mask)
+        cv2.imwrite(str(base_path), base_binary)
+        cv2.imwrite(str(add_path), add_binary)
+        cv2.imwrite(str(erase_path), erase_binary)
+        overlay = original.copy()
+        overlay_colour = np.zeros_like(original)
+        overlay_colour[:, :, 1] = 210
+        overlay_colour[:, :, 2] = 70
+        overlay_mask = combined_mask > 0
+        overlay[overlay_mask] = cv2.addWeighted(original[overlay_mask], 0.62, overlay_colour[overlay_mask], 0.38, 0)
+        cv2.imwrite(str(overlay_path), overlay)
+        updated_candidate, refinement_paths = _write_manual_refinement_outputs(
+            row=row,
+            candidate=candidate,
+            candidate_index=int(candidate_index),
+            original=original,
+            amended_mask=combined_mask,
+        )
+        updated_candidate["manual_mask_amend_path"] = str(amend_path)
+        updated_candidate["manual_mask_base_path"] = str(base_path)
+        updated_candidate["manual_mask_overlay_path"] = str(overlay_path)
+        updated_candidate["manual_mask_add_path"] = str(add_path)
+        updated_candidate["manual_mask_erase_path"] = str(erase_path)
+        updated_candidate["amended_by"] = amended_by
+        updated_candidate["amended_at"] = _iso_now()
+        updated_paths = _update_candidate_in_split_paths(paths, int(candidate_index), updated_candidate)
+        stored = update_split_candidates(bundle_id, split_candidate_paths=updated_paths)
+        _mark_quick_review_cache_stale_for_bundle(bundle_id, "manual_mask_amended")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(
+        {
+            "ok": True,
+            "bundle_id": bundle_id,
+            "candidate_index": int(candidate_index),
+            "review_state": "mask_amended",
+            "manual_mask_amend_path": str(amend_path),
+            "manual_mask_base_path": str(base_path),
+            "manual_mask_overlay_path": str(overlay_path),
+            **refinement_paths,
+            "row": stored.get("row"),
+        }
+    )
+
+
+@router.post("/debug/training-store/rerun-manual-mask-refinement")
+async def training_store_rerun_manual_mask_refinement(req: Request):
+    try:
+        payload = await req.json()
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    query = dict(req.query_params)
+    bundle_id = str(payload.get("bundle_id") or query.get("bundle_id") or "").strip()
+    candidate_index = _coerce_int(payload.get("candidate_index", query.get("candidate_index")))
+    if not bundle_id or candidate_index is None:
+        raise HTTPException(status_code=400, detail="bundle_id and candidate_index are required")
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        metadata = _read_training_review_metadata(row)
+        copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
+        original_path = Path(str(copied_files.get("original_crop") or "").strip())
+        if not original_path.exists() or not original_path.is_file():
+            raise FileNotFoundError("original crop not found")
+        original = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+        if original is None or getattr(original, "size", 0) == 0:
+            raise ValueError("original crop is unreadable")
+        height, width = original.shape[:2]
+        paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+        candidate = _candidate_for_index_from_row(row, int(candidate_index))
+
+        def read_full_mask(path_value: Any) -> Optional[np.ndarray]:
+            path = Path(str(path_value or "").strip())
+            if not path.exists() or not path.is_file():
+                return None
+            mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if mask is None or getattr(mask, "size", 0) == 0:
+                return None
+            if mask.shape[:2] != (height, width):
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            _, mask = cv2.threshold(mask, 16, 255, cv2.THRESH_BINARY)
+            return mask
+
+        base_mask = read_full_mask(candidate.get("manual_mask_base_path"))
+        add_mask = read_full_mask(candidate.get("manual_mask_add_path"))
+        erase_mask = read_full_mask(candidate.get("manual_mask_erase_path"))
+        amend_mask = read_full_mask(candidate.get("manual_mask_amend_path"))
+        if base_mask is not None:
+            combined_mask = base_mask.copy()
+            if add_mask is not None:
+                combined_mask[add_mask > 0] = 255
+            if erase_mask is not None:
+                combined_mask[erase_mask > 0] = 0
+        elif amend_mask is not None:
+            combined_mask = amend_mask.copy()
+        else:
+            raise ValueError("manual amendment masks are missing")
+
+        updated_candidate, refinement_paths = _write_manual_refinement_outputs(
+            row=row,
+            candidate=candidate,
+            candidate_index=int(candidate_index),
+            original=original,
+            amended_mask=combined_mask,
+        )
+        updated_candidate["manual_refined_by"] = str(payload.get("refined_by") or "andy").strip() or "andy"
+        updated_paths = _update_candidate_in_split_paths(paths, int(candidate_index), updated_candidate)
+        stored = update_split_candidates(bundle_id, split_candidate_paths=updated_paths)
+        _mark_quick_review_cache_stale_for_bundle(bundle_id, "manual_refinement_rerun")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(
+        {
+            "ok": True,
+            "bundle_id": bundle_id,
+            "candidate_index": int(candidate_index),
+            "review_state": "mask_amended",
+            **refinement_paths,
+            "row": stored.get("row"),
+        }
+    )
+
+
+@router.post("/debug/training-store/save-picked-colour-cleanup")
+async def training_store_save_picked_colour_cleanup(req: Request):
+    """
+    Remove alpha pixels in the current candidate that are colour-close to the
+    user-picked RGB, while preserving pixels on strong edges/texture.
+
+    Inputs (JSON body):
+      bundle_id       : str
+      candidate_index : int
+      picked_rgb      : [r, g, b]   (0–255 each)
+      tolerance       : float        (LAB ΔE distance, 5–80)
+    """
+    try:
+        payload = await req.json()
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    bundle_id = str(payload.get("bundle_id") or "").strip()
+    candidate_index = _coerce_int(payload.get("candidate_index"))
+    picked_rgb_raw = payload.get("picked_rgb")
+    tolerance_raw = payload.get("tolerance")
+
+    if not bundle_id or candidate_index is None:
+        raise HTTPException(status_code=400, detail="bundle_id and candidate_index are required")
+    if not isinstance(picked_rgb_raw, (list, tuple)) or len(picked_rgb_raw) < 3:
+        raise HTTPException(status_code=400, detail="picked_rgb must be [r, g, b]")
+    try:
+        picked_bgr = [int(picked_rgb_raw[2]), int(picked_rgb_raw[1]), int(picked_rgb_raw[0])]
+        picked_rgb = [int(picked_rgb_raw[0]), int(picked_rgb_raw[1]), int(picked_rgb_raw[2])]
+        tolerance = float(tolerance_raw if tolerance_raw is not None else 22.0)
+        tolerance = max(5.0, min(80.0, tolerance))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid parameters: {exc}")
+
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        metadata = _read_training_review_metadata(row)
+        copied_files = metadata.get("copied_files") if isinstance(metadata.get("copied_files"), dict) else {}
+        original_path = Path(str(copied_files.get("original_crop") or "").strip())
+        if not original_path.exists() or not original_path.is_file():
+            raise FileNotFoundError("original crop not found")
+        original_bgr = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+        if original_bgr is None or getattr(original_bgr, "size", 0) == 0:
+            raise ValueError("original crop is unreadable")
+
+        candidate = _candidate_for_index_from_row(row, int(candidate_index))
+        # Read the CURRENT candidate PNG (uses current_candidate_path if available)
+        candidate_img_path = Path(_candidate_display_path(candidate))
+        if not candidate_img_path.exists() or not candidate_img_path.is_file():
+            raise FileNotFoundError(f"candidate image not found: {candidate_img_path}")
+
+        candidate_bgra = cv2.imread(str(candidate_img_path), cv2.IMREAD_UNCHANGED)
+        if candidate_bgra is None or getattr(candidate_bgra, "size", 0) == 0:
+            raise ValueError("candidate image is unreadable")
+        if candidate_bgra.ndim < 3 or candidate_bgra.shape[2] < 4:
+            raise ValueError("candidate image has no alpha channel")
+
+        c_h, c_w = candidate_bgra.shape[:2]
+        alpha = candidate_bgra[:, :, 3].copy()
+        rgb_pixels = candidate_bgra[:, :, :3]  # BGR
+
+        # ── candidate box for cropping the original to the same region ──
+        candidate_box = [int(_coerce_int(v) or 0) for v in list(candidate.get("box") or [])[:4]]
+        if len(candidate_box) == 4:
+            bx, by, bw, bh = candidate_box
+            original_crop_region = original_bgr[by:by+bh, bx:bx+bw]
+            if original_crop_region.shape[:2] != (c_h, c_w):
+                original_crop_region = cv2.resize(original_crop_region, (c_w, c_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            original_crop_region = cv2.resize(original_bgr, (c_w, c_h), interpolation=cv2.INTER_LINEAR)
+
+        # ── per-pixel LAB distance from picked colour ──
+        picked_bgr_u8 = np.array([[picked_bgr]], dtype=np.uint8)
+        picked_lab = cv2.cvtColor(picked_bgr_u8, cv2.COLOR_BGR2LAB).reshape(3).astype(np.float32)
+
+        img_lab = cv2.cvtColor(rgb_pixels, cv2.COLOR_BGR2LAB).astype(np.float32)
+        delta = img_lab - picked_lab[np.newaxis, np.newaxis, :]
+        pixel_dist = np.sqrt(np.sum(delta * delta, axis=2))  # (h, w)
+
+        # ── strong local edge protection (Sobel on original crop region) ──
+        gray_orig = cv2.cvtColor(original_crop_region, cv2.COLOR_BGR2GRAY)
+        sx_g = cv2.Sobel(gray_orig, cv2.CV_32F, 1, 0, ksize=3)
+        sy_g = cv2.Sobel(gray_orig, cv2.CV_32F, 0, 1, ksize=3)
+        gradient_mag = np.sqrt(sx_g * sx_g + sy_g * sy_g)
+        strong_edge = gradient_mag > 25.0
+
+        # ── removal mask: colour-close AND not a strong edge AND currently opaque ──
+        remove_mask: np.ndarray = (
+            (pixel_dist < tolerance)
+            & (~strong_edge)
+            & (alpha > 16)
+        )
+        removed_count = int(np.count_nonzero(remove_mask))
+
+        # ── apply removal ──
+        cleaned_alpha = alpha.copy()
+        cleaned_alpha[remove_mask] = 0
+
+        # ── save outputs ──
+        bundle_dir = _training_review_metadata_path(row).parent
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+
+        cleanup_path = bundle_dir / f"candidate_{candidate_index}_colour_cleanup.png"
+        cleanup_mask_path = bundle_dir / f"candidate_{candidate_index}_colour_cleanup_mask.png"
+        cleanup_alpha_path = bundle_dir / f"candidate_{candidate_index}_colour_cleanup_alpha.png"
+        cleanup_overlay_path = bundle_dir / f"candidate_{candidate_index}_colour_cleanup_overlay.png"
+
+        # Cleaned candidate BGRA
+        cleaned_bgra = candidate_bgra.copy()
+        cleaned_bgra[:, :, 3] = cleaned_alpha
+        cleaned_bgra[cleaned_alpha == 0, 0:3] = 0
+        cv2.imwrite(str(cleanup_path), cleaned_bgra)
+
+        # Binary cleanup mask (255 = removed pixel) — debug / overlay only
+        cleanup_mask_img = (remove_mask.astype(np.uint8) * 255)
+        cv2.imwrite(str(cleanup_mask_path), cleanup_mask_img)
+
+        # Current alpha mask (255 = remaining opaque pixel) — used by match scoring
+        cv2.imwrite(str(cleanup_alpha_path), cleaned_alpha)
+
+        # Overlay: original crop with removed pixels tinted magenta
+        overlay = original_crop_region.copy().astype(np.float32)
+        if removed_count > 0:
+            overlay[remove_mask] = (
+                overlay[remove_mask] * 0.3
+                + np.array([180.0, 30.0, 180.0]) * 0.7
+            )
+        cv2.imwrite(str(cleanup_overlay_path), overlay.clip(0, 255).astype(np.uint8))
+
+        print(
+            f"[picked-colour-cleanup] bundle={bundle_id} candidate={candidate_index}"
+            f" picked_rgb={picked_rgb} tolerance={tolerance:.1f}"
+            f" removed={removed_count}"
+        )
+
+        # ── update candidate record ──
+        paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+        now = _iso_now()
+        updated_candidate = dict(candidate)
+        # current_candidate_path advances; candidate_path (base) never changes
+        updated_candidate["current_candidate_path"] = str(cleanup_path)
+        updated_candidate["current_alpha_path"] = str(cleanup_alpha_path)   # remaining alpha, not removed-pixels
+        updated_candidate["thumbnail_path"] = str(cleanup_path)
+        updated_candidate["colour_cleanup_path"] = str(cleanup_path)
+        updated_candidate["colour_cleanup_alpha_path"] = str(cleanup_alpha_path)
+        updated_candidate["colour_cleanup_mask_path"] = str(cleanup_mask_path)
+        updated_candidate["colour_cleanup_overlay_path"] = str(cleanup_overlay_path)
+        updated_candidate["colour_cleanup_picked_rgb"] = picked_rgb
+        updated_candidate["colour_cleanup_tolerance"] = round(tolerance, 2)
+        updated_candidate["colour_cleanup_removed_pixels"] = removed_count
+        updated_candidate["colour_cleanup_at"] = now
+        history = list(updated_candidate.get("cleanup_history") or [])
+        history.append({"op": "colour_cleanup", "path": str(cleanup_path), "at": now})
+        updated_candidate["cleanup_history"] = history
+
+        updated_paths = _update_candidate_in_split_paths(paths, int(candidate_index), updated_candidate)
+        stored = update_split_candidates(bundle_id, split_candidate_paths=updated_paths)
+        _mark_quick_review_cache_stale_for_bundle(bundle_id, "colour_cleanup")
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return JSONResponse({
+        "ok": True,
+        "bundle_id": bundle_id,
+        "candidate_index": int(candidate_index),
+        "picked_rgb": picked_rgb,
+        "tolerance": round(tolerance, 2),
+        "removed_pixels": removed_count,
+        "cleanup_path": str(cleanup_path),
+        "cleanup_mask_path": str(cleanup_mask_path),
+        "cleanup_overlay_path": str(cleanup_overlay_path),
+    })
+
+
+@router.post("/debug/training-store/mark-qty-clean")
+async def training_store_mark_qty_clean(req: Request):
+    """
+    Mark a candidate's qty text as clean without running an image scrub.
+    Used when the qty token is already invisible / outside the alpha region
+    after manual amend, and re-scrubbing would be redundant.
+
+    Inputs (JSON body or query params):
+      bundle_id       : str
+      candidate_index : int
+    """
+    try:
+        body = await req.json()
+        payload = dict(body) if isinstance(body, dict) else {}
+    except Exception:
+        payload = {}
+    query = dict(req.query_params)
+    bundle_id = str(payload.get("bundle_id") or query.get("bundle_id") or "").strip()
+    candidate_index_raw = payload.get("candidate_index", query.get("candidate_index"))
+    try:
+        candidate_index = int(candidate_index_raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="candidate_index is required")
+    if not bundle_id:
+        raise HTTPException(status_code=400, detail="bundle_id is required")
+
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+        paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+        candidates = list(paths.get("candidates") or [])
+        if candidate_index < 0 or candidate_index >= len(candidates):
+            raise ValueError("candidate_index is out of range")
+        candidate = dict(candidates[candidate_index]) if isinstance(candidates[candidate_index], dict) else {}
+        now = _iso_now()
+        updated_candidate = dict(candidate)
+        updated_candidate["qty_text_state"] = "manual_mark_clean"
+        updated_candidate["qty_scrub_status"] = "manual_mark_clean"
+        history = list(updated_candidate.get("cleanup_history") or [])
+        history.append({"op": "mark_qty_clean", "at": now})
+        updated_candidate["cleanup_history"] = history
+        updated_paths = _update_candidate_in_split_paths(paths, int(candidate_index), updated_candidate)
+        stored = update_split_candidates(bundle_id, split_candidate_paths=updated_paths)
+        _mark_quick_review_cache_stale_for_bundle(bundle_id, "mark_qty_clean")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return JSONResponse({
+        "ok": True,
+        "bundle_id": bundle_id,
+        "candidate_index": int(candidate_index),
+        "qty_text_state": "manual_mark_clean",
+    })
 
 
 @router.post("/debug/training-store/confirm-candidate-part")
@@ -5488,17 +7751,15 @@ async def training_store_confirm_candidate_part(req: Request):
             raise ValueError("candidate_index is out of range")
         if str(candidate.get("status") or "") != "accepted":
             raise ValueError("candidate must be accepted before part confirmation")
-        if bool(candidate.get("qty_detected")) and not str(candidate.get("qty_scrubbed_path") or "").strip():
-            raise ValueError("candidate must be qty-scrubbed before part confirmation")
+        if not _candidate_qty_is_clean(candidate):
+            raise ValueError("candidate must be qty-clean before part confirmation; scrub qty or use Mark Qty Clean")
         qty_values = list(candidate.get("qty_values") or [])
         qty = payload.get("qty", query.get("qty"))
         if qty in {None, ""} and qty_values:
             qty = qty_values[0]
         thumbnail_path = str(
             payload.get("thumbnail_path")
-            or candidate.get("qty_scrubbed_path")
-            or candidate.get("thumbnail_path")
-            or candidate.get("candidate_path")
+            or _candidate_display_path(candidate)
             or ""
         )
         result = confirm_candidate_part(
@@ -5539,6 +7800,7 @@ async def training_store_confirm_candidate_part(req: Request):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "candidate_confirmed")
     return JSONResponse(result)
 
 
@@ -5551,6 +7813,7 @@ def training_store_unconfirm_candidate_part(
         result = unconfirm_candidate_part(bundle_id=bundle_id, candidate_index=candidate_index)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    _mark_quick_review_cache_stale_for_bundle(bundle_id, "candidate_unconfirmed")
     return JSONResponse(result)
 
 
@@ -5603,6 +7866,156 @@ def training_store_reset_bag(
     )
 
 
+@router.get("/debug/dev/find-obsolete-candidates")
+def dev_find_obsolete_candidates(
+    set_num: str = Query(""),
+    bag_num: str = Query(""),
+    limit: int = Query(200),
+):
+    """
+    Scans stored candidate JSON across all (or filtered) bundles and reports:
+    - candidates missing current_candidate_path
+    - candidates where current_alpha_path points to the old removed-pixels mask
+      (i.e. colour_cleanup_mask_path == current_alpha_path)
+    - candidates with legacy fields but no base_candidate_path
+    - orphaned debug overlay files on disk
+    - duplicate intermediate files (e.g. amended + cleanup both present)
+
+    Read-only. Does NOT delete or modify anything.
+    """
+    set_filter = str(set_num or "").strip()
+    bag_filter = _coerce_int(bag_num) if str(bag_num or "").strip() else None
+    limit_val = max(1, min(int(limit or 200), 500))
+
+    queue_result = list_review_queue(set_num=set_filter, bag_num=bag_filter, limit=limit_val)
+    bundle_rows = [dict(r) for r in list(queue_result.get("rows") or []) if isinstance(r, dict)]
+
+    # ── orphan overlay patterns (files written but not displayed in main UI) ──
+    _ORPHAN_SUFFIXES = [
+        "_background_likeness_mask.png",
+        "_refined_minus_background_mask.png",
+        "_manual_trimap.png",
+        "_manual_refined_overlay.png",
+        "_colour_cleanup_overlay.png",
+    ]
+
+    missing_current_candidate_path: List[Dict[str, Any]] = []
+    wrong_alpha_path: List[Dict[str, Any]] = []
+    missing_base_candidate_path: List[Dict[str, Any]] = []
+    has_legacy_only_fields: List[Dict[str, Any]] = []
+    duplicate_intermediates: List[Dict[str, Any]] = []
+    orphaned_overlays: List[Dict[str, Any]] = []
+
+    analysis_root = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug" / "ai_training" / "analysis_bundles"
+    ).resolve()
+
+    for b_row in bundle_rows:
+        bundle_id = str(b_row.get("bundle_id") or "")
+        paths = b_row.get("split_candidate_paths") if isinstance(b_row.get("split_candidate_paths"), dict) else {}
+        candidates = [dict(c) for c in list(paths.get("candidates") or []) if isinstance(c, dict)]
+
+        # Per-candidate checks
+        for c in candidates:
+            cidx = c.get("index")
+            entry = {"bundle_id": bundle_id, "candidate_index": cidx}
+
+            # 1. Missing current_candidate_path
+            if not str(c.get("current_candidate_path") or "").strip():
+                missing_current_candidate_path.append({
+                    **entry,
+                    "candidate_path": str(c.get("candidate_path") or ""),
+                    "has_manual_amended": bool(c.get("manual_amended_candidate_path")),
+                    "has_qty_scrubbed": bool(c.get("qty_scrubbed_path")),
+                })
+
+            # 2. current_alpha_path points to the removed-pixels mask (wrong)
+            cur_alpha = str(c.get("current_alpha_path") or "")
+            cleanup_mask = str(c.get("colour_cleanup_mask_path") or "")
+            if cur_alpha and cleanup_mask and cur_alpha == cleanup_mask:
+                wrong_alpha_path.append({
+                    **entry,
+                    "current_alpha_path": cur_alpha,
+                    "colour_cleanup_alpha_path": str(c.get("colour_cleanup_alpha_path") or ""),
+                    "note": "current_alpha_path == colour_cleanup_mask_path (removed-pixels mask); should be colour_cleanup_alpha_path",
+                })
+
+            # 3. Missing base_candidate_path
+            if not str(c.get("base_candidate_path") or "").strip():
+                missing_base_candidate_path.append({
+                    **entry,
+                    "candidate_path": str(c.get("candidate_path") or ""),
+                    "note": "pre-refactor bundle; base_candidate_path not set",
+                })
+
+            # 4. Has original_candidate_path but no base_candidate_path (pre-refactor legacy)
+            if str(c.get("original_candidate_path") or "").strip() and not str(c.get("base_candidate_path") or "").strip():
+                has_legacy_only_fields.append({
+                    **entry,
+                    "original_candidate_path": str(c.get("original_candidate_path") or ""),
+                    "note": "original_candidate_path present; base_candidate_path absent",
+                })
+
+            # 5. Both manual_amended_candidate_path and colour_cleanup_path present
+            #    (cleanup supersedes amend; amended file may be orphaned)
+            if str(c.get("manual_amended_candidate_path") or "").strip() and str(c.get("colour_cleanup_path") or "").strip():
+                duplicate_intermediates.append({
+                    **entry,
+                    "manual_amended_candidate_path": str(c.get("manual_amended_candidate_path") or ""),
+                    "colour_cleanup_path": str(c.get("colour_cleanup_path") or ""),
+                    "current_candidate_path": str(c.get("current_candidate_path") or ""),
+                    "note": "both amend and cleanup outputs exist; current_candidate_path should point to cleanup",
+                })
+
+        # Per-bundle: scan for orphaned overlay files on disk
+        bundle_dir = analysis_root / bundle_id
+        if bundle_dir.exists() and bundle_dir.is_dir():
+            for suffix in _ORPHAN_SUFFIXES:
+                for f in sorted(bundle_dir.glob(f"*{suffix}")):
+                    # Only flag if no candidate currently references it
+                    path_str = str(f)
+                    referenced = any(
+                        path_str in (
+                            str(c.get("manual_bg_likeness_mask_path") or ""),
+                            str(c.get("manual_bg_fringe_preview_path") or ""),
+                            str(c.get("manual_bg_minus_mask_path") or ""),
+                            str(c.get("manual_trimap_path") or ""),
+                            str(c.get("manual_refined_overlay_path") or ""),
+                            str(c.get("colour_cleanup_overlay_path") or ""),
+                        )
+                        for c in candidates
+                    )
+                    orphaned_overlays.append({
+                        "bundle_id": bundle_id,
+                        "file": path_str,
+                        "size_bytes": f.stat().st_size,
+                        "referenced_in_candidate": referenced,
+                    })
+
+    summary = {
+        "bundles_scanned": len(bundle_rows),
+        "missing_current_candidate_path": len(missing_current_candidate_path),
+        "wrong_alpha_path": len(wrong_alpha_path),
+        "missing_base_candidate_path": len(missing_base_candidate_path),
+        "has_legacy_only_fields": len(has_legacy_only_fields),
+        "duplicate_intermediates": len(duplicate_intermediates),
+        "orphaned_overlays": len(orphaned_overlays),
+    }
+    return JSONResponse({
+        "ok": True,
+        "filter": {"set_num": set_filter or None, "bag_num": bag_filter, "limit": limit_val},
+        "summary": summary,
+        "missing_current_candidate_path": missing_current_candidate_path,
+        "wrong_alpha_path": wrong_alpha_path,
+        "missing_base_candidate_path": missing_base_candidate_path,
+        "has_legacy_only_fields": has_legacy_only_fields,
+        "duplicate_intermediates": duplicate_intermediates,
+        "orphaned_overlays": orphaned_overlays,
+        "note": "Read-only scan. Nothing was deleted or modified.",
+    })
+
+
 def _training_review_metadata_path(row: Dict[str, Any]) -> Path:
     manifest_path = Path(str(row.get("manifest_path") or "").strip())
     if manifest_path.exists() and manifest_path.is_file():
@@ -5635,6 +8048,19 @@ def _training_review_img(path_value: Any, alt: str) -> str:
         return '<div class="missing">missing</div>'
     src = f"/debug/ai-snap-artifact?path={_url_quote(path_text)}"
     return f'<img src="{src}" alt="{escape(alt)}" loading="lazy">'
+
+
+def _training_review_alpha_compare(path_value: Any, alt: str) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return '<div class="missing">missing</div>'
+    src = f"/debug/ai-snap-artifact?path={_url_quote(path_text)}"
+    labels = [("checkerboard", "checker"), ("black", "black"), ("white", "white")]
+    panels = "".join(
+        f'<div class="alpha-preview {escape(class_name)}"><img src="{src}" alt="{escape(alt + " on " + label)}" loading="lazy"><span>{escape(label)}</span></div>'
+        for label, class_name in labels
+    )
+    return f'<div class="alpha-preview-grid">{panels}</div>'
 
 
 def _training_review_catalog_img(path_value: Any, alt: str) -> str:
@@ -5680,8 +8106,15 @@ def _training_review_candidate_part_matches(
         if parsed:
             set_num = str(parsed.group("set") or "")
             bag = _coerce_int(parsed.group("bag")) or bag
-    thumbnail_path = str(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path") or "").strip()
-    mask_path = str(candidate.get("qty_scrubbed_mask_path") or candidate.get("mask_path") or "").strip()
+    thumbnail_path = str(_candidate_display_path(candidate) or candidate.get("thumbnail_path") or "").strip()
+    # Prefer the dedicated alpha files (not the "removed pixels" debug mask)
+    mask_path = str(
+        candidate.get("colour_cleanup_alpha_path")
+        or candidate.get("current_alpha_path")
+        or candidate.get("qty_scrubbed_mask_path")
+        or candidate.get("mask_path")
+        or ""
+    ).strip()
     if not set_num or not thumbnail_path:
         return []
     query_profile = _slot_mask_query_profile(thumbnail_path, mask_path)
@@ -6113,20 +8546,64 @@ def training_store_review_ui(
         "needs_mask_expand": "Needs Mask Expand",
         "needs_ocr_review": "Needs OCR Review",
         "needs_manual_crop": "Needs Manual Crop",
+        "mask_amended": "Mask Amended",
     }
+
+    def _manual_refinement_meta(candidate: Dict[str, Any]) -> str:
+        if not str(candidate.get("manual_mask_amend_path") or "").strip():
+            return ""
+        version = str(candidate.get("manual_refinement_version") or "n/a")
+        refined_at = str(candidate.get("manual_refined_at") or "")
+        refined_text = f"Refinement: v{version}" + (f" · {refined_at}" if refined_at else "")
+        return f'<br>{escape(refined_text)}'
+
+    def _rerun_refinement_button(candidate: Dict[str, Any], index: int) -> str:
+        if not str(candidate.get("manual_mask_amend_path") or "").strip():
+            return ""
+        return (
+            f'<button type="button" data-rerun-refinement="true" '
+            f'data-candidate-index="{escape(str(candidate.get("index", index)))}">Re-run Refinement</button>'
+        )
+
+    def _pick_colour_button(candidate: Dict[str, Any], index: int) -> str:
+        img_path = _candidate_display_path(candidate)
+        if not img_path:
+            return ""
+        return (
+            f'<button type="button" class="clnup-open-btn" '
+            f'data-pick-colour="true" '
+            f'data-candidate-index="{escape(str(candidate.get("index", index)))}" '
+            f'data-candidate-img-path="{escape(img_path)}">Pick Background Colour</button>'
+        )
+
+    def _mark_qty_clean_button(candidate: Dict[str, Any], index: int) -> str:
+        if not bool(candidate.get("qty_detected")):
+            return ""
+        if _candidate_qty_is_clean(candidate):
+            return ""
+        return (
+            f'<button type="button" '
+            f'data-candidate-index="{escape(str(candidate.get("index", index)))}" '
+            f'data-candidate-action="mark_qty_clean" '
+            f'title="Mark qty text as already clean — no scrub needed">Mark Qty Clean</button>'
+        )
 
     def _render_candidate_cards(candidates: List[Dict[str, Any]]) -> str:
         return "".join(
             (
                 f'<figure class="split-candidate-card {escape("has-review-state" if str(candidate.get("review_state") or "") else "")}">'
-                f'<div class="slot-img split-candidate-img">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+                f'<div class="slot-img split-candidate-img">{_training_review_alpha_compare(_candidate_display_path(candidate), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
                 f'<figcaption><strong>Candidate {escape(str(_candidate_display_index(candidate, index)))}</strong><span>{escape(review_state_labels.get(str(candidate.get("review_state") or ""), str(candidate.get("status") or "pending")))}</span></figcaption>'
-                f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}<br>Qty scrub: {escape(str(candidate.get("qty_scrub_status") or "not run"))}</div>'
+                f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}<br>Qty scrub: {escape(str(candidate.get("qty_scrub_status") or "not run"))}{_manual_refinement_meta(candidate)}</div>'
                 f'<div class="candidate-actions">'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Scrub Qty</button>'
+                f'{_mark_qty_clean_button(candidate, index)}'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_mask_expand">Needs Mask Expand</button>'
+                f'<button type="button" data-amend-mask="true" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-original-path="{escape(str(copied_files.get("original_crop") or ""))}" data-mask-path="{escape(str(candidate.get("mask_path") or ""))}" data-candidate-box="{escape(json.dumps(list(candidate.get("box") or [])))}">Amend Mask</button>'
+                f'{_rerun_refinement_button(candidate, index)}'
+                f'{_pick_colour_button(candidate, index)}'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_ocr_review">Needs OCR Review</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_manual_crop">Needs Manual Crop</button>'
                 f'</div>'
@@ -6140,14 +8617,16 @@ def training_store_review_ui(
     legacy_split_candidate_html = "".join(
         (
             f'<figure>'
-            f'<div class="slot-img">{_training_review_img(candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+            f'<div class="slot-img">{_training_review_alpha_compare(candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
             f'<figcaption>Candidate {escape(str(_candidate_display_index(candidate, index)))} · {escape(str(candidate.get("status") or "pending"))}</figcaption>'
-            f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}</div>'
+            f'<div class="candidate-meta">OCR/qty detected: {escape("yes" if candidate.get("qty_detected") else "no")}<br>Qty value: {escape(", ".join(str(v) for v in list(candidate.get("qty_values") or [])) or "n/a")}{_manual_refinement_meta(candidate)}</div>'
             f'<div class="candidate-actions">'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Needs Qty Scrub / Scrub Qty</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_mask_expand">Needs Mask Expand</button>'
+            f'<button type="button" data-amend-mask="true" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-original-path="{escape(str(copied_files.get("original_crop") or ""))}" data-mask-path="{escape(str(candidate.get("mask_path") or ""))}" data-candidate-box="{escape(json.dumps(list(candidate.get("box") or [])))}">Amend Mask</button>'
+            f'{_rerun_refinement_button(candidate, index)}'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_ocr_review">Needs OCR Review</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_manual_crop">Needs Manual Crop</button>'
             f'</div>'
@@ -6192,7 +8671,7 @@ def training_store_review_ui(
             )
         )
         and not str(candidate.get("review_state") or "").strip()
-        and (not bool(candidate.get("qty_detected")) or bool(str(candidate.get("qty_scrubbed_path") or "").strip()))
+        and _candidate_qty_is_clean(candidate)
     ]
     selected_set_num = str((selected or {}).get("set_num") or (metadata.get("set_num") if isinstance(metadata, dict) else "") or set_num or "")
     selected_bag_num = _coerce_int((selected or {}).get("bag_num") or (metadata.get("bag") if isinstance(metadata, dict) else None))
@@ -6226,37 +8705,25 @@ def training_store_review_ui(
         scope="bag",
         confirmed_totals=set_confirmed_totals,
     ) if selected_set_num else []
+    next_pending_payload: Dict[str, Any] = {}
     next_pending_href = ""
+    next_bag_href = ""
+    current_bag_complete = False
+    next_bag_num = None
     if selected_set_num and selected_bag_num is not None:
         try:
-            pending_queue = list_review_queue(
-                review_status="pending",
+            next_pending_payload = _next_pending_bundle_payload(
                 set_num=selected_set_num,
                 bag_num=selected_bag_num,
-                limit=500,
+                current_bundle_id=selected_bundle_id,
+                limit=int(limit or 50),
             )
-            pending_rows = [
-                dict(row)
-                for row in list(pending_queue.get("rows") or [])
-                if isinstance(row, dict)
-            ]
+            next_pending_href = str(next_pending_payload.get("next_url") or "")
+            next_bag_href = str(next_pending_payload.get("next_bag_url") or "")
+            current_bag_complete = bool(next_pending_payload.get("current_bag_complete"))
+            next_bag_num = next_pending_payload.get("next_bag_num")
         except Exception:
-            pending_rows = []
-        pending_bundle_ids = [str(row.get("bundle_id") or "") for row in pending_rows]
-        next_pending_row: Optional[Dict[str, Any]] = None
-        if selected_bundle_id in pending_bundle_ids:
-            selected_queue_index = pending_bundle_ids.index(selected_bundle_id)
-            if selected_queue_index + 1 < len(pending_rows):
-                next_pending_row = pending_rows[selected_queue_index + 1]
-        elif pending_rows:
-            next_pending_row = pending_rows[0]
-        if next_pending_row:
-            next_pending_bundle_id = str(next_pending_row.get("bundle_id") or "")
-            next_pending_href = (
-                f"/debug/training-store/review-ui?bundle_id={_url_quote(next_pending_bundle_id)}"
-                f"&review_status=pending&set_num={_url_quote(selected_set_num)}"
-                f"&bag_num={_url_quote(str(int(selected_bag_num)))}&limit={int(limit or 50)}"
-            )
+            next_pending_payload = {}
     step_href = ""
     if selected_set_num and selected_bag_num is not None and selected_page_num and selected_step_num:
         step_href = (
@@ -6303,10 +8770,12 @@ def training_store_review_ui(
         '<label><input type="checkbox" data-required-current-colour="true"> Current colour</label>'
         '<label><input type="checkbox" data-required-show-completed="true"> Show already completed</label>'
         '</div></div>'
-        f'<div class="inventory-debug-counts">full_set_part_count: <strong>{escape(str(len(full_set_part_rows)))}</strong> · '
+        '<details class="inventory-debug-counts"><summary>Debug counts</summary>'
+        f'full_set_part_count: <strong>{escape(str(len(full_set_part_rows)))}</strong> · '
         f'full_bag_part_count: <strong>{escape(str(len(full_bag_part_rows)))}</strong> · '
         '<span>rendered_match_count: <strong data-rendered-match-count>0</strong></span> · '
-        '<span>hidden_due_to_limit_count: <strong data-hidden-due-limit-count>0</strong></span></div>'
+        '<span>hidden_due_to_limit_count: <strong data-hidden-due-limit-count>0</strong></span>'
+        '</details>'
         '<div class="required-parts-table-wrap"><table class="required-parts-table">'
         '<thead><tr><th>image</th><th>part_num</th><th>color_id</th><th>color_name</th><th>element_id</th><th>Set qty</th><th>Confirmed qty</th><th>Remaining qty</th></tr></thead>'
         f'<tbody>{required_parts_rows_html}</tbody>'
@@ -6437,7 +8906,7 @@ def training_store_review_ui(
         if not suggestion_html:
             suggestion_html = '<div class="missing">No required-part matches available.</div>'
         match_debug_html = (
-            f'<div class="match-debug" data-match-debug="true" '
+            f'<details class="match-debug" data-match-debug="true" '
             f'data-total-matches="{escape(str(len(matches)))}" '
             f'data-full-set-part-count="{escape(str(len(full_set_part_rows)))}" '
             f'data-full-bag-part-count="{escape(str(len(full_bag_part_rows)))}" '
@@ -6446,6 +8915,7 @@ def training_store_review_ui(
             f'data-hidden-due-to-limit-count="0" '
             f'data-selected-color-id="{escape(initial_selected_color_text)}" '
             f'data-filtered-match-count="{escape(str(initial_filtered_count))}">'
+            f'<summary>Debug counts</summary>'
             f'full_set_part_count: {escape(str(len(full_set_part_rows)))} · '
             f'full_bag_part_count: {escape(str(len(full_bag_part_rows)))} · '
             f'rendered_match_count: <span data-rendered-match-count-local>{escape(str(server_total_card_count))}</span> · '
@@ -6456,7 +8926,7 @@ def training_store_review_ui(
             f'total_cards_in_DOM: <span data-dom-total-card-count>{escape(str(server_total_card_count))}</span> · '
             f'cards_with_data_part_color_id_308: <span data-dom-color-308-count>{escape(str(server_color_308_count))}</span> · '
             f'visible_cards_after_clicking_color_308: <span data-dom-visible-after-308-count>{escape(str(server_color_308_count))}</span>'
-            f'</div>'
+            f'</details>'
         )
         unconfirm_html = (
             f'<button type="button" class="unconfirm-btn" data-unconfirm-candidate="{escape(str(candidate_index))}">Unconfirm part</button>'
@@ -6474,7 +8944,7 @@ def training_store_review_ui(
             f'</div>'
             f'<div class="candidate-workspace">'
             f'<div class="candidate-preview-panel">'
-            f'<div class="confirm-thumb" data-confirm-thumb="true">{_training_review_img(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
+            f'<div class="confirm-thumb" data-confirm-thumb="true">{_training_review_alpha_compare(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path"), "Candidate " + str(_candidate_display_index(candidate, index)))}</div>'
             f'<div class="candidate-preview-meta">'
             f'<span><strong>Qty</strong> {escape(", ".join(str(v) for v in qty_values) or "n/a")}</span>'
             f'<span><strong>State</strong> {escape(display_status)}</span>'
@@ -6507,7 +8977,37 @@ def training_store_review_ui(
         if next_pending_href
         else '<button type="button" class="top-action-link" data-next-pending="true">Next pending</button>'
     )
+    next_bag_button_html = (
+        f'<a class="top-action-link next-bag-link" data-next-bag="true" href="{escape(next_bag_href)}">Open Next Bag</a>'
+        if current_bag_complete and next_bag_href
+        else '<button type="button" class="top-action-link next-bag-link hidden" data-next-bag="true">Open Next Bag</button>'
+    )
+    bag_audit_href = (
+        f"/debug/training-store/bag-completion-audit?set_num={_url_quote(selected_set_num)}&bag_num={int(selected_bag_num or 1)}"
+        if selected_set_num and selected_bag_num is not None
+        else ""
+    )
+    bag_audit_link_html = (
+        f'<a class="top-action-link" href="{escape(bag_audit_href)}" target="_blank" rel="noopener">Open Bag Audit</a>'
+        if bag_audit_href
+        else ""
+    )
+    bag_complete_html = (
+        '<div class="bag-complete-banner" data-bag-complete-banner="true">'
+        f'Bag complete{escape(" - next bag " + str(next_bag_num) + " is available" if next_bag_num else "")}.'
+        f'{(" " + bag_audit_link_html) if bag_audit_link_html else ""}'
+        '</div>'
+        if current_bag_complete
+        else '<div class="bag-complete-banner hidden" data-bag-complete-banner="true">Bag complete.</div>'
+    )
+    bag_audit_href_js = json.dumps(bag_audit_href)
     next_pending_url_js = json.dumps(next_pending_href)
+    next_pending_endpoint_js = json.dumps(
+        f"/debug/training-store/next-pending-bundle?set_num={_url_quote(selected_set_num)}"
+        f"&bag_num={_url_quote(str(selected_bag_num or ''))}"
+        f"&current_bundle_id={_url_quote(selected_bundle_id)}"
+    )
+    next_bag_url_js = json.dumps(next_bag_href)
     html = f"""
 <!doctype html>
 <html>
@@ -6527,6 +9027,9 @@ def training_store_review_ui(
     .title-row h2 {{ margin:0; min-width:0; overflow-wrap:anywhere; }}
     .top-actions {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
     .top-action-link {{ display:inline-flex; align-items:center; justify-content:center; min-height:36px; box-sizing:border-box; padding:8px 12px; border:1px solid #1f6fc9; border-radius:6px; background:#1f6fc9; color:white; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; white-space:nowrap; }}
+    .next-bag-link {{ background:#2f6c41; border-color:#2f6c41; }}
+    .bag-complete-banner {{ margin:0 0 12px; padding:10px 12px; border:1px solid #7db28a; border-radius:6px; background:#eef6ef; color:#2f6c41; font-weight:700; }}
+    .bag-complete-banner a {{ color:#2f6c41; margin-left:8px; }}
     .meta {{ display:grid; grid-template-columns:repeat(5,minmax(90px,1fr)); gap:8px; margin-bottom:14px; }}
     .meta div {{ background:white; border:1px solid #d8dee3; border-radius:6px; padding:8px; }}
     .label {{ display:block; color:#66727d; font-size:12px; }}
@@ -6548,9 +9051,17 @@ def training_store_review_ui(
     .split-candidate-card.has-review-state figcaption span {{ color:#8a5a00; font-weight:700; }}
     .split-candidate-img {{ min-height:132px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:repeating-conic-gradient(#f0f2f3 0 25%, #fff 0 50%) 50% / 20px 20px; }}
     .split-candidate-img img {{ max-height:118px; max-width:150px; object-fit:contain; background:transparent; }}
+    .alpha-preview-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; width:100%; }}
+    .alpha-preview {{ min-height:96px; display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden; border:1px solid #d8dee3; border-radius:6px; }}
+    .alpha-preview.checker {{ background:repeating-conic-gradient(#d9dee3 0 25%, #fff 0 50%) 50% / 18px 18px; }}
+    .alpha-preview.black {{ background:#050505; }}
+    .alpha-preview.white {{ background:#fff; }}
+    .alpha-preview img {{ max-width:100%; max-height:108px; object-fit:contain; background:transparent; }}
+    .alpha-preview span {{ position:absolute; left:4px; bottom:4px; padding:2px 4px; border-radius:4px; background:rgba(15,24,33,.72); color:white; font-size:10px; line-height:1; }}
     .candidate-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-top:8px; }}
     .candidate-actions button {{ padding:8px 9px; font-size:12px; min-width:0; white-space:normal; line-height:1.15; }}
     .candidate-actions button[data-candidate-action="scrub"] {{ grid-column:1 / -1; }}
+    .candidate-actions button[data-candidate-action="mark_qty_clean"] {{ background:#f0fff4; border-color:#3a9a60; color:#1a5c38; }}
     .candidate-actions button[data-candidate-action^="needs_"] {{ background:#fff8e8; border-color:#d59a20; color:#755000; }}
     .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
     .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:18px; margin-top:10px; }}
@@ -6570,6 +9081,9 @@ def training_store_review_ui(
     .confirm-thumb.picker-active {{ outline:2px solid #cf1f1f; cursor:crosshair; }}
     .confirm-thumb.picker-active img {{ cursor:crosshair; }}
     .confirm-thumb img {{ max-height:210px; max-width:230px; object-fit:contain; background:transparent; }}
+    .confirm-thumb .alpha-preview-grid {{ max-width:100%; }}
+    .confirm-thumb .alpha-preview {{ min-height:190px; }}
+    .confirm-thumb .alpha-preview img {{ max-height:178px; max-width:100%; }}
     .candidate-preview-meta {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }}
     .candidate-preview-meta span {{ border:1px solid #e4e9ed; border-radius:6px; padding:8px; color:#66727d; font-size:12px; background:#f8fafb; }}
     .candidate-preview-meta strong {{ display:block; color:#172026; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }}
@@ -6616,10 +9130,62 @@ def training_store_review_ui(
     .usage-thumb {{ width:58px; height:58px; display:flex; align-items:center; justify-content:center; border:1px solid #e4e9ed; border-radius:6px; background:#f8fafb; overflow:hidden; }}
     .usage-thumb img {{ max-width:56px; max-height:56px; object-fit:contain; background:transparent; }}
     .usage-empty {{ padding:18px; color:#66727d; }}
+    .mask-amend-backdrop {{ position:fixed; inset:0; z-index:90; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(15,24,33,.62); }}
+    .mask-amend-backdrop.open {{ display:flex; }}
+    .mask-amend-modal {{ width:min(1180px, calc(100vw - 36px)); max-height:calc(100vh - 36px); display:grid; grid-template-rows:auto auto minmax(0,1fr); overflow:hidden; background:white; border-radius:8px; box-shadow:0 18px 48px rgba(15,24,33,.32); }}
+    .mask-amend-head, .mask-amend-tools {{ display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; padding:12px 14px; border-bottom:1px solid #d8dee3; }}
+    .mask-amend-head h3 {{ margin:0; font-size:18px; }}
+    .mask-amend-tools label {{ display:inline-flex; align-items:center; gap:6px; color:#32465a; font-size:13px; }}
+    .mask-tool.active {{ background:#2f6c41; border-color:#2f6c41; }}
+    .mask-amend-stage-wrap {{ overflow:auto; padding:14px; background:#f4f7fb; }}
+    .mask-amend-stage {{ position:relative; display:inline-block; line-height:0; background:#111; }}
+    .mask-amend-stage canvas {{ display:block; max-width:min(100%, 1080px); height:auto; }}
+    .mask-amend-layer {{ position:absolute; inset:0; }}
+    .mask-amend-close {{ background:#f8fafb; color:#32465a; border-color:#c8d0d7; }}
+    /* ── colour cleanup picker modal ──────────────────────────────────────── */
+    .clnup-backdrop {{ position:fixed; inset:0; z-index:95; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(15,24,33,.70); }}
+    .clnup-backdrop.open {{ display:flex; }}
+    .clnup-modal {{ width:min(1100px, calc(100vw - 36px)); max-height:calc(100vh - 36px); display:grid; grid-template-rows:auto 1fr auto; overflow:hidden; background:#1a2230; color:#e8edf2; border-radius:8px; box-shadow:0 20px 56px rgba(0,0,0,.6); }}
+    .clnup-head {{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 16px; border-bottom:1px solid #2e3d50; }}
+    .clnup-head h3 {{ margin:0; font-size:17px; font-weight:700; }}
+    .clnup-body {{ display:grid; grid-template-columns:1fr 240px; min-height:0; overflow:hidden; }}
+    .clnup-stage-wrap {{ overflow:auto; padding:14px; background:#0f161e; position:relative; cursor:crosshair; }}
+    .clnup-stage {{ position:relative; display:inline-block; line-height:0; }}
+    .clnup-canvas {{ display:block; image-rendering:pixelated; }}
+    .clnup-overlay {{ position:absolute; inset:0; pointer-events:none; image-rendering:pixelated; }}
+    .clnup-crosshair {{ position:absolute; pointer-events:none; }}
+    .clnup-crosshair::before, .clnup-crosshair::after {{ content:""; position:absolute; background:rgba(255,80,80,.85); }}
+    .clnup-crosshair::before {{ width:1px; height:18px; left:50%; top:50%; transform:translate(-50%,-50%); }}
+    .clnup-crosshair::after {{ height:1px; width:18px; top:50%; left:50%; transform:translate(-50%,-50%); }}
+    .clnup-sidebar {{ display:flex; flex-direction:column; gap:12px; padding:14px; border-left:1px solid #2e3d50; overflow-y:auto; background:#182030; }}
+    .clnup-mag-wrap {{ display:flex; flex-direction:column; gap:4px; }}
+    .clnup-mag-label {{ font-size:11px; color:#8899aa; text-transform:uppercase; letter-spacing:.05em; }}
+    .clnup-magnifier {{ width:210px; height:210px; border:1px solid #2e3d50; border-radius:4px; background:#0f161e; image-rendering:pixelated; display:block; }}
+    .clnup-pixel-info {{ background:#111b27; border:1px solid #2e3d50; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; min-height:52px; }}
+    .clnup-swatch-row {{ display:flex; align-items:center; gap:8px; }}
+    .clnup-swatch {{ width:28px; height:28px; border-radius:4px; border:2px solid #3a4f65; flex-shrink:0; }}
+    .clnup-swatch-none {{ background:repeating-conic-gradient(#2a3848 0 25%, #1a2638 0 50%) 50% / 10px 10px; }}
+    .clnup-swatch-label {{ font-size:12px; color:#8899aa; }}
+    .clnup-controls {{ display:flex; flex-direction:column; gap:10px; }}
+    .clnup-controls label {{ font-size:13px; color:#c8d8e8; display:flex; flex-direction:column; gap:4px; }}
+    .clnup-controls input[type=range] {{ width:100%; }}
+    .clnup-tol-row {{ display:flex; align-items:center; gap:6px; }}
+    .clnup-tol-val {{ font-family:monospace; font-size:13px; min-width:28px; }}
+    .clnup-btn {{ padding:8px 12px; border-radius:6px; border:1px solid #3a4f65; background:#253245; color:#d0e0f0; cursor:pointer; font:inherit; font-size:13px; }}
+    .clnup-btn:hover {{ background:#2e3d55; }}
+    .clnup-btn-primary {{ background:#1a5fa8; border-color:#1a5fa8; color:white; font-weight:700; }}
+    .clnup-btn-primary:hover {{ background:#1869ba; }}
+    .clnup-btn-close {{ background:#1a2230; color:#8899aa; border-color:#2e3d50; }}
+    .clnup-status {{ font-size:12px; color:#8899aa; min-height:18px; }}
     .required-parts-panel {{ padding:0; margin:18px 0; }}
     .required-part-toggles {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:13px; }}
     .required-part-toggles label {{ display:inline-flex; align-items:center; gap:5px; padding:6px 8px; border:1px solid #d8dee3; border-radius:6px; background:white; }}
-    .inventory-debug-counts {{ margin:8px 0; color:#66727d; font-size:13px; }}
+    .inventory-debug-counts {{ margin:8px 0; font-size:12px; }}
+    .inventory-debug-counts > summary {{ cursor:pointer; color:#66727d; user-select:none; display:inline; }}
+    .inventory-debug-counts > summary::marker {{ font-size:10px; }}
+    .match-debug {{ font-size:11px; color:#888; margin:4px 0 6px; }}
+    .match-debug > summary {{ cursor:pointer; color:#a0a8b0; user-select:none; }}
+    .match-debug > summary::marker {{ font-size:9px; }}
     .required-parts-table-wrap {{ max-height:420px; overflow:auto; border:1px solid #d8dee3; border-radius:6px; background:white; }}
     .required-parts-table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
     .required-parts-table th, .required-parts-table td {{ padding:8px; border-bottom:1px solid #e4e9ed; text-align:left; vertical-align:middle; font-size:13px; }}
@@ -6647,6 +9213,7 @@ def training_store_review_ui(
     button {{ background:#1f6fc9; color:white; border-color:#1f6fc9; cursor:pointer; }}
     .save-next-btn {{ background:#155da8; border-color:#155da8; font-weight:700; }}
     .missing {{ padding:18px; color:#66727d; background:#f3f5f6; border-radius:6px; }}
+    .hidden {{ display:none !important; }}
     @media (max-width: 1180px) {{
       .candidate-workspace {{ grid-template-columns:1fr; }}
       .confirm-thumb {{ min-height:220px; }}
@@ -6675,8 +9242,9 @@ def training_store_review_ui(
     <section>
       <div class="title-row">
         <h2>{title}</h2>
-        <div class="top-actions">{next_pending_button_html}</div>
+        <div class="top-actions">{next_pending_button_html}{next_bag_button_html}</div>
       </div>
+      {bag_complete_html}
       {direct_lookup_warning_html}
       <div class="meta">
         <div><span class="label">status</span>{escape(str((selected or {}).get("review_status") or ""))}</div>
@@ -6718,8 +9286,8 @@ def training_store_review_ui(
         <label><input name="qty_text_present" type="checkbox"> qty text present</label>
         <label><input name="multi_part_merge" type="checkbox"> multi-part merge</label>
         <textarea name="review_notes" placeholder="review notes"></textarea>
-        <button type="submit">Save review</button>
-        <button type="button" class="save-next-btn" data-save-review-next="true">Save review + next</button>
+        <button type="submit">Save Review</button>
+        <button type="button" class="save-next-btn" data-save-review-next="true">Save + Next Crop</button>
       </form>
     </section>
   </main>
@@ -6733,10 +9301,128 @@ def training_store_review_ui(
       <div class="usage-table-wrap" data-usage-modal-body="true"></div>
     </div>
   </div>
+  <div class="mask-amend-backdrop" data-mask-amend-modal="true" aria-hidden="true">
+    <div class="mask-amend-modal" role="dialog" aria-modal="true" aria-labelledby="mask-amend-title">
+      <div class="mask-amend-head">
+        <h3 id="mask-amend-title" data-mask-amend-title="true">Amend Mask</h3>
+        <button type="button" class="mask-amend-close" data-mask-amend-close="true">Close</button>
+      </div>
+      <div class="mask-amend-tools">
+        <div>
+          <button type="button" class="mask-tool active" data-mask-tool="add">Brush ADD</button>
+          <button type="button" class="mask-tool" data-mask-tool="erase">Eraser</button>
+        </div>
+        <label>Brush size <input type="range" min="2" max="80" value="18" data-mask-brush-size="true"></label>
+        <button type="button" data-save-mask-amendment="true">Save Amendment</button>
+      </div>
+      <div class="mask-amend-stage-wrap">
+        <div class="mask-amend-stage" data-mask-stage="true">
+          <canvas data-mask-base-canvas="true"></canvas>
+          <canvas class="mask-amend-layer" data-mask-current-canvas="true"></canvas>
+          <canvas class="mask-amend-layer" data-mask-add-canvas="true"></canvas>
+          <canvas class="mask-amend-layer" data-mask-erase-canvas="true"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- ── Colour cleanup picker modal ──────────────────────────────────── -->
+  <div class="clnup-backdrop" data-clnup-modal="true" aria-hidden="true">
+    <div class="clnup-modal" role="dialog" aria-modal="true" aria-labelledby="clnup-title">
+      <div class="clnup-head">
+        <h3 id="clnup-title">Pick Background Colour</h3>
+        <button type="button" class="clnup-btn clnup-btn-close" data-clnup-close="true">Close</button>
+      </div>
+      <div class="clnup-body">
+        <div class="clnup-stage-wrap" data-clnup-stage-wrap="true">
+          <div class="clnup-stage" data-clnup-stage="true">
+            <canvas class="clnup-canvas" data-clnup-img-canvas="true"></canvas>
+            <canvas class="clnup-overlay" data-clnup-overlay-canvas="true"></canvas>
+            <div class="clnup-crosshair" data-clnup-crosshair="true" style="display:none;position:absolute;width:0;height:0"></div>
+          </div>
+        </div>
+        <div class="clnup-sidebar">
+          <div class="clnup-mag-wrap">
+            <div class="clnup-mag-label">Zoom ×10</div>
+            <canvas class="clnup-magnifier" data-clnup-magnifier="true" width="210" height="210"></canvas>
+          </div>
+          <div class="clnup-pixel-info" data-clnup-pixel-info="true">Hover to sample colour…</div>
+          <div class="clnup-swatch-row">
+            <div class="clnup-swatch clnup-swatch-none" data-clnup-swatch="true"></div>
+            <div class="clnup-swatch-label" data-clnup-swatch-label="true">No colour picked</div>
+          </div>
+          <div class="clnup-controls">
+            <label>Tolerance (LAB Δ)
+              <div class="clnup-tol-row">
+                <input type="range" min="5" max="80" value="22" data-clnup-tolerance="true">
+                <span class="clnup-tol-val" data-clnup-tol-val="true">22</span>
+              </div>
+            </label>
+          </div>
+          <button type="button" class="clnup-btn clnup-btn-primary" data-clnup-save="true" disabled>Save Cleanup</button>
+          <div class="clnup-status" data-clnup-status="true">Click image to pick a colour</div>
+        </div>
+      </div>
+    </div>
+  </div>
   <script>
-    const nextPendingUrl = {next_pending_url_js};
-    function showNoNextPending() {{
-      alert('No more pending bundles in this filter');
+    let nextPendingUrl = {next_pending_url_js};
+    let nextBagUrl = {next_bag_url_js};
+    const nextPendingEndpoint = {next_pending_endpoint_js};
+    const bagAuditHref = {bag_audit_href_js};
+    function showBagComplete(nextBagUrlValue) {{
+      const banner = document.querySelector('[data-bag-complete-banner]');
+      if (banner) {{
+        banner.classList.remove('hidden');
+        const msg = nextBagUrlValue ? 'Bag complete — next bag is available.' : 'Bag complete.';
+        banner.innerHTML = escape_html(msg)
+          + (bagAuditHref ? ' <a href="' + bagAuditHref + '" target="_blank" rel="noopener" style="font-weight:600;text-decoration:underline">Open Bag Audit</a>' : '')
+          + (nextBagUrlValue ? ' <a href="' + nextBagUrlValue + '" style="font-weight:600;text-decoration:underline">Open Next Bag</a>' : '');
+      }}
+      const nextBagButton = document.querySelector('[data-next-bag]');
+      if (nextBagButton && nextBagUrlValue) {{
+        nextBagButton.classList.remove('hidden');
+        nextBagButton.setAttribute('href', nextBagUrlValue);
+      }}
+      const msg = nextBagUrlValue
+        ? 'Bag complete.\n\nOpen Bag Audit or continue to Next Bag?'
+        : 'Bag complete.\n\nOpen Bag Audit?';
+      if (bagAuditHref && confirm(msg)) {{
+        window.open(bagAuditHref, '_blank', 'noopener');
+      }}
+    }}
+    function escape_html(s) {{
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }}
+    async function loadNextPending() {{
+      if (!nextPendingEndpoint) {{
+        return {{next_url: nextPendingUrl, next_bag_url: nextBagUrl, current_bag_complete: !nextPendingUrl}};
+      }}
+      const res = await fetch(nextPendingEndpoint);
+      if (!res.ok) {{
+        throw new Error(await res.text());
+      }}
+      const data = await res.json();
+      nextPendingUrl = data.next_url || '';
+      nextBagUrl = data.next_bag_url || '';
+      return data;
+    }}
+    async function openNextPending() {{
+      let data = {{next_url: nextPendingUrl, next_bag_url: nextBagUrl, current_bag_complete: !nextPendingUrl}};
+      try {{
+        data = await loadNextPending();
+      }} catch (err) {{
+        alert(String(err && err.message ? err.message : err));
+        return;
+      }}
+      if (data.next_url) {{
+        window.location.href = data.next_url;
+        return;
+      }}
+      if (data.current_bag_complete) {{
+        showBagComplete(data.next_bag_url || '');
+        return;
+      }}
+      alert('No next pending bundle after this crop; current bundle is still pending.');
     }}
     function buildReviewPayload(form) {{
       const payload = Object.fromEntries(new FormData(form).entries());
@@ -6772,6 +9458,209 @@ def training_store_review_ui(
       const text = String(path || '').trim();
       return text ? '/debug/ai-snap-artifact?path=' + encodeURIComponent(text) : '';
     }}
+    const maskAmendState = {{
+      bundleId: "{escape(selected_bundle_id)}",
+      candidateIndex: '',
+      tool: 'add',
+      drawing: false
+    }};
+    const maskAmendModal = document.querySelector('[data-mask-amend-modal]');
+    const maskBaseCanvas = document.querySelector('[data-mask-base-canvas]');
+    const maskCurrentCanvas = document.querySelector('[data-mask-current-canvas]');
+    const maskAddCanvas = document.querySelector('[data-mask-add-canvas]');
+    const maskEraseCanvas = document.querySelector('[data-mask-erase-canvas]');
+    const maskStage = document.querySelector('[data-mask-stage]');
+    const maskBrushSize = document.querySelector('[data-mask-brush-size]');
+    function setMaskCanvasSize(width, height) {{
+      [maskBaseCanvas, maskCurrentCanvas, maskAddCanvas, maskEraseCanvas].forEach((canvas) => {{
+        if (!canvas) {{
+          return;
+        }}
+        canvas.width = width;
+        canvas.height = height;
+        canvas.style.width = width + 'px';
+        canvas.style.height = height + 'px';
+      }});
+      if (maskStage) {{
+        maskStage.style.width = width + 'px';
+        maskStage.style.height = height + 'px';
+      }}
+    }}
+    function loadImageElement(src) {{
+      return new Promise((resolve, reject) => {{
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = reject;
+        image.src = src;
+      }});
+    }}
+    async function openMaskAmend(button) {{
+      const originalPath = button.dataset.originalPath || '';
+      const maskPath = button.dataset.maskPath || '';
+      let candidateBox = [];
+      try {{
+        candidateBox = JSON.parse(button.dataset.candidateBox || '[]');
+      }} catch (err) {{
+        candidateBox = [];
+      }}
+      const originalUrl = artifactUrl(originalPath);
+      if (!originalUrl) {{
+        alert('original crop is missing');
+        return;
+      }}
+      const originalImage = await loadImageElement(originalUrl);
+      setMaskCanvasSize(originalImage.naturalWidth || originalImage.width, originalImage.naturalHeight || originalImage.height);
+      const baseCtx = maskBaseCanvas.getContext('2d');
+      baseCtx.clearRect(0, 0, maskBaseCanvas.width, maskBaseCanvas.height);
+      baseCtx.drawImage(originalImage, 0, 0, maskBaseCanvas.width, maskBaseCanvas.height);
+      [maskCurrentCanvas, maskAddCanvas, maskEraseCanvas].forEach((canvas) => {{
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }});
+      if (maskPath && candidateBox.length === 4) {{
+        try {{
+          const maskImage = await loadImageElement(artifactUrl(maskPath));
+          const [x, y, w, h] = candidateBox.map((value) => Number(value || 0));
+          const offscreen = document.createElement('canvas');
+          offscreen.width = Math.max(1, Math.round(w));
+          offscreen.height = Math.max(1, Math.round(h));
+          const offscreenCtx = offscreen.getContext('2d');
+          offscreenCtx.drawImage(maskImage, 0, 0, offscreen.width, offscreen.height);
+          const pixels = offscreenCtx.getImageData(0, 0, offscreen.width, offscreen.height);
+          for (let i = 0; i < pixels.data.length; i += 4) {{
+            const value = Math.max(pixels.data[i], pixels.data[i + 1], pixels.data[i + 2], pixels.data[i + 3]);
+            pixels.data[i] = 31;
+            pixels.data[i + 1] = 111;
+            pixels.data[i + 2] = 201;
+            pixels.data[i + 3] = value > 8 ? 96 : 0;
+          }}
+          offscreenCtx.putImageData(pixels, 0, 0);
+          const currentCtx = maskCurrentCanvas.getContext('2d');
+          currentCtx.drawImage(offscreen, x, y, w, h);
+        }} catch (err) {{
+          console.warn('mask overlay failed', err);
+        }}
+      }}
+      maskAmendState.candidateIndex = button.dataset.candidateIndex || '';
+      maskAmendState.tool = 'add';
+      document.querySelectorAll('[data-mask-tool]').forEach((toolButton) => {{
+        toolButton.classList.toggle('active', toolButton.dataset.maskTool === 'add');
+      }});
+      if (maskAmendModal) {{
+        maskAmendModal.classList.add('open');
+        maskAmendModal.setAttribute('aria-hidden', 'false');
+      }}
+    }}
+    function closeMaskAmend() {{
+      if (maskAmendModal) {{
+        maskAmendModal.classList.remove('open');
+        maskAmendModal.setAttribute('aria-hidden', 'true');
+      }}
+    }}
+    function drawMaskStroke(event) {{
+      if (!maskAmendState.drawing) {{
+        return;
+      }}
+      const targetCanvas = maskAmendState.tool === 'erase' ? maskEraseCanvas : maskAddCanvas;
+      const rect = targetCanvas.getBoundingClientRect();
+      const x = ((event.clientX - rect.left) / rect.width) * targetCanvas.width;
+      const y = ((event.clientY - rect.top) / rect.height) * targetCanvas.height;
+      const radius = Number(maskBrushSize && maskBrushSize.value || 18) / 2;
+      const ctx = targetCanvas.getContext('2d');
+      ctx.fillStyle = maskAmendState.tool === 'erase' ? 'rgba(255,60,40,.70)' : 'rgba(47,108,65,.72)';
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }}
+    [maskAddCanvas, maskEraseCanvas].forEach((canvas) => {{
+      if (!canvas) {{
+        return;
+      }}
+      canvas.addEventListener('pointerdown', (event) => {{
+        maskAmendState.drawing = true;
+        canvas.setPointerCapture(event.pointerId);
+        drawMaskStroke(event);
+      }});
+      canvas.addEventListener('pointermove', drawMaskStroke);
+      canvas.addEventListener('pointerup', () => {{
+        maskAmendState.drawing = false;
+      }});
+      canvas.addEventListener('pointercancel', () => {{
+        maskAmendState.drawing = false;
+      }});
+    }});
+    document.querySelectorAll('[data-mask-tool]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        maskAmendState.tool = button.dataset.maskTool || 'add';
+        document.querySelectorAll('[data-mask-tool]').forEach((toolButton) => {{
+          toolButton.classList.toggle('active', toolButton === button);
+        }});
+        if (maskAddCanvas && maskEraseCanvas) {{
+          maskAddCanvas.style.pointerEvents = maskAmendState.tool === 'add' ? 'auto' : 'none';
+          maskEraseCanvas.style.pointerEvents = maskAmendState.tool === 'erase' ? 'auto' : 'none';
+        }}
+      }});
+    }});
+    if (maskAddCanvas && maskEraseCanvas) {{
+      maskAddCanvas.style.pointerEvents = 'auto';
+      maskEraseCanvas.style.pointerEvents = 'none';
+    }}
+    document.querySelectorAll('[data-amend-mask]').forEach((button) => {{
+      button.addEventListener('click', () => openMaskAmend(button));
+    }});
+    document.querySelectorAll('[data-mask-amend-close]').forEach((button) => {{
+      button.addEventListener('click', closeMaskAmend);
+    }});
+    document.querySelectorAll('[data-save-mask-amendment]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        button.disabled = true;
+        button.textContent = 'Saving...';
+        const res = await fetch('/debug/training-store/save-manual-mask-amendment', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{
+            bundle_id: maskAmendState.bundleId,
+            candidate_index: maskAmendState.candidateIndex,
+            amended_by: 'andy',
+            add_mask_data_url: maskAddCanvas.toDataURL('image/png'),
+            erase_mask_data_url: maskEraseCanvas.toDataURL('image/png')
+          }})
+        }});
+        if (!res.ok) {{
+          alert(await res.text());
+          button.disabled = false;
+          button.textContent = 'Save Amendment';
+          return;
+        }}
+        location.reload();
+      }});
+    }});
+    document.querySelectorAll('[data-rerun-refinement]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        if (button.disabled) {{
+          return;
+        }}
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Refining...';
+        const res = await fetch('/debug/training-store/rerun-manual-mask-refinement', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{
+            bundle_id: maskAmendState.bundleId,
+            candidate_index: button.dataset.candidateIndex || '',
+            refined_by: 'andy'
+          }})
+        }});
+        if (!res.ok) {{
+          alert(await res.text());
+          button.disabled = false;
+          button.textContent = originalText;
+          return;
+        }}
+        location.reload();
+      }});
+    }});
     const usageModal = document.querySelector('[data-usage-modal]');
     const usageModalTitle = document.querySelector('[data-usage-modal-title]');
     const usageModalSummary = document.querySelector('[data-usage-modal-summary]');
@@ -6838,18 +9727,24 @@ def training_store_review_ui(
         if (!saved) {{
           return;
         }}
-        if (!nextPendingUrl) {{
-          showNoNextPending();
-          return;
-        }}
-        window.location.href = nextPendingUrl;
+        await openNextPending();
       }});
     }});
     document.querySelectorAll('[data-next-pending]').forEach((button) => {{
+      button.addEventListener('click', async (event) => {{
+        event.preventDefault();
+        if (button.disabled) {{
+          return;
+        }}
+        await openNextPending();
+      }});
+    }});
+    document.querySelectorAll('[data-next-bag]').forEach((button) => {{
       button.addEventListener('click', (event) => {{
-        if (!nextPendingUrl) {{
+        const href = button.getAttribute('href') || nextBagUrl || '';
+        if (!href) {{
           event.preventDefault();
-          showNoNextPending();
+          showBagComplete('');
         }}
       }});
     }});
@@ -6933,6 +9828,8 @@ def training_store_review_ui(
           endpoint = '/debug/training-store/accept-split-candidate';
         }} else if (action === 'scrub') {{
           endpoint = '/debug/training-store/scrub-candidate-qty';
+        }} else if (action === 'mark_qty_clean') {{
+          endpoint = '/debug/training-store/mark-qty-clean';
         }} else if (['needs_mask_expand', 'needs_ocr_review', 'needs_manual_crop'].includes(action)) {{
           endpoint = '/debug/training-store/set-candidate-review-state';
           params.set('review_state', action);
@@ -7234,6 +10131,308 @@ def training_store_review_ui(
         }}
       }});
     }});
+
+    /* ── Colour cleanup picker ──────────────────────────────────────────── */
+    (function () {{
+      const backdrop  = document.querySelector('[data-clnup-modal]');
+      const imgCanvas = backdrop && backdrop.querySelector('[data-clnup-img-canvas]');
+      const ovCanvas  = backdrop && backdrop.querySelector('[data-clnup-overlay-canvas]');
+      const magCanvas = backdrop && backdrop.querySelector('[data-clnup-magnifier]');
+      const pixInfo   = backdrop && backdrop.querySelector('[data-clnup-pixel-info]');
+      const swatchEl  = backdrop && backdrop.querySelector('[data-clnup-swatch]');
+      const swatchLbl = backdrop && backdrop.querySelector('[data-clnup-swatch-label]');
+      const tolInput  = backdrop && backdrop.querySelector('[data-clnup-tolerance]');
+      const tolVal    = backdrop && backdrop.querySelector('[data-clnup-tol-val]');
+      const saveBtn   = backdrop && backdrop.querySelector('[data-clnup-save]');
+      const statusEl  = backdrop && backdrop.querySelector('[data-clnup-status]');
+      const crosshair = backdrop && backdrop.querySelector('[data-clnup-crosshair]');
+
+      if (!backdrop) return;
+
+      let pickerState = {{
+        bundleId: '',
+        candidateIndex: '',
+        imgPath: '',
+        imgData: null,       // ImageData of source
+        srcW: 0, srcH: 0,
+        pickedRgb: null,     // [r,g,b] or null
+        tolerance: 22,
+      }};
+
+      /* ── RGB ↔ LAB conversion (CIELAB, D65) ── */
+      function rgbToLab(r, g, b) {{
+        let rl = r/255, gl = g/255, bl = b/255;
+        const lin = c => c > 0.04045 ? Math.pow((c+0.055)/1.055, 2.4) : c/12.92;
+        rl = lin(rl); gl = lin(gl); bl = lin(bl);
+        const x = rl*0.4124564 + gl*0.3575761 + bl*0.1804375;
+        const y = rl*0.2126729 + gl*0.7151522 + bl*0.0721750;
+        const z = rl*0.0193339 + gl*0.1191920 + bl*0.9503041;
+        const f = t => t > 0.008856 ? Math.cbrt(t) : 7.787*t + 16/116;
+        const fx = f(x/0.95047), fy = f(y/1.0), fz = f(z/1.08883);
+        return [116*fy - 16, 500*(fx-fy), 200*(fy-fz)];
+      }}
+      function labDist(rgb1, rgb2) {{
+        const [L1,a1,b1] = rgbToLab(...rgb1);
+        const [L2,a2,b2] = rgbToLab(...rgb2);
+        return Math.sqrt((L1-L2)**2 + (a1-a2)**2 + (b1-b2)**2);
+      }}
+
+      /* ── helpers ── */
+      function artifactUrl(p) {{
+        return p ? '/debug/ai-snap-artifact?path=' + encodeURIComponent(p) : '';
+      }}
+      function setStatus(msg) {{ if (statusEl) statusEl.textContent = msg; }}
+
+      /* ── source pixel coords from pointer event ── */
+      function srcCoords(canvas, ev) {{
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((ev.clientX - rect.left) * canvas.width / rect.width);
+        const y = Math.floor((ev.clientY - rect.top)  * canvas.height / rect.height);
+        return [
+          Math.max(0, Math.min(pickerState.srcW - 1, x)),
+          Math.max(0, Math.min(pickerState.srcH - 1, y)),
+        ];
+      }}
+
+      /* ── read pixel RGBA from ImageData ── */
+      function getPixel(imgData, x, y) {{
+        const i = (y * imgData.width + x) * 4;
+        return [imgData.data[i], imgData.data[i+1], imgData.data[i+2], imgData.data[i+3]];
+      }}
+
+      /* ── draw magnifier ── */
+      function drawMag(sx, sy) {{
+        if (!magCanvas || !pickerState.imgData) return;
+        const mw = magCanvas.width, mh = magCanvas.height;
+        const zoom = 10;
+        const halfW = mw / zoom / 2, halfH = mh / zoom / 2;
+        const mCtx = magCanvas.getContext('2d', {{willReadFrequently: true}});
+        mCtx.clearRect(0, 0, mw, mh);
+        // draw zoomed region from main canvas
+        mCtx.imageSmoothingEnabled = false;
+        mCtx.drawImage(imgCanvas, sx - halfW, sy - halfH, mw/zoom, mh/zoom, 0, 0, mw, mh);
+        // draw overlay region (cleanup mask)
+        if (ovCanvas) {{
+          mCtx.globalAlpha = 0.55;
+          mCtx.drawImage(ovCanvas, sx - halfW, sy - halfH, mw/zoom, mh/zoom, 0, 0, mw, mh);
+          mCtx.globalAlpha = 1.0;
+        }}
+        // crosshair at centre
+        mCtx.strokeStyle = 'rgba(255,60,60,.9)';
+        mCtx.lineWidth = 1;
+        mCtx.beginPath();
+        mCtx.moveTo(mw/2, 0); mCtx.lineTo(mw/2, mh);
+        mCtx.moveTo(0, mh/2); mCtx.lineTo(mw, mh/2);
+        mCtx.stroke();
+        // pixel grid lines
+        mCtx.strokeStyle = 'rgba(255,255,255,.10)';
+        mCtx.lineWidth = 0.5;
+        for (let gx = 0; gx < mw; gx += zoom) {{
+          mCtx.beginPath(); mCtx.moveTo(gx, 0); mCtx.lineTo(gx, mh); mCtx.stroke();
+        }}
+        for (let gy = 0; gy < mh; gy += zoom) {{
+          mCtx.beginPath(); mCtx.moveTo(0, gy); mCtx.lineTo(mw, gy); mCtx.stroke();
+        }}
+      }}
+
+      /* ── update cleanup overlay preview ── */
+      function updateOverlay() {{
+        if (!ovCanvas || !pickerState.imgData || !pickerState.pickedRgb) return;
+        const w = pickerState.srcW, h = pickerState.srcH;
+        const ov = ovCanvas.getContext('2d');
+        const picked = pickerState.pickedRgb;
+        const tol = pickerState.tolerance;
+        const out = ov.createImageData(w, h);
+        const src = pickerState.imgData;
+        for (let i = 0; i < w * h; i++) {{
+          const si = i * 4;
+          const a = src.data[si+3];
+          if (a < 16) continue;  // skip transparent
+          const [r, g, b] = [src.data[si], src.data[si+1], src.data[si+2]];
+          const dist = labDist([r,g,b], picked);
+          if (dist < tol) {{
+            // will-be-removed: red tint
+            out.data[si]   = 220;
+            out.data[si+1] = 30;
+            out.data[si+2] = 30;
+            out.data[si+3] = 160;
+          }}
+        }}
+        ov.putImageData(out, 0, 0);
+      }}
+
+      /* ── load candidate image into canvas ── */
+      function loadCandidateImage(imgPath) {{
+        return new Promise((resolve, reject) => {{
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => {{
+            const w = img.naturalWidth, h = img.naturalHeight;
+            pickerState.srcW = w; pickerState.srcH = h;
+            imgCanvas.width  = w; imgCanvas.height = h;
+            ovCanvas.width   = w; ovCanvas.height  = h;
+            const ctx = imgCanvas.getContext('2d', {{willReadFrequently: true}});
+            // checkerboard background for transparency
+            const checker = document.createElement('canvas');
+            checker.width = 20; checker.height = 20;
+            const cc = checker.getContext('2d');
+            cc.fillStyle = '#555'; cc.fillRect(0,0,20,20);
+            cc.fillStyle = '#888'; cc.fillRect(0,0,10,10); cc.fillRect(10,10,10,10);
+            ctx.fillStyle = ctx.createPattern(checker, 'repeat');
+            ctx.fillRect(0, 0, w, h);
+            ctx.drawImage(img, 0, 0);
+            pickerState.imgData = ctx.getImageData(0, 0, w, h);
+            resolve();
+          }};
+          img.onerror = reject;
+          img.src = artifactUrl(imgPath);
+        }});
+      }}
+
+      /* ── open modal ── */
+      async function openPicker(bundleId, candidateIndex, imgPath) {{
+        pickerState = {{
+          bundleId, candidateIndex, imgPath,
+          imgData: null, srcW: 0, srcH: 0,
+          pickedRgb: null, tolerance: Number(tolInput ? tolInput.value : 22),
+        }};
+        if (swatchEl) {{ swatchEl.className = 'clnup-swatch clnup-swatch-none'; swatchEl.style.background = ''; }}
+        if (swatchLbl) swatchLbl.textContent = 'No colour picked';
+        if (pixInfo)   pixInfo.textContent = 'Hover to sample colour…';
+        if (saveBtn)   saveBtn.disabled = true;
+        const ovCtx = ovCanvas && ovCanvas.getContext('2d');
+        if (ovCtx) ovCtx.clearRect(0, 0, ovCanvas.width, ovCanvas.height);
+        setStatus('Loading image…');
+        backdrop.classList.add('open');
+        backdrop.setAttribute('aria-hidden', 'false');
+        try {{
+          await loadCandidateImage(imgPath);
+          setStatus('Click image to pick a background colour');
+        }} catch (e) {{
+          setStatus('Error loading image: ' + String(e));
+        }}
+      }}
+
+      /* ── close modal ── */
+      function closePicker() {{
+        backdrop.classList.remove('open');
+        backdrop.setAttribute('aria-hidden', 'true');
+      }}
+
+      /* ── event: open picker buttons ── */
+      document.querySelectorAll('[data-pick-colour]').forEach(btn => {{
+        btn.addEventListener('click', () => {{
+          const bundleId = maskAmendState.bundleId || '';
+          const idx = String(btn.dataset.candidateIndex || '');
+          const imgPath = String(btn.dataset.candidateImgPath || '');
+          openPicker(bundleId, idx, imgPath);
+        }});
+      }});
+
+      /* ── event: close ── */
+      backdrop.addEventListener('click', ev => {{
+        if (ev.target === backdrop) closePicker();
+      }});
+      const closeBtn = backdrop.querySelector('[data-clnup-close]');
+      if (closeBtn) closeBtn.addEventListener('click', closePicker);
+
+      /* ── event: tolerance slider ── */
+      if (tolInput) {{
+        tolInput.addEventListener('input', () => {{
+          pickerState.tolerance = Number(tolInput.value);
+          if (tolVal) tolVal.textContent = tolInput.value;
+          updateOverlay();
+        }});
+      }}
+
+      /* ── event: mousemove over main canvas ── */
+      const stageWrap = backdrop.querySelector('[data-clnup-stage-wrap]');
+      if (imgCanvas) {{
+        imgCanvas.addEventListener('mousemove', ev => {{
+          if (!pickerState.imgData) return;
+          const [sx, sy] = srcCoords(imgCanvas, ev);
+          const [r, g, b, a] = getPixel(pickerState.imgData, sx, sy);
+          const [L, aL, bL] = rgbToLab(r, g, b);
+          if (pixInfo) {{
+            pixInfo.innerHTML =
+              `<b>x:</b>${{sx}} <b>y:</b>${{sy}}<br>` +
+              `<b>RGB:</b> ${{r}} ${{g}} ${{b}} (α=${{a}})<br>` +
+              `<b>LAB:</b> ${{L.toFixed(1)}} ${{aL.toFixed(1)}} ${{bL.toFixed(1)}}`;
+          }}
+          drawMag(sx, sy);
+          // move crosshair div (CSS position, relative to stage)
+          if (crosshair) {{
+            const rect = imgCanvas.getBoundingClientRect();
+            const cssX = (ev.clientX - rect.left);
+            const cssY = (ev.clientY - rect.top);
+            crosshair.style.display = 'block';
+            crosshair.style.left = cssX + 'px';
+            crosshair.style.top  = cssY + 'px';
+          }}
+        }});
+        imgCanvas.addEventListener('mouseleave', () => {{
+          if (crosshair) crosshair.style.display = 'none';
+        }});
+      }}
+
+      /* ── event: click to pick colour ── */
+      if (imgCanvas) {{
+        imgCanvas.addEventListener('click', ev => {{
+          if (!pickerState.imgData) return;
+          const [sx, sy] = srcCoords(imgCanvas, ev);
+          const [r, g, b, a] = getPixel(pickerState.imgData, sx, sy);
+          if (a < 16) {{
+            setStatus('Picked transparent pixel — choose an opaque pixel');
+            return;
+          }}
+          pickerState.pickedRgb = [r, g, b];
+          const hex = '#' + [r,g,b].map(c => c.toString(16).padStart(2,'0')).join('');
+          if (swatchEl) {{ swatchEl.className = 'clnup-swatch'; swatchEl.style.background = hex; }}
+          if (swatchLbl) swatchLbl.textContent = `RGB(${{r}}, ${{g}}, ${{b}})`;
+          if (saveBtn) saveBtn.disabled = false;
+          setStatus(`Picked ${{hex}} — adjust tolerance then Save`);
+          updateOverlay();
+        }});
+      }}
+
+      /* ── event: save cleanup ── */
+      if (saveBtn) {{
+        saveBtn.addEventListener('click', async () => {{
+          if (!pickerState.pickedRgb || saveBtn.disabled) return;
+          const originalText = saveBtn.textContent;
+          saveBtn.disabled = true;
+          saveBtn.textContent = 'Saving…';
+          setStatus('Sending to server…');
+          try {{
+            const res = await fetch('/debug/training-store/save-picked-colour-cleanup', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{
+                bundle_id: pickerState.bundleId,
+                candidate_index: pickerState.candidateIndex,
+                picked_rgb: pickerState.pickedRgb,
+                tolerance: pickerState.tolerance,
+              }}),
+            }});
+            if (!res.ok) {{
+              const msg = await res.text();
+              setStatus('Error: ' + msg);
+              saveBtn.disabled = false;
+              saveBtn.textContent = originalText;
+              return;
+            }}
+            const data = await res.json();
+            setStatus('Saved — reloading…');
+            closePicker();
+            location.reload();
+          }} catch (e) {{
+            setStatus('Network error: ' + String(e));
+            saveBtn.disabled = false;
+            saveBtn.textContent = originalText;
+          }}
+        }});
+      }}
+    }})();
   </script>
 </body>
 </html>
