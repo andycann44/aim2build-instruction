@@ -92,11 +92,50 @@ _AUTO_MASK_CACHE_DIR = Path(__file__).resolve().parents[2] / "debug" / "ai_train
 _ELEMENT_PAGE_EXTRACT_ROOT = Path("/Users/olly/aim2build-instruction/debug/element_page_extract")
 _SAM2_TEST_ROOT            = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
 _TRAINING_PACK_ROOT        = Path("/Users/olly/aim2build-instruction/debug/element_training_packs")
+_CLIP_EMBEDDINGS_ROOT      = Path("/Users/olly/aim2build-instruction/debug/clip_training_embeddings")
 
 # Lazy-loaded SAM2 model state (populated on first POST /debug/sam2-test call)
 _sam2_processor: Any = None
 _sam2_model: Any = None
 _sam2_load_error: Optional[str] = None
+
+# Lazy-loaded CLIP model state
+_CLIP_MODEL_NAME  = "ViT-B-32"
+_CLIP_PRETRAINED  = "laion2b_s34b_b79k"
+_clip_model: Any       = None
+_clip_preprocess: Any  = None
+_clip_load_error: Optional[str] = None
+
+
+def _clip_load() -> Tuple[bool, str]:
+    """Lazy-load open_clip ViT-B-32 / laion2b_s34b_b79k (once per process)."""
+    global _clip_model, _clip_preprocess, _clip_load_error
+    if _clip_model is not None:
+        return True, ""
+    if _clip_load_error is not None:
+        return False, _clip_load_error
+    try:
+        import open_clip  # type: ignore
+        import torch
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            _CLIP_MODEL_NAME, pretrained=_CLIP_PRETRAINED
+        )
+        model.eval()
+        # Use MPS if available (Apple Silicon), else CPU
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        model = model.to(device)
+        _clip_model      = model
+        _clip_preprocess = preprocess
+        return True, ""
+    except ImportError:
+        _clip_load_error = (
+            "open_clip not installed. "
+            "Install with: pip install open-clip-torch"
+        )
+        return False, _clip_load_error
+    except Exception as exc:
+        _clip_load_error = str(exc)
+        return False, _clip_load_error
 
 
 def _page_callout_cache_key(set_num: str, page: int) -> Tuple[str, int]:
@@ -6553,6 +6592,205 @@ async def export_training_packs(req: Request) -> JSONResponse:
         "pages_processed": pages,
         "manifest_path":  str(manifest_path),
         "pack_root":      str(_TRAINING_PACK_ROOT),
+    })
+
+
+@router.post("/debug/generate-training-clip-embeddings")
+async def generate_training_clip_embeddings(req: Request) -> JSONResponse:
+    """
+    Generate CLIP image embeddings for element training packs.
+
+    Reads masked.png from each item in:
+        debug/element_training_packs/<stem>/masked.png
+
+    Writes to:
+        debug/clip_training_embeddings/
+            embeddings.npy    float32 (N, D), L2-normalised, one row per embedded item
+            items.json        metadata for each embedded item (index = row in embeddings.npy)
+            manifest.json     run summary
+
+    Model: ViT-B-32 / laion2b_s34b_b79k  (open_clip)
+    Device: MPS if available, else CPU
+
+    Input JSON
+    ----------
+    {
+      "limit":   null,      -- max items to embed (null = all)
+      "quality": "all"      -- "all" | "high" | "medium" | "low"
+    }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    limit_raw      = body.get("limit")
+    quality_filter = str(body.get("quality") or "all").lower().strip()
+
+    if quality_filter not in ("all", "high", "medium", "low"):
+        raise HTTPException(status_code=400,
+            detail="quality must be one of: all, high, medium, low")
+
+    # ── Load CLIP (lazy, first call downloads weights ~350 MB) ────────────────
+    clip_ok, clip_err = _clip_load()
+    if not clip_ok:
+        raise HTTPException(status_code=503,
+            detail=f"CLIP unavailable: {clip_err}. "
+                   f"Install with: pip install open-clip-torch")
+
+    # ── Load training pack manifest ───────────────────────────────────────────
+    pack_manifest_path = _TRAINING_PACK_ROOT / "manifest.json"
+    if not pack_manifest_path.exists():
+        raise HTTPException(status_code=404,
+            detail="Training pack manifest not found. "
+                   "Run POST /debug/export-training-packs first.")
+
+    try:
+        pack_manifest = json.loads(pack_manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500,
+            detail=f"Failed to read manifest: {exc}")
+
+    all_items: List[Dict[str, Any]] = pack_manifest.get("items", [])
+
+    # ── Filter by clip_quality ────────────────────────────────────────────────
+    if quality_filter != "all":
+        all_items = [it for it in all_items if it.get("clip_quality") == quality_filter]
+
+    # ── Apply limit ───────────────────────────────────────────────────────────
+    if limit_raw is not None:
+        try:
+            all_items = all_items[: int(limit_raw)]
+        except (TypeError, ValueError):
+            pass
+
+    total_input = len(all_items)
+
+    # ── Resolve masked.png paths ──────────────────────────────────────────────
+    import torch
+    import numpy as np
+    from PIL import Image as _Pil
+
+    BATCH_SIZE = 32
+    device_str = "mps" if torch.backends.mps.is_available() else "cpu"
+
+    # Two lists kept in sync: one for embedding, one for output metadata
+    load_tensors: List[Any]       = []   # preprocessed tensors
+    embed_items:  List[Dict[str, Any]] = []  # items that loaded OK
+    skipped:      List[Dict[str, Any]] = []  # items that failed
+
+    for item in all_items:
+        element_id = str(item.get("element_id", ""))
+        page       = int(item.get("page", 0))
+        stem       = f"elem_{element_id}_p{page:03d}"
+        masked_path = _TRAINING_PACK_ROOT / stem / "masked.png"
+        meta_path   = _TRAINING_PACK_ROOT / stem / "meta.json"
+
+        if not masked_path.exists():
+            skipped.append({"stem": stem, "reason": "masked.png not found"})
+            continue
+
+        try:
+            img    = _Pil.open(str(masked_path)).convert("RGB")
+            tensor = _clip_preprocess(img).unsqueeze(0)   # (1, C, H, W)
+        except Exception as exc:
+            skipped.append({"stem": stem, "reason": f"load error: {exc}"})
+            continue
+
+        load_tensors.append(tensor)
+        embed_items.append({
+            "stem":               stem,
+            "element_id":         element_id,
+            "page":               page,
+            "set_num":            item.get("set_num", ""),
+            "qty":                item.get("qty", 0),
+            "clip_quality":       item.get("clip_quality", ""),
+            "segmentation_method": item.get("segmentation_method", ""),
+            "coverage_pct":       item.get("coverage_pct", 0.0),
+            "image_path":         str(masked_path),
+            "meta_path":          str(meta_path),
+        })
+
+    if not load_tensors:
+        raise HTTPException(status_code=422,
+            detail=f"No images could be loaded (total_input={total_input}, "
+                   f"skipped={len(skipped)}). "
+                   "Run POST /debug/export-training-packs first.")
+
+    # ── Batch encode ──────────────────────────────────────────────────────────
+    all_tensors = torch.cat(load_tensors, dim=0).to(device_str)  # (N, C, H, W)
+
+    all_feats: List[Any] = []
+    with torch.no_grad():
+        for b_start in range(0, all_tensors.shape[0], BATCH_SIZE):
+            batch = all_tensors[b_start : b_start + BATCH_SIZE]
+            feats = _clip_model.encode_image(batch)
+            feats = feats / feats.norm(dim=-1, keepdim=True)   # L2-normalise
+            all_feats.append(feats.cpu().float())
+
+    embeddings: np.ndarray = torch.cat(all_feats, dim=0).numpy()  # (N, D)
+    embed_dim  = int(embeddings.shape[1])
+
+    # ── Assign final index (= row in embeddings.npy) and build items.json ─────
+    items_out: List[Dict[str, Any]] = []
+    for idx, item_meta in enumerate(embed_items):
+        items_out.append({
+            "index":              idx,
+            "set_num":            item_meta["set_num"],
+            "page":               item_meta["page"],
+            "element_id":         item_meta["element_id"],
+            "qty":                item_meta["qty"],
+            "clip_quality":       item_meta["clip_quality"],
+            "segmentation_method": item_meta["segmentation_method"],
+            "coverage_pct":       item_meta["coverage_pct"],
+            "image_path":         item_meta["image_path"],
+            "meta_path":          item_meta["meta_path"],
+        })
+
+    # ── Write outputs ─────────────────────────────────────────────────────────
+    _CLIP_EMBEDDINGS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    embeddings_path = _CLIP_EMBEDDINGS_ROOT / "embeddings.npy"
+    items_path      = _CLIP_EMBEDDINGS_ROOT / "items.json"
+    manifest_out    = _CLIP_EMBEDDINGS_ROOT / "manifest.json"
+
+    np.save(str(embeddings_path), embeddings)
+
+    items_path.write_text(
+        json.dumps(items_out, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
+
+    manifest_out.write_text(
+        json.dumps({
+            "generated_at":    __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "model_name":      _CLIP_MODEL_NAME,
+            "pretrained":      _CLIP_PRETRAINED,
+            "device":          device_str,
+            "quality_filter":  quality_filter,
+            "total_input":     total_input,
+            "embedded_count":  len(items_out),
+            "skipped_count":   len(skipped),
+            "embedding_dim":   embed_dim,
+            "embeddings_path": str(embeddings_path),
+            "items_path":      str(items_path),
+            "skipped":         skipped,
+        }, indent=2, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+    return JSONResponse({
+        "ok":              True,
+        "total_input":     total_input,
+        "embedded_count":  len(items_out),
+        "skipped_count":   len(skipped),
+        "embedding_dim":   embed_dim,
+        "model_name":      f"{_CLIP_MODEL_NAME} / {_CLIP_PRETRAINED}",
+        "device":          device_str,
+        "output_paths": {
+            "embeddings":  str(embeddings_path),
+            "items":       str(items_path),
+            "manifest":    str(manifest_out),
+        },
     })
 
 
