@@ -8555,6 +8555,128 @@ def _clip_embed_image(img_path: str):
     return feat.cpu().float().numpy()[0]  # (512,)
 
 
+# ── Shape/silhouette helpers (Phase 4 reranker) ────────────────────────────────
+
+def _catalog_mask_from_image(img: np.ndarray) -> np.ndarray:
+    """
+    Extract a binary foreground mask from a catalog part image.
+    Handles BGRA (alpha channel) and BGR (white-bg threshold).
+    Returns uint8 mask: 255 = foreground, 0 = background.
+    """
+    if img is None or img.size == 0:
+        return np.zeros((1, 1), dtype=np.uint8)
+    if img.ndim == 3 and img.shape[2] == 4:
+        alpha = img[:, :, 3]
+        _, mask = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
+        return mask
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    _, mask = cv2.threshold(gray, 239, 255, cv2.THRESH_BINARY_INV)
+    return mask
+
+
+def _shape_features(mask: np.ndarray) -> Dict[str, Any]:
+    """
+    Compute shape descriptors from a binary mask.
+    Returns: aspect_ratio, solidity, extent, contour (largest), hu_moments, area.
+    All values default to 0 on empty/bad input.
+    """
+    _empty: Dict[str, Any] = {
+        "aspect_ratio": 0.0, "solidity": 0.0, "extent": 0.0,
+        "contour": None, "hu_moments": [0.0] * 7, "area": 0.0,
+    }
+    if mask is None or mask.size == 0:
+        return _empty
+    bw = np.where(mask > 127, np.uint8(255), np.uint8(0))
+    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return _empty
+    cnt = max(cnts, key=cv2.contourArea)
+    area = float(cv2.contourArea(cnt))
+    if area < 4:
+        return _empty
+    x, y, w, h = cv2.boundingRect(cnt)
+    w, h = max(w, 1), max(h, 1)
+    aspect_ratio = float(min(w, h)) / float(max(w, h))   # [0,1], rotation-invariant
+    extent = min(area / float(w * h), 1.0)
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull))
+    solidity = min(area / hull_area, 1.0) if hull_area > 0 else 0.0
+    M = cv2.moments(cnt)
+    hu = cv2.HuMoments(M).flatten().tolist()
+    return {
+        "aspect_ratio": aspect_ratio,
+        "solidity": solidity,
+        "extent": extent,
+        "contour": cnt,
+        "hu_moments": hu,
+        "area": area,
+    }
+
+
+def _shape_score(feat_q: Dict[str, Any], feat_c: Dict[str, Any]) -> float:
+    """
+    Composite shape similarity in [0, 1].
+    Weights: Hu-moments 0.40, aspect_ratio 0.30, solidity 0.15, extent 0.15.
+    """
+    import math
+    ar_sim  = max(0.0, 1.0 - abs(feat_q["aspect_ratio"] - feat_c["aspect_ratio"]))
+    cnt_q, cnt_c = feat_q.get("contour"), feat_c.get("contour")
+    if cnt_q is not None and cnt_c is not None and len(cnt_q) >= 3 and len(cnt_c) >= 3:
+        try:
+            hu_dist = float(cv2.matchShapes(cnt_q, cnt_c, cv2.CONTOURS_MATCH_I2, 0))
+            hu_dist = min(hu_dist, 5.0)
+        except Exception:
+            hu_dist = 5.0
+    else:
+        hu_dist = 5.0
+    hu_sim  = math.exp(-0.5 * hu_dist)
+    sol_sim = max(0.0, 1.0 - abs(feat_q["solidity"] - feat_c["solidity"]))
+    ext_sim = max(0.0, 1.0 - abs(feat_q["extent"]   - feat_c["extent"]))
+    return 0.30 * ar_sim + 0.40 * hu_sim + 0.15 * sol_sim + 0.15 * ext_sim
+
+
+def _shape_rerank(
+    query_mask_path: str,
+    top20: List[Dict[str, Any]],
+    alpha: float = 0.6,
+) -> List[Dict[str, Any]]:
+    """
+    Rerank CLIP top-20 by blending CLIP cosine score with shape similarity.
+        final_score = alpha * clip_score + (1 - alpha) * shape_score
+
+    Input items must have: clip_rank (int), clip_score (float), cat_item (dict w/ img_path).
+    Returns list sorted by final_score desc; each item gains shape_score, final_score.
+    """
+    q_mask = cv2.imread(query_mask_path, cv2.IMREAD_GRAYSCALE)
+    feat_q = _shape_features(q_mask)
+
+    result = []
+    for item in top20:
+        clip_score  = item["clip_score"]
+        img_path    = item["cat_item"].get("img_path", "")
+        shape_score = 0.0
+        feat_c_safe: Dict[str, Any] = {}
+        if img_path and Path(img_path).exists():
+            try:
+                cat_img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                if cat_img is not None and cat_img.size > 0:
+                    cat_mask    = _catalog_mask_from_image(cat_img)
+                    feat_c      = _shape_features(cat_mask)
+                    shape_score = _shape_score(feat_q, feat_c)
+                    feat_c_safe = {k: v for k, v in feat_c.items() if k != "contour"}
+            except Exception:
+                pass
+        final_score = alpha * clip_score + (1.0 - alpha) * shape_score
+        result.append({
+            **item,
+            "shape_score": round(shape_score, 4),
+            "final_score": round(final_score, 4),
+            "shape_feat_c": feat_c_safe,
+        })
+    result.sort(key=lambda x: -x["final_score"])
+    return result
+
+
 def _match_file_url(abs_path: str) -> str:
     return f"/debug/clip-match-file?path={_url_quote(abs_path)}"
 
@@ -8585,8 +8707,78 @@ def clip_match_file(path: str = Query(...)) -> FileResponse:
     return FileResponse(str(resolved))
 
 
+@router.get("/debug/shape-overlay-diagnostic")
+def shape_overlay_diagnostic(
+    stem: str = Query(...),
+    part_num: str = Query(...),
+    color_id: str = Query(...),
+    size: int = Query(256, ge=64, le=512),
+):
+    """
+    In-memory PNG: query silhouette (green) vs catalog silhouette (blue), both normalised.
+    No files written to disk.
+    """
+    from fastapi.responses import Response as _RawResp
+
+    pack_dir  = _TRAINING_PACK_ROOT / stem
+    mask_path = pack_dir / "mask.png"
+    if not mask_path.exists():
+        raise HTTPException(status_code=404, detail=f"mask.png not found: {stem}")
+
+    q_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    feat_q = _shape_features(q_mask)
+    cnt_q  = feat_q.get("contour")
+
+    cnt_c = None
+    try:
+        _, cat_items_local = _cat_emb_load()
+        for it in cat_items_local:
+            if (str(it.get("part_num", "")) == str(part_num)
+                    and str(it.get("color_id", "")) == str(color_id)):
+                img_p = it.get("img_path", "")
+                if img_p and Path(img_p).exists():
+                    cat_img = cv2.imread(img_p, cv2.IMREAD_UNCHANGED)
+                    if cat_img is not None:
+                        cat_mask = _catalog_mask_from_image(cat_img)
+                        feat_c   = _shape_features(cat_mask)
+                        cnt_c    = feat_c.get("contour")
+                break
+    except Exception:
+        pass
+
+    sz     = max(64, min(size, 512))
+    canvas = np.full((sz, sz, 3), 245, dtype=np.uint8)
+
+    def _draw_norm(cnv: np.ndarray, cnt, color: tuple, thickness: int = 2) -> None:
+        if cnt is None or len(cnt) < 3:
+            return
+        pts = cnt.reshape(-1, 2).astype(np.float32)
+        mn, mx = pts.min(axis=0), pts.max(axis=0)
+        rng = mx - mn
+        rng[rng < 1] = 1
+        margin = sz * 0.08
+        scale  = (sz - 2 * margin) / rng.max()
+        pts    = (pts - mn) * scale + margin
+        pts    = pts.astype(np.int32).reshape(-1, 1, 2)
+        cv2.drawContours(cnv, [pts], -1, color, thickness, cv2.LINE_AA)
+
+    _draw_norm(canvas, cnt_q, (30, 160, 30))   # green = query
+    _draw_norm(canvas, cnt_c, (30,  30, 200))   # blue  = catalog
+    lbl_y = sz - 8
+    cv2.putText(canvas, "Q=query",   (6, lbl_y - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (30, 160, 30), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "C=catalog", (6, lbl_y),       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (30,  30, 200), 1, cv2.LINE_AA)
+
+    ok, buf = cv2.imencode(".png", canvas)
+    if not ok:
+        raise HTTPException(status_code=500, detail="PNG encode failed")
+    return _RawResp(content=buf.tobytes(), media_type="image/png")
+
+
 @router.get("/debug/catalog-match-test")
-def catalog_match_test(stem: str = Query("")) -> HTMLResponse:
+def catalog_match_test(
+    stem: str = Query(""),
+    alpha: float = Query(0.6, ge=0.0, le=1.0),
+) -> HTMLResponse:
     """
     Visual nearest-neighbour test: training-pack crop → top-20 catalog matches.
 
@@ -8622,9 +8814,10 @@ def catalog_match_test(stem: str = Query("")) -> HTMLResponse:
     if not pack_dir.exists():
         raise HTTPException(status_code=404, detail=f"Training pack not found: {stem}")
 
-    masked_path  = pack_dir / "masked.png"
+    masked_path   = pack_dir / "masked.png"
     original_path = pack_dir / "original.png"
     overlay_path  = pack_dir / "overlay.png"
+    mask_path     = pack_dir / "mask.png"
     meta_path     = pack_dir / "meta.json"
 
     if not masked_path.exists():
@@ -8650,9 +8843,27 @@ def catalog_match_test(stem: str = Query("")) -> HTMLResponse:
         raise HTTPException(status_code=500,
             detail=f"Failed to embed query image: {exc}")
 
-    # ── Dot-product similarity (both sides L2-normalised = cosine sim) ─────────
+    # ── CLIP top-20 ───────────────────────────────────────────────────────────
     scores = (cat_matrix @ query_vec).tolist()   # (N,)
     ranked = sorted(enumerate(scores), key=lambda x: -x[1])[:20]
+    top20 = [
+        {
+            "clip_rank":  rank,
+            "clip_score": score,
+            "cat_idx":    cat_idx,
+            "cat_item":   cat_items[cat_idx],
+        }
+        for rank, (cat_idx, score) in enumerate(ranked, 1)
+    ]
+
+    # ── Shape rerank ──────────────────────────────────────────────────────────
+    if mask_path.exists():
+        reranked = _shape_rerank(str(mask_path), top20, alpha=alpha)
+    else:
+        reranked = [
+            {**it, "shape_score": 0.0, "final_score": it["clip_score"], "shape_feat_c": {}}
+            for it in top20
+        ]
 
     # ── Load pack meta ────────────────────────────────────────────────────────
     pack_meta: Dict[str, Any] = {}
@@ -8669,6 +8880,15 @@ def catalog_match_test(stem: str = Query("")) -> HTMLResponse:
     iou_val    = pack_meta.get("iou")
     iou_str    = f"{iou_val:.3f}" if iou_val is not None else "—"
     qty        = pack_meta.get("qty", "?")
+
+    # ── Query shape features (for left-panel display) ─────────────────────────
+    q_shape: Dict[str, Any] = {}
+    if mask_path.exists():
+        try:
+            q_mask_arr = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            q_shape = _shape_features(q_mask_arr)
+        except Exception:
+            pass
 
     # ── Build nav (prev / next stem) ──────────────────────────────────────────
     all_stems = sorted(
@@ -8690,68 +8910,115 @@ def catalog_match_test(stem: str = Query("")) -> HTMLResponse:
                     f'border:1px solid #ccc;border-radius:4px;background:#fff;">')
         return f'<div style="width:{w}px;height:{w}px;background:#eee;border-radius:4px;"></div>'
 
+    def _score_bar(score: float, color: str, label: str, pct_str: str) -> str:
+        bw = max(3, int(score * 100))
+        return (
+            f'<div style="display:flex;align-items:center;gap:4px;margin-top:2px;">'
+            f'<span style="font-size:9px;color:#888;width:34px;text-align:right;">{label}</span>'
+            f'<div style="flex:1;background:#eee;border-radius:2px;height:4px;">'
+            f'<div style="width:{bw}%;height:4px;background:{color};border-radius:2px;"></div>'
+            f'</div>'
+            f'<span style="font-size:10px;font-weight:600;color:{color};width:38px;">{pct_str}</span>'
+            f'</div>'
+        )
+
     # Left panel — query crop
+    ar_str  = f"{q_shape.get('aspect_ratio', 0):.2f}" if q_shape else "—"
+    sol_str = f"{q_shape.get('solidity', 0):.2f}"     if q_shape else "—"
+    ext_str = f"{q_shape.get('extent', 0):.2f}"       if q_shape else "—"
+    mask_warn = (
+        '<div style="font-size:10px;color:#b00020;margin-top:4px;">⚠ mask.png missing — shape=0</div>'
+        if not mask_path.exists() else ""
+    )
+    alpha_links = (
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(stem)}&alpha=1.0" style="font-size:10px;">pure CLIP</a>'
+        f' &nbsp;|&nbsp; '
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(stem)}&alpha=0.0" style="font-size:10px;">pure shape</a>'
+        f' &nbsp;|&nbsp; '
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(stem)}&alpha=0.6" style="font-size:10px;">α=0.6</a>'
+    )
     left_html = (
         f'<div style="min-width:200px;max-width:220px;">'
         f'<div style="font-size:13px;font-weight:700;margin-bottom:8px;color:#1a2a3a;">'
         f'  element {_esc(str(element_id))} &nbsp;<span style="font-weight:400;color:#778;">p{_esc(str(page))}</span>'
         f'</div>'
-        f'<div style="font-size:11px;color:#556677;margin-bottom:10px;">'
-        f'  method: {_esc(method)} &nbsp;|&nbsp; cov: {cov:.1f}% &nbsp;|&nbsp; iou: {iou_str}<br>'
-        f'  qty: {_esc(str(qty))}'
+        f'<div style="font-size:11px;color:#556677;margin-bottom:4px;">'
+        f'  method: {_esc(method)} &nbsp;|&nbsp; cov: {cov:.1f}%<br>'
+        f'  iou: {iou_str} &nbsp;|&nbsp; qty: {_esc(str(qty))}'
         f'</div>'
-        f'<div style="font-size:11px;color:#aaa;margin-bottom:4px;">original</div>'
+        f'<div style="font-size:11px;color:#556677;margin-bottom:4px;">'
+        f'  shape: ar={ar_str} &nbsp; sol={sol_str} &nbsp; ext={ext_str}'
+        f'</div>'
+        f'<div style="font-size:11px;color:#334;margin-bottom:6px;">'
+        f'  α = <strong>{alpha:.2f}</strong> &nbsp; {alpha_links}'
+        f'</div>'
+        + mask_warn
+        + f'<div style="font-size:11px;color:#aaa;margin:6px 0 4px;">original</div>'
         + _img(original_path, 160)
         + f'<div style="font-size:11px;color:#aaa;margin:8px 0 4px;">masked (query)</div>'
         + _img(masked_path, 160)
         + f'<div style="font-size:11px;color:#aaa;margin:8px 0 4px;">overlay</div>'
         + _img(overlay_path, 160)
         + f'<div style="margin-top:16px;font-size:11px;">'
-        f'<a href="/debug/catalog-match-test?stem={_url_quote(prev_s)}">◀ prev</a>'
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(prev_s)}&alpha={alpha}">◀ prev</a>'
         f'&nbsp;&nbsp;'
         f'<a href="/debug/catalog-match-test">list</a>'
         f'&nbsp;&nbsp;'
-        f'<a href="/debug/catalog-match-test?stem={_url_quote(next_s)}">next ▶</a>'
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(next_s)}&alpha={alpha}">next ▶</a>'
         f'</div>'
         f'</div>'
     )
 
-    # Right panel — top-20 matches grid
+    # Right panel — reranked match cards
     match_cards = ""
-    for rank, (cat_idx, score) in enumerate(ranked, 1):
-        cat_item = cat_items[cat_idx]
-        part_num = cat_item.get("part_num", "?")
-        color_id = cat_item.get("color_id", "?")
-        img_p    = Path(cat_item.get("img_path", ""))
-        score_pct = f"{score * 100:.1f}%"
-        bar_w   = max(4, int(score * 100))
+    for final_rank, item in enumerate(reranked, 1):
+        clip_rank   = item["clip_rank"]
+        clip_score  = item["clip_score"]
+        shape_score = item["shape_score"]
+        final_score = item["final_score"]
+        cat_item    = item["cat_item"]
+        part_num    = cat_item.get("part_num", "?")
+        color_id    = cat_item.get("color_id", "?")
+        img_p       = Path(cat_item.get("img_path", ""))
 
-        score_col = (
-            "#2a7a2a" if score >= 0.85 else
-            "#7a6a14" if score >= 0.70 else
-            "#556677"
+        rank_moved = clip_rank != final_rank
+        clip_col  = "#2a7a2a" if clip_score  >= 0.85 else "#7a6a14" if clip_score  >= 0.70 else "#556677"
+        shape_col = "#2a7a2a" if shape_score >= 0.70 else "#7a6a14" if shape_score >= 0.50 else "#556677"
+        final_col = "#2a7a2a" if final_score >= 0.80 else "#7a6a14" if final_score >= 0.65 else "#556677"
+        rank_badge = (
+            f'<span style="font-size:9px;color:#b07000;font-weight:700;" title="CLIP rank was #{clip_rank}">↕CLIP#{clip_rank}</span>'
+            if rank_moved else
+            f'<span style="font-size:9px;color:#aaa;">CLIP#{clip_rank}</span>'
+        )
+        overlay_url = (
+            f'/debug/shape-overlay-diagnostic?stem={_url_quote(stem)}'
+            f'&part_num={_url_quote(str(part_num))}&color_id={_url_quote(str(color_id))}'
         )
         match_cards += (
             f'<div style="display:flex;flex-direction:column;align-items:center;'
             f'background:#fff;border:1px solid #dde3ec;border-radius:6px;'
-            f'padding:8px;width:130px;box-shadow:0 1px 3px rgba(0,0,0,.06);">'
-            f'<div style="font-size:10px;color:#aaa;align-self:flex-start;">#{rank}</div>'
+            f'padding:8px;width:155px;box-shadow:0 1px 3px rgba(0,0,0,.06);">'
+            f'<div style="display:flex;justify-content:space-between;width:100%;margin-bottom:2px;">'
+            f'<span style="font-size:11px;font-weight:700;color:#1a2a3a;">#{final_rank}</span>'
+            f'{rank_badge}'
+            f'</div>'
             + _img(img_p, 110)
             + f'<div style="font-size:12px;font-weight:600;margin-top:6px;color:#1a2a3a;">'
             f'{_esc(str(part_num))}</div>'
-            f'<div style="font-size:11px;color:#778;">color {_esc(str(color_id))}</div>'
-            f'<div style="margin-top:4px;width:100%;background:#eee;border-radius:3px;height:4px;">'
-            f'  <div style="width:{bar_w}%;height:4px;background:{score_col};border-radius:3px;"></div>'
+            f'<div style="font-size:10px;color:#778;margin-bottom:4px;">color {_esc(str(color_id))}</div>'
+            + _score_bar(clip_score,  clip_col,  "CLIP",  f"{clip_score  * 100:.1f}%")
+            + _score_bar(shape_score, shape_col, "shape", f"{shape_score * 100:.1f}%")
+            + _score_bar(final_score, final_col, "final", f"{final_score * 100:.1f}%")
+            + f'<div style="margin-top:6px;">'
+            f'<a href="{overlay_url}" target="_blank" style="font-size:9px;color:#2a6bcc;">overlay ↗</a>'
             f'</div>'
-            f'<div style="font-size:11px;font-weight:600;color:{score_col};margin-top:2px;">'
-            f'{score_pct}</div>'
             f'</div>'
         )
 
     right_html = (
         f'<div>'
         f'<div style="font-size:13px;font-weight:700;color:#1a2a3a;margin-bottom:12px;">'
-        f'Top 20 catalog matches</div>'
+        f'Top 20 matches &mdash; sorted by final score (α={alpha:.2f})</div>'
         f'<div style="display:flex;flex-wrap:wrap;gap:10px;">'
         + match_cards
         + f'</div></div>'
