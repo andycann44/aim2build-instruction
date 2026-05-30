@@ -1,12 +1,12 @@
 import json
 from html import escape
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, Form, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Form, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from clean.services import (
     auto_confirm_service,
@@ -18,6 +18,13 @@ from clean.services import (
     step_sequence_bag_service,
 )
 from clean.services.page_analyzer import analyze_page, configure_pages_dir
+from clean.services.training_bundle_index_service import (
+    list_review_queue,
+    get_review_stats,
+    update_review as update_training_bundle_review,
+    list_confirmed_part_usage,
+    unconfirm_candidate_part,
+)
 router = APIRouter()
 
 
@@ -2078,3 +2085,97 @@ def debug_set_overview(set_num: str = Query(...)):
         </html>
         """
     )
+
+
+# ---------------------------------------------------------------------------
+# Production training-store API routes
+# Thin wrappers — all logic lives in training_bundle_index_service.
+# The /debug/training-store/* equivalents in instruction_debug.py are untouched.
+# ---------------------------------------------------------------------------
+
+@router.get("/api/training-store/review-queue")
+def api_training_store_review_queue(
+    review_status: str = Query(""),
+    set_num: str = Query(""),
+    bag_num: str = Query(""),
+    limit: int = Query(100),
+):
+    try:
+        result = list_review_queue(
+            review_status=review_status,
+            set_num=set_num,
+            bag_num=bag_num,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.get("/api/training-store/review-stats")
+def api_training_store_review_stats():
+    try:
+        result = get_review_stats()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/api/training-store/review")
+async def api_training_store_review(req: Request):
+    payload: Dict[str, Any] = {}
+    try:
+        body = await req.json()
+        if isinstance(body, dict):
+            payload = dict(body)
+    except Exception:
+        payload = {}
+    try:
+        result = update_training_bundle_review(
+            str(payload.get("bundle_id") or ""),
+            review_status=str(payload.get("review_status") or ""),
+            review_notes=str(payload.get("review_notes") or ""),
+            mask_quality=payload.get("mask_quality"),
+            split_quality=payload.get("split_quality"),
+            qty_text_present=bool(payload.get("qty_text_present")),
+            multi_part_merge=bool(payload.get("multi_part_merge")),
+            reviewed_by=str(payload.get("reviewed_by") or ""),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.get("/api/training-store/confirmed-part-usage")
+def api_training_store_confirmed_part_usage(
+    set_num: str = Query(...),
+    part_num: str = Query(...),
+    color_id: int = Query(...),
+    element_id: str = Query(""),
+    required_qty: str = Query(""),
+):
+    try:
+        result = list_confirmed_part_usage(
+            set_num=set_num,
+            part_num=part_num,
+            color_id=color_id,
+            element_id=element_id,
+            required_qty=required_qty,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
+
+
+@router.post("/api/training-store/unconfirm-candidate-part")
+def api_training_store_unconfirm_candidate_part(
+    bundle_id: str = Query(...),
+    candidate_index: int = Query(...),
+):
+    try:
+        result = unconfirm_candidate_part(bundle_id=bundle_id, candidate_index=candidate_index)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(result)
