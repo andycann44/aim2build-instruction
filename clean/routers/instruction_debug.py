@@ -90,7 +90,8 @@ _PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 _AUTO_MASK_CACHE_DIR = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "auto_mask_cache"
 _ELEMENT_PAGE_EXTRACT_ROOT = Path("/Users/olly/aim2build-instruction/debug/element_page_extract")
-_SAM2_TEST_ROOT = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
+_SAM2_TEST_ROOT            = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
+_TRAINING_PACK_ROOT        = Path("/Users/olly/aim2build-instruction/debug/element_training_packs")
 
 # Lazy-loaded SAM2 model state (populated on first POST /debug/sam2-test call)
 _sam2_processor: Any = None
@@ -6347,6 +6348,212 @@ def segment_element_crops_preview(page: int = Query(-1)) -> HTMLResponse:
         + "</table></body></html>"
     )
     return HTMLResponse(content=html)
+
+
+@router.post("/debug/export-training-packs")
+async def export_training_packs(req: Request) -> JSONResponse:
+    """
+    Package segmented element crops into per-element training-pack folders.
+
+    Reads existing segmented outputs from:
+        debug/element_page_extract/page_XXX/segmented/
+
+    Writes to:
+        debug/element_training_packs/<stem>/
+            original.png   (extracted thumbnail)
+            mask.png
+            masked.png
+            overlay.png
+            meta.json      (element_id, qty, set_num, segmentation fields,
+                            clip_quality, source_paths)
+        debug/element_training_packs/manifest.json
+
+    Input JSON
+    ----------
+    { "pages": [309, 310, 311] }    — defaults to [309, 310, 311]
+
+    clip_quality rules
+    ------------------
+    high   : coverage_pct >= 20
+    medium : coverage_pct >= 10 and < 20
+    low    : coverage_pct < 10
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    raw_pages = body.get("pages") or [309, 310, 311]
+    try:
+        pages: List[int] = [int(p) for p in raw_pages]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="pages must be a list of integers")
+
+    _TRAINING_PACK_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def _clip_quality(cov: float) -> str:
+        if cov >= 20:
+            return "high"
+        if cov >= 10:
+            return "medium"
+        return "low"
+
+    def _set_num_from_image_path(image_path: str) -> str:
+        """Extract set number from paths like .../debug/70618/70618_01/pages/page_309.png"""
+        try:
+            parts = Path(image_path).parts
+            idx = parts.index("debug")
+            return parts[idx + 1]
+        except (ValueError, IndexError):
+            return "unknown"
+
+    manifest_entries: List[Dict[str, Any]] = []
+    total_exported = 0
+    missing_files  = 0
+    cq_counts: Dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+
+    for page in pages:
+        page_dir = _ELEMENT_PAGE_EXTRACT_ROOT / f"page_{page:03d}"
+        seg_dir  = page_dir / "segmented"
+        if not seg_dir.exists():
+            continue
+
+        # ── Load per-page manifest to resolve qty and set_num ────────────────
+        qty_map:  Dict[str, int]  = {}
+        set_num:  str             = "unknown"
+        page_manifest_path = page_dir / "manifest.json"
+        if page_manifest_path.exists():
+            try:
+                pm = json.loads(page_manifest_path.read_text(encoding="utf-8"))
+                set_num = _set_num_from_image_path(pm.get("image_path", ""))
+                for item in pm.get("items", []):
+                    eid = str(item.get("element_id", ""))
+                    if eid:
+                        qty_map[eid] = item.get("qty") or 0
+            except Exception:
+                pass
+
+        # ── Process each segmented crop ───────────────────────────────────────
+        for meta_path in sorted(seg_dir.glob("*_meta.json")):
+            try:
+                seg_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                missing_files += 1
+                continue
+
+            stem       = seg_meta.get("stem", meta_path.stem.replace("_meta", ""))
+            element_id = stem.replace("elem_", "").split("_p")[0]
+            cov        = seg_meta.get("coverage_pct", 0.0)
+            cq         = _clip_quality(cov)
+
+            # ── Create item folder ────────────────────────────────────────────
+            item_dir = _TRAINING_PACK_ROOT / stem
+            item_dir.mkdir(parents=True, exist_ok=True)
+
+            # ── Copy source files → canonical names ───────────────────────────
+            src_original = Path(seg_meta.get("crop_path", ""))
+            src_mask     = Path(seg_meta.get("mask_path", ""))
+            src_masked   = Path(seg_meta.get("masked_path", ""))
+            src_overlay  = Path(seg_meta.get("overlay_path", ""))
+
+            file_map = {
+                "original.png": src_original,
+                "mask.png":     src_mask,
+                "masked.png":   src_masked,
+                "overlay.png":  src_overlay,
+            }
+            src_ok = True
+            for dest_name, src_path in file_map.items():
+                dest = item_dir / dest_name
+                if src_path.exists():
+                    shutil.copy2(str(src_path), str(dest))
+                else:
+                    missing_files += 1
+                    src_ok = False
+
+            # ── Write item meta.json ──────────────────────────────────────────
+            item_meta: Dict[str, Any] = {
+                "set_num":              set_num,
+                "page":                 page,
+                "element_id":           element_id,
+                "qty":                  qty_map.get(element_id, 0),
+                "segmentation_method":  seg_meta.get("segmentation_method"),
+                "coverage_pct":         cov,
+                "iou":                  seg_meta.get("iou"),
+                "clip_quality":         cq,
+                "sam2_reject_reason":   seg_meta.get("sam2_reject_reason"),
+                "reject_reason":        seg_meta.get("reject_reason"),
+                "largest_component_pct": seg_meta.get("largest_component_pct"),
+                "mask_components":      seg_meta.get("mask_components"),
+                "elapsed_ms":           seg_meta.get("elapsed_ms"),
+                "source_paths": {
+                    "original": str(src_original),
+                    "mask":     str(src_mask),
+                    "masked":   str(src_masked),
+                    "overlay":  str(src_overlay),
+                },
+                "pack_paths": {
+                    "original": str(item_dir / "original.png"),
+                    "mask":     str(item_dir / "mask.png"),
+                    "masked":   str(item_dir / "masked.png"),
+                    "overlay":  str(item_dir / "overlay.png"),
+                },
+            }
+            (item_dir / "meta.json").write_text(
+                json.dumps(item_meta, indent=2, ensure_ascii=True), encoding="utf-8"
+            )
+
+            # ── Manifest entry ────────────────────────────────────────────────
+            manifest_entries.append({
+                "set_num":             set_num,
+                "page":                page,
+                "element_id":          element_id,
+                "qty":                 qty_map.get(element_id, 0),
+                "segmentation_method": seg_meta.get("segmentation_method"),
+                "coverage_pct":        cov,
+                "iou":                 seg_meta.get("iou"),
+                "clip_quality":        cq,
+                "source_paths": {
+                    "original": str(src_original),
+                    "mask":     str(src_mask),
+                    "masked":   str(src_masked),
+                    "overlay":  str(src_overlay),
+                },
+            })
+
+            cq_counts[cq] += 1
+            if src_ok:
+                total_exported += 1
+
+    # ── Write top-level manifest ──────────────────────────────────────────────
+    manifest_path = _TRAINING_PACK_ROOT / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "generated_at":  __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                "pages":         pages,
+                "total":         len(manifest_entries),
+                "clip_quality":  cq_counts,
+                "missing_files": missing_files,
+                "items":         manifest_entries,
+            },
+            indent=2,
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+
+    return JSONResponse({
+        "ok":            True,
+        "total_exported": total_exported,
+        "high":           cq_counts["high"],
+        "medium":         cq_counts["medium"],
+        "low":            cq_counts["low"],
+        "missing_files":  missing_files,
+        "pages_processed": pages,
+        "manifest_path":  str(manifest_path),
+        "pack_root":      str(_TRAINING_PACK_ROOT),
+    })
 
 
 @router.post("/debug/training-store/upload-r2")
