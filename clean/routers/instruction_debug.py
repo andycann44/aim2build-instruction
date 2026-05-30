@@ -21,6 +21,7 @@ from html import escape
 import hashlib
 import json
 import os
+import random
 import shutil
 import sqlite3
 import tempfile
@@ -88,6 +89,13 @@ router = APIRouter()
 _PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 _AUTO_MASK_CACHE_DIR = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "auto_mask_cache"
+_ELEMENT_PAGE_EXTRACT_ROOT = Path("/Users/olly/aim2build-instruction/debug/element_page_extract")
+_SAM2_TEST_ROOT = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
+
+# Lazy-loaded SAM2 model state (populated on first POST /debug/sam2-test call)
+_sam2_processor: Any = None
+_sam2_model: Any = None
+_sam2_load_error: Optional[str] = None
 
 
 def _page_callout_cache_key(set_num: str, page: int) -> Tuple[str, int]:
@@ -5098,6 +5106,1249 @@ def _dry_run_enabled(value: str) -> bool:
     return text not in {"0", "false", "no", "off"}
 
 
+def _resolve_debug_training_path(path_value: Any) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return ""
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = Path("/Users/olly/aim2build-instruction") / path
+    return str(path.resolve(strict=False))
+
+
+def _planned_ai_crop_fix_path(path_value: Any, suffix: str) -> str:
+    resolved = _resolve_debug_training_path(path_value)
+    if not resolved:
+        return ""
+    path = Path(resolved)
+    return str(path.with_name(f"{path.stem}{suffix}{path.suffix or '.png'}"))
+
+
+def _request_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text not in {"0", "false", "no", "off"}
+
+
+def _ai_crop_fix_bundle_dir(bundle_id: str) -> Path:
+    safe_bundle_id = str(bundle_id or "").strip()
+    if not safe_bundle_id or not re.fullmatch(r"[A-Za-z0-9_.-]+", safe_bundle_id):
+        raise ValueError("invalid bundle_id")
+    analysis_root = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "analysis_bundles"
+    ).resolve()
+    bundle_dir = (analysis_root / safe_bundle_id).resolve()
+    if analysis_root not in bundle_dir.parents:
+        raise ValueError("bundle path escapes analysis bundle directory")
+    return bundle_dir
+
+
+def _ai_crop_fix_candidate_from_index(bundle_id: str, candidate_id: str) -> Dict[str, Any]:
+    try:
+        row = dict(get_training_bundle_index_row(bundle_id).get("row") or {})
+    except Exception:
+        row = {}
+    paths = row.get("split_candidate_paths") if isinstance(row.get("split_candidate_paths"), dict) else {}
+    candidates = [
+        dict(item)
+        for item in list(paths.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    if not candidates:
+        return {}
+    candidate_text = str(candidate_id or "").strip()
+    candidate_index = _coerce_int(candidate_text)
+    for candidate in candidates:
+        values = {
+            str(candidate.get("candidate_id") or "").strip(),
+            str(candidate.get("id") or "").strip(),
+            str(candidate.get("name") or "").strip(),
+        }
+        if candidate_text and candidate_text in values:
+            return candidate
+        if candidate_index is not None and _coerce_int(candidate.get("index")) == candidate_index:
+            return candidate
+    if candidate_index is not None and 0 <= candidate_index < len(candidates):
+        return candidates[candidate_index]
+    return {}
+
+
+def _first_existing_path(candidates: List[Path]) -> str:
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return str(path)
+    return str(candidates[0]) if candidates else ""
+
+
+def _ai_crop_fix_safe_component(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._")
+    return safe or fallback
+
+
+def _resolve_ai_crop_fix_preview_paths(bundle_id: str, candidate_id: str) -> Dict[str, str]:
+    bundle_dir = _ai_crop_fix_bundle_dir(bundle_id)
+    candidate = _ai_crop_fix_candidate_from_index(bundle_id, candidate_id)
+    candidate_text = str(candidate_id or "").strip()
+    candidate_index = _coerce_int(candidate_text)
+    stem_candidates: List[str] = []
+    if candidate_text:
+        stem_candidates.append(Path(candidate_text).stem)
+    if candidate_index is not None:
+        stem_candidates.extend(
+            [
+                f"baseline_slot_candidate_{int(candidate_index)}",
+                f"split_candidate_{int(candidate_index)}",
+                f"candidate_{int(candidate_index)}",
+            ]
+        )
+    stem_candidates = [stem for index, stem in enumerate(stem_candidates) if stem and stem not in stem_candidates[:index]]
+
+    original_candidate_path = _first_existing_path([bundle_dir / "original_crop.png"])
+    original_alpha_path = str(
+        candidate.get("qty_scrubbed_mask_path")
+        or candidate.get("mask_path")
+        or candidate.get("alpha_path")
+        or ""
+    ).strip()
+
+    if not Path(original_candidate_path).exists():
+        original_candidate_path = _first_existing_path(
+            [bundle_dir / f"{stem}.png" for stem in stem_candidates]
+        )
+    if not original_alpha_path:
+        original_alpha_path = _first_existing_path(
+            [
+                candidate_path
+                for stem in stem_candidates
+                for candidate_path in (
+                    bundle_dir / f"{stem}_mask.png",
+                    bundle_dir / f"{stem}_raw_mask.png",
+                    bundle_dir / f"{stem}_qty_scrubbed_mask.png",
+                )
+            ]
+        )
+
+    repaired_candidate_path = _planned_ai_crop_fix_path(
+        original_candidate_path,
+        "_ai_crop_fix_repaired_candidate",
+    )
+    repaired_alpha_path = _planned_ai_crop_fix_path(
+        original_alpha_path,
+        "_ai_crop_fix_repaired_alpha",
+    )
+    return {
+        "original_candidate_path": _resolve_debug_training_path(original_candidate_path),
+        "original_alpha_path": _resolve_debug_training_path(original_alpha_path),
+        "repaired_candidate_path": repaired_candidate_path,
+        "repaired_alpha_path": repaired_alpha_path,
+    }
+
+
+def _write_ai_crop_fix_request_package(
+    *,
+    bundle_id: str,
+    candidate_id: str,
+    current_candidate_path: str,
+    current_alpha_path: str,
+    reference_candidate_path: str,
+    slot_overlay_path: str,
+    qty: Any,
+    metadata: Dict[str, Any],
+    resolved_absolute_paths: Dict[str, str],
+) -> Dict[str, Any]:
+    safe_bundle_id = _ai_crop_fix_safe_component(bundle_id, "bundle")
+    safe_candidate_id = _ai_crop_fix_safe_component(candidate_id, "candidate")
+    package_dir = (
+        Path("/Users/olly/aim2build-instruction")
+        / "debug"
+        / "ai_training"
+        / "ai_crop_fix_requests"
+        / f"{safe_bundle_id}_{safe_candidate_id}"
+    )
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_files: List[str] = []
+    copy_plan = [
+        ("candidate.png", resolved_absolute_paths.get("current_candidate_path", "")),
+        ("alpha.png", resolved_absolute_paths.get("current_alpha_path", "")),
+    ]
+    reference_source = resolved_absolute_paths.get("reference_candidate_path", "")
+    if reference_source and Path(reference_source).exists() and Path(reference_source).is_file():
+        copy_plan.append(("reference_candidate.png", reference_source))
+    overlay_source = resolved_absolute_paths.get("slot_overlay_path", "")
+    if overlay_source and Path(overlay_source).exists() and Path(overlay_source).is_file():
+        copy_plan.append(("overlay.png", overlay_source))
+    for filename, source in copy_plan:
+        if not source:
+            continue
+        target = package_dir / filename
+        shutil.copy2(source, target)
+        copied_files.append(str(target))
+
+    request_payload = {
+        "bundle_id": bundle_id,
+        "candidate_id": candidate_id,
+        "qty": qty,
+        "metadata": metadata,
+        "received_paths": {
+            "current_candidate_path": current_candidate_path,
+            "current_alpha_path": current_alpha_path,
+            "reference_candidate_path": reference_candidate_path,
+            "slot_overlay_path": slot_overlay_path,
+        },
+        "resolved_absolute_paths": resolved_absolute_paths,
+        "package_path": str(package_dir),
+        "created_at": _iso_now(),
+        "mode": "ai_scaffold",
+        "openai_called": False,
+    }
+    request_path = package_dir / "request.json"
+    request_path.write_text(json.dumps(request_payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    copied_files.append(str(request_path))
+    return {
+        "package_path": str(package_dir),
+        "files": copied_files,
+    }
+
+
+def _alpha_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    if mask is None or getattr(mask, "size", 0) == 0:
+        return None
+    ys, xs = np.where(mask > 10)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    x0 = int(xs.min())
+    y0 = int(ys.min())
+    x1 = int(xs.max()) + 1
+    y1 = int(ys.max()) + 1
+    return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
+
+
+def _write_ai_crop_fix_matched_placeholder(
+    *,
+    original_crop_path: str,
+    alpha_path: str,
+    reference_candidate_path: str,
+    repaired_candidate_path: str,
+    repaired_alpha_path: str,
+) -> Dict[str, Any]:
+    original = cv2.imread(original_crop_path, cv2.IMREAD_COLOR)
+    alpha = cv2.imread(alpha_path, cv2.IMREAD_GRAYSCALE)
+    reference = cv2.imread(reference_candidate_path, cv2.IMREAD_UNCHANGED) if reference_candidate_path else None
+    if original is None or getattr(original, "size", 0) == 0:
+        raise ValueError("original crop could not be read")
+    if alpha is None or getattr(alpha, "size", 0) == 0:
+        raise ValueError("alpha mask could not be read")
+    if reference is None or getattr(reference, "size", 0) == 0:
+        raise ValueError("reference candidate could not be read")
+
+    if len(reference.shape) == 3 and reference.shape[2] == 4:
+        reference_bgr = reference[:, :, :3]
+        reference_alpha = reference[:, :, 3]
+    elif len(reference.shape) == 3:
+        reference_bgr = reference[:, :, :3]
+        reference_alpha = alpha
+    else:
+        reference_bgr = cv2.cvtColor(reference, cv2.COLOR_GRAY2BGR)
+        reference_alpha = alpha
+
+    ref_h, ref_w = reference_bgr.shape[:2]
+    if original.shape[0] < ref_h or original.shape[1] < ref_w:
+        raise ValueError("reference candidate is larger than original crop")
+    mask = (reference_alpha > 10).astype(np.uint8) * 255
+    if mask.shape[:2] != (ref_h, ref_w):
+        mask = cv2.resize(mask, (ref_w, ref_h), interpolation=cv2.INTER_NEAREST)
+
+    result = cv2.matchTemplate(original, reference_bgr, cv2.TM_CCORR_NORMED, mask=mask)
+    result = np.nan_to_num(result, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+    match_x, match_y = int(max_loc[0]), int(max_loc[1])
+    matched_bgr = original[match_y : match_y + ref_h, match_x : match_x + ref_w]
+    if matched_bgr.shape[:2] != (ref_h, ref_w):
+        raise ValueError("matched crop could not be extracted")
+
+    out_alpha = alpha
+    if out_alpha.shape[:2] != (ref_h, ref_w):
+        out_alpha = cv2.resize(out_alpha, (ref_w, ref_h), interpolation=cv2.INTER_NEAREST)
+    repaired_rgba = cv2.cvtColor(matched_bgr, cv2.COLOR_BGR2BGRA)
+    repaired_rgba[:, :, 3] = out_alpha
+
+    Path(repaired_candidate_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(repaired_alpha_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(repaired_candidate_path, repaired_rgba)
+    cv2.imwrite(repaired_alpha_path, out_alpha)
+    bbox = _alpha_bbox(out_alpha)
+    return {
+        "match_score": float(max_val),
+        "match_box_xywh": [match_x, match_y, int(ref_w), int(ref_h)],
+        "alpha_bbox_xywh": list(bbox) if bbox is not None else [],
+        "reference_candidate_path": reference_candidate_path,
+    }
+
+
+def _ai_crop_fix_preview_tile(title: str, path_value: str) -> str:
+    path_text = str(path_value or "").strip()
+    exists = bool(path_text and Path(path_text).exists() and Path(path_text).is_file())
+    image_html = (
+        f'<img src="/debug/ai-snap-artifact?path={_url_quote(path_text)}" alt="{escape(title)}" loading="lazy">'
+        if exists
+        else '<div class="missing-image">missing</div>'
+    )
+    return (
+        '<figure class="preview-tile">'
+        f'<div class="preview-image">{image_html}</div>'
+        f'<figcaption><strong>{escape(title)}</strong>'
+        f'<span class="status {"ok" if exists else "missing"}">exists: {escape(str(exists).lower())}</span>'
+        f'<code>{escape(path_text or "not resolved")}</code></figcaption>'
+        '</figure>'
+    )
+
+
+@router.post("/debug/training-store/ai-crop-fix")
+async def training_store_ai_crop_fix(req: Request):
+    payload: Dict[str, Any] = {}
+    try:
+        body = await req.json()
+        if isinstance(body, dict):
+            payload = dict(body)
+    except Exception:
+        payload = {}
+    query = dict(req.query_params)
+
+    candidate_metadata = payload.get("candidate_metadata")
+    if candidate_metadata is None:
+        candidate_metadata = payload.get("candidate")
+    if not isinstance(candidate_metadata, dict):
+        candidate_metadata = {}
+
+    bundle_id = str(payload.get("bundle_id") or query.get("bundle_id") or "").strip()
+    candidate_id = str(
+        payload.get("candidate_id")
+        or query.get("candidate_id")
+        or candidate_metadata.get("candidate_id")
+        or candidate_metadata.get("id")
+        or candidate_metadata.get("index")
+        or ""
+    ).strip()
+    current_candidate_path = str(
+        payload.get("current_candidate_path")
+        or query.get("current_candidate_path")
+        or candidate_metadata.get("current_candidate_path")
+        or candidate_metadata.get("candidate_path")
+        or ""
+    ).strip()
+    current_alpha_path = str(
+        payload.get("current_alpha_path")
+        or query.get("current_alpha_path")
+        or candidate_metadata.get("current_alpha_path")
+        or candidate_metadata.get("alpha_path")
+        or candidate_metadata.get("mask_path")
+        or ""
+    ).strip()
+    reference_candidate_path = str(
+        payload.get("reference_candidate_path")
+        or query.get("reference_candidate_path")
+        or candidate_metadata.get("reference_candidate_path")
+        or candidate_metadata.get("template_candidate_path")
+        or candidate_metadata.get("qty_scrubbed_path")
+        or candidate_metadata.get("thumbnail_path")
+        or candidate_metadata.get("candidate_path")
+        or ""
+    ).strip()
+    slot_overlay_path = str(
+        payload.get("slot_overlay_path")
+        or query.get("slot_overlay_path")
+        or candidate_metadata.get("slot_overlay_path")
+        or candidate_metadata.get("overlay_path")
+        or ""
+    ).strip()
+    qty = payload.get("qty", query.get("qty", candidate_metadata.get("qty")))
+    dry_run = _request_bool(payload.get("dry_run", query.get("dry_run")), True)
+    mode = str(payload.get("mode") or query.get("mode") or "").strip().lower()
+
+    if not bundle_id:
+        raise HTTPException(status_code=400, detail="bundle_id is required")
+
+    received_paths = {
+        "current_candidate_path": current_candidate_path,
+        "current_alpha_path": current_alpha_path,
+        "reference_candidate_path": reference_candidate_path,
+        "slot_overlay_path": slot_overlay_path,
+    }
+    resolved_absolute_paths = {
+        key: _resolve_debug_training_path(value)
+        for key, value in received_paths.items()
+    }
+    file_exists = {
+        key: bool(value and Path(value).exists() and Path(value).is_file())
+        for key, value in resolved_absolute_paths.items()
+    }
+    candidate_image_exists = bool(file_exists.get("current_candidate_path"))
+    alpha_mask_exists = bool(file_exists.get("current_alpha_path"))
+    planned_repaired_alpha_path = _planned_ai_crop_fix_path(
+        current_alpha_path,
+        "_ai_crop_fix_repaired_alpha",
+    )
+    planned_repaired_candidate_path = _planned_ai_crop_fix_path(
+        current_candidate_path,
+        "_ai_crop_fix_repaired_candidate",
+    )
+
+    repaired_paths: Dict[str, str] = {}
+    package_result: Dict[str, Any] = {}
+    match_result: Dict[str, Any] = {}
+    copied = False
+    if not dry_run:
+        if not candidate_image_exists:
+            raise HTTPException(status_code=400, detail="current_candidate_path does not exist")
+        if not alpha_mask_exists:
+            raise HTTPException(status_code=400, detail="current_alpha_path does not exist")
+        if mode == "placeholder":
+            if not planned_repaired_alpha_path or not planned_repaired_candidate_path:
+                raise HTTPException(status_code=400, detail="planned repaired paths could not be resolved")
+            if Path(planned_repaired_alpha_path) == Path(resolved_absolute_paths["current_alpha_path"]):
+                raise HTTPException(status_code=400, detail="planned repaired alpha path matches source")
+            if Path(planned_repaired_candidate_path) == Path(resolved_absolute_paths["current_candidate_path"]):
+                raise HTTPException(status_code=400, detail="planned repaired candidate path matches source")
+            if reference_candidate_path:
+                try:
+                    match_result = _write_ai_crop_fix_matched_placeholder(
+                        original_crop_path=resolved_absolute_paths["current_candidate_path"],
+                        alpha_path=resolved_absolute_paths["current_alpha_path"],
+                        reference_candidate_path=resolved_absolute_paths["reference_candidate_path"],
+                        repaired_candidate_path=planned_repaired_candidate_path,
+                        repaired_alpha_path=planned_repaired_alpha_path,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+            else:
+                Path(planned_repaired_alpha_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(planned_repaired_candidate_path).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(resolved_absolute_paths["current_alpha_path"], planned_repaired_alpha_path)
+                shutil.copy2(resolved_absolute_paths["current_candidate_path"], planned_repaired_candidate_path)
+            repaired_paths = {
+                "repaired_alpha_path": planned_repaired_alpha_path,
+                "repaired_candidate_path": planned_repaired_candidate_path,
+            }
+            copied = True
+        elif mode == "ai_scaffold":
+            package_result = _write_ai_crop_fix_request_package(
+                bundle_id=bundle_id,
+                candidate_id=candidate_id,
+                current_candidate_path=current_candidate_path,
+                current_alpha_path=current_alpha_path,
+                reference_candidate_path=reference_candidate_path,
+                slot_overlay_path=slot_overlay_path,
+                qty=qty,
+                metadata=candidate_metadata,
+                resolved_absolute_paths=resolved_absolute_paths,
+            )
+            copied = True
+        else:
+            raise HTTPException(status_code=400, detail="mode=placeholder or mode=ai_scaffold is required when dry_run=false")
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "dry_run": dry_run,
+            "mode": mode,
+            "bundle_id": bundle_id,
+            "candidate_id": candidate_id,
+            "candidate_metadata": candidate_metadata,
+            "qty": qty,
+            "received_paths": received_paths,
+            "resolved_absolute_paths": resolved_absolute_paths,
+            "file_exists": file_exists,
+            "candidate_image_exists": candidate_image_exists,
+            "alpha_mask_exists": alpha_mask_exists,
+            "planned_repaired_alpha_path": planned_repaired_alpha_path,
+            "planned_repaired_candidate_path": planned_repaired_candidate_path,
+            "repaired_paths": repaired_paths,
+            "match_result": match_result,
+            "package_path": package_result.get("package_path", ""),
+            "files": package_result.get("files", []),
+            "copied": copied,
+            "message": (
+                "AI Crop Fix dry run ready"
+                if dry_run
+                else "AI Crop Fix request package ready"
+                if mode == "ai_scaffold"
+                else "AI Crop Fix placeholder repair copied"
+            ),
+        }
+    )
+
+
+@router.get("/debug/training-store/ai-crop-fix-preview")
+def training_store_ai_crop_fix_preview(
+    bundle_id: str = Query(...),
+    candidate_id: str = Query(...),
+):
+    try:
+        paths = _resolve_ai_crop_fix_preview_paths(bundle_id, candidate_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    tiles = [
+        _ai_crop_fix_preview_tile("Original candidate image", paths.get("original_candidate_path", "")),
+        _ai_crop_fix_preview_tile("Original alpha mask", paths.get("original_alpha_path", "")),
+        _ai_crop_fix_preview_tile("Repaired candidate image", paths.get("repaired_candidate_path", "")),
+        _ai_crop_fix_preview_tile("Repaired alpha mask", paths.get("repaired_alpha_path", "")),
+    ]
+    status_rows = "".join(
+        (
+            '<tr>'
+            f'<th>{escape(label.replace("_", " "))}</th>'
+            f'<td>{escape(str(Path(path).exists() and Path(path).is_file()).lower() if path else "false")}</td>'
+            f'<td><code>{escape(path or "not resolved")}</code></td>'
+            '</tr>'
+        )
+        for label, path in paths.items()
+    )
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AI Crop Fix Preview</title>
+  <style>
+    body {{ margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f8fb; color: #18212f; }}
+    h1 {{ margin: 0 0 4px; font-size: 24px; }}
+    .subhead {{ margin: 0 0 20px; color: #5d6978; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; align-items: start; }}
+    .preview-tile {{ margin: 0; background: #fff; border: 1px solid #d8e0ea; border-radius: 8px; overflow: hidden; }}
+    .preview-image {{ min-height: 180px; display: flex; align-items: center; justify-content: center; background: #eef2f7; }}
+    .preview-image img {{ max-width: 100%; max-height: 360px; object-fit: contain; image-rendering: auto; }}
+    .missing-image {{ color: #8a2432; font-weight: 700; }}
+    figcaption {{ display: grid; gap: 8px; padding: 12px; font-size: 13px; }}
+    .status {{ width: fit-content; padding: 3px 8px; border-radius: 999px; font-weight: 700; }}
+    .status.ok {{ background: #e8f7ee; color: #17663a; }}
+    .status.missing {{ background: #fdecef; color: #8a2432; }}
+    code {{ white-space: pre-wrap; word-break: break-word; font-size: 12px; color: #39485c; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; background: #fff; border: 1px solid #d8e0ea; }}
+    th, td {{ text-align: left; vertical-align: top; border-top: 1px solid #e6ebf1; padding: 10px; font-size: 13px; }}
+    th {{ width: 210px; color: #4d5b6d; }}
+  </style>
+</head>
+<body>
+  <h1>AI Crop Fix Preview</h1>
+  <p class="subhead">bundle_id: {escape(str(bundle_id or ""))} · candidate_id: {escape(str(candidate_id or ""))}</p>
+  <section class="grid">{"".join(tiles)}</section>
+  <table>
+    <thead><tr><th>file</th><th>exists</th><th>path</th></tr></thead>
+    <tbody>{status_rows}</tbody>
+  </table>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+@router.post("/debug/extract-element-page")
+async def extract_element_page(req: Request) -> JSONResponse:
+    """
+    Extract element IDs, qtys and part thumbnails from a LEGO back-page image.
+
+    Body JSON:
+      image_path  – absolute or repo-relative path to the page image
+      page        – integer page number (used for output naming / run_id)
+
+    Returns:
+      { ok, run_id, items: [{element_id, qty, thumbnail_path, bbox,
+                              element_bbox, ocr_conf, page}], ... }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    query = dict(req.query_params)
+
+    image_path_raw = str(
+        body.get("image_path") or query.get("image_path") or ""
+    ).strip()
+    try:
+        page = int(body.get("page") or query.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+
+    if not image_path_raw:
+        raise HTTPException(status_code=400, detail="image_path is required")
+
+    # Resolve path (absolute or relative to repo root)
+    p = Path(image_path_raw).expanduser()
+    if not p.is_absolute():
+        p = Path("/Users/olly/aim2build-instruction") / p
+    resolved = p.resolve()
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(
+            status_code=404, detail=f"image not found: {resolved}"
+        )
+
+    img = cv2.imread(str(resolved), cv2.IMREAD_COLOR)
+    if img is None or getattr(img, "size", 0) == 0:
+        raise HTTPException(
+            status_code=400, detail="image could not be read by OpenCV"
+        )
+
+    run_id = f"page_{page:03d}"
+    out_dir = _ELEMENT_PAGE_EXTRACT_ROOT / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    debug_mode = bool(body.get("debug", True))
+
+    # ── OCR ────────────────────────────────────────────────────────────────
+    ocr = _element_page_ocr(img)
+    qty_tokens = ocr["qty_tokens"]
+    elem_tokens = ocr["elem_tokens"]
+    raw_ocr_tokens = ocr["raw_ocr_tokens"]
+
+    # ── Build items ────────────────────────────────────────────────────────
+    items: List[Dict[str, Any]] = []
+    for elem in elem_tokens:
+        qty = _nearest_qty_for_element(elem, qty_tokens)
+
+        # Use qty bbox as explicit search window so text is excluded before CC
+        qty_above = _find_qty_above_element(elem, qty_tokens)
+        if qty_above is not None:
+            search_top = qty_above["y"] + qty_above["h"] + 4
+            search_bottom = elem["y"] - 4
+            bbox, window_source = _find_part_thumbnail_above(
+                img, elem["x"], elem["y"], elem["w"], elem["h"],
+                search_top=search_top,
+                search_bottom=search_bottom,
+            )
+        else:
+            bbox, window_source = _find_part_thumbnail_above(
+                img, elem["x"], elem["y"], elem["w"], elem["h"],
+            )
+
+        thumb_path = ""
+        suspicious = False
+        suspicious_reason = ""
+        text_removed = False
+        trim_reason = ""
+        final_bbox = bbox
+
+        if bbox is not None:
+            bx, by, bw, bh = bbox
+
+            # ── Suspicious checks ──────────────────────────────────────────
+            if bh > 180:
+                suspicious = True
+                suspicious_reason = f"h={bh}>180"
+            if not suspicious:
+                for other in elem_tokens:
+                    # Skip same element_id (handles duplicate OCR detections)
+                    if other.get("element_id") == elem.get("element_id"):
+                        continue
+                    ox, oy = other["x"], other["y"]
+                    if bx <= ox <= bx + bw and by <= oy <= by + bh:
+                        suspicious = True
+                        suspicious_reason = f"overlaps elem {other['element_id']}"
+                        break
+
+            crop = img[by : by + bh, bx : bx + bw]
+            if crop.size > 0:
+                # ── Blank OCR text regions before exporting ────────────────
+                # Collect qty labels + element number tokens that may overlap
+                text_tokens = list(qty_tokens) + [
+                    {"x": t["x"], "y": t["y"], "w": t["w"], "h": t["h"],
+                     "text": t["element_id"]}
+                    for t in elem_tokens
+                ]
+                bg_color = _detect_crop_bg_color(crop)
+                clean_crop, text_removed, removed_texts = _blank_text_regions_in_crop(
+                    crop, bx, by, text_tokens, bg_color
+                )
+                if text_removed:
+                    trim_reason = "blanked: " + ", ".join(removed_texts)
+
+                fname = f"elem_{elem['element_id']}_p{page:03d}.png"
+                cv2.imwrite(str(out_dir / fname), clean_crop)
+                thumb_path = str(out_dir / fname)
+
+        items.append({
+            "element_id": elem["element_id"],
+            "raw_text": elem.get("raw_text", elem["element_id"]),
+            "digit_len": elem.get("digit_len", len(elem["element_id"])),
+            "qty": qty,
+            "thumbnail_path": thumb_path,
+            "bbox": list(final_bbox) if final_bbox else [],
+            "bbox_size": [final_bbox[2], final_bbox[3]] if final_bbox else [],
+            "element_bbox": [elem["x"], elem["y"], elem["w"], elem["h"]],
+            "ocr_conf": elem["conf"],
+            "window_source": window_source,
+            "text_removed": text_removed,
+            "trim_reason": trim_reason,
+            "final_bbox": list(final_bbox) if final_bbox else [],
+            "suspicious": suspicious,
+            "suspicious_reason": suspicious_reason,
+            "page": page,
+        })
+
+    # ── Element-only overlay (existing bboxes) ─────────────────────────────
+    dbg = img.copy()
+    for it in items:
+        ex, ey, ew, eh = it["element_bbox"]
+        cv2.rectangle(dbg, (ex, ey), (ex + ew, ey + eh), (0, 200, 0), 2)
+        cv2.putText(dbg, it["element_id"], (ex, max(0, ey - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 180, 0), 1, cv2.LINE_AA)
+        if it["bbox"]:
+            bx, by, bw2, bh2 = it["bbox"]
+            cv2.rectangle(dbg, (bx, by), (bx + bw2, by + bh2), (200, 100, 0), 2)
+    for qt in qty_tokens:
+        cv2.rectangle(dbg, (qt["x"], qt["y"]),
+                      (qt["x"] + qt["w"], qt["y"] + qt["h"]), (180, 0, 220), 1)
+    cv2.imwrite(str(out_dir / "debug_overlay.png"), dbg)
+
+    # ── Full OCR overlay – every raw token labelled ────────────────────────
+    ocr_dbg = img.copy()
+    for tok in raw_ocr_tokens:
+        tx, ty, tw, th = tok["x"], tok["y"], tok["w"], tok["h"]
+        conf_val = tok["conf"]
+        # colour by confidence: red=low, yellow=mid, green=high
+        if conf_val < 0:
+            colour = (160, 160, 160)   # grey – no conf
+        elif conf_val < 50:
+            colour = (0, 80, 220)      # orange-red
+        elif conf_val < 80:
+            colour = (0, 200, 220)     # yellow
+        else:
+            colour = (0, 200, 60)      # green
+        cv2.rectangle(ocr_dbg, (tx, ty), (tx + tw, ty + th), colour, 1)
+        label = f"{tok['text']}({int(conf_val)})"
+        cv2.putText(ocr_dbg, label, (tx, max(0, ty - 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, colour, 1, cv2.LINE_AA)
+    cv2.imwrite(str(out_dir / "ocr_overlay.png"), ocr_dbg)
+
+    # ── Manifest ───────────────────────────────────────────────────────────
+    manifest: Dict[str, Any] = {
+        "ok": True,
+        "run_id": run_id,
+        "image_path": str(resolved),
+        "page": page,
+        "image_h": ocr["image_h"],
+        "image_w": ocr["image_w"],
+        "element_candidate_count": len(items),
+        "raw_ocr_token_count": len(raw_ocr_tokens),
+        "items": items,
+        "qty_tokens": qty_tokens,
+        "out_dir": str(out_dir),
+    }
+    if debug_mode:
+        manifest["raw_ocr_tokens"] = raw_ocr_tokens
+
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
+
+    return JSONResponse(manifest)
+
+
+@router.get("/debug/element-page-file")
+def element_page_file(path: str = Query(...)) -> FileResponse:
+    """Serve a file from the element_page_extract output directory."""
+    allowed_root = _ELEMENT_PAGE_EXTRACT_ROOT.resolve()
+    requested = Path(str(path or "").strip()).expanduser()
+    if not requested.is_absolute():
+        requested = Path("/Users/olly/aim2build-instruction") / requested
+    try:
+        resolved = requested.resolve()
+    except Exception:
+        raise HTTPException(status_code=404, detail="file not found")
+    if allowed_root not in resolved.parents and resolved != allowed_root:
+        raise HTTPException(status_code=404, detail="file not found")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(str(resolved))
+
+
+def _elem_img_url(abs_path: str) -> str:
+    """Return an HTTP URL for a file inside element_page_extract."""
+    return f"/debug/element-page-file?path={_url_quote(abs_path)}"
+
+
+@router.get("/debug/extract-element-page-preview")
+def extract_element_page_preview(
+    run_id: str = Query(""), page: int = Query(-1)
+) -> HTMLResponse:
+    """HTML preview for a previous extract-element-page run."""
+    if not run_id and page >= 0:
+        run_id = f"page_{page:03d}"
+
+    run_dir: Optional[Path] = None
+    if run_id:
+        candidate = _ELEMENT_PAGE_EXTRACT_ROOT / run_id
+        if candidate.exists() and candidate.is_dir():
+            run_dir = candidate
+
+    if run_dir is None:
+        runs: List[str] = []
+        if _ELEMENT_PAGE_EXTRACT_ROOT.exists():
+            runs = sorted(
+                p.name for p in _ELEMENT_PAGE_EXTRACT_ROOT.iterdir()
+                if p.is_dir()
+            )
+        links = "".join(
+            f'<li><a href="/debug/extract-element-page-preview?run_id='
+            f'{escape(r)}">{escape(r)}</a></li>'
+            for r in runs
+        )
+        return HTMLResponse(
+            "<h2>Element Page Extractions</h2>"
+            + (f"<ul>{links}</ul>" if links else "<p>No runs yet.</p>")
+            + "<p>POST to <code>/debug/extract-element-page</code> first.</p>"
+        )
+
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail=f"manifest not found in {run_dir}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"manifest parse error: {exc}")
+
+    items: List[Dict[str, Any]] = list(manifest.get("items") or [])
+
+    def _img_tag(abs_path: str, style: str = "") -> str:
+        p = Path(abs_path) if abs_path else None
+        if p and p.exists() and p.is_file():
+            return (
+                f'<img src="{_elem_img_url(abs_path)}" '
+                f'loading="lazy" style="{style}">'
+            )
+        return (
+            '<div style="display:flex;align-items:center;justify-content:center;'
+            'background:#eee;border-radius:4px;color:#999;font-size:11px;'
+            'min-height:60px;">not found</div>'
+        )
+
+    overlay_path = str(run_dir / "debug_overlay.png")
+    ocr_overlay_path = str(run_dir / "ocr_overlay.png")
+
+    overlay_section = (
+        f'<h3 style="margin-top:24px;">Element overlay</h3>'
+        f'<div style="margin-bottom:8px;">'
+        + _img_tag(overlay_path,
+                   "max-width:100%;border:1px solid #ccc;border-radius:6px;")
+        + f'</div>'
+        f'<h3 style="margin-top:24px;">OCR token overlay (all passes)</h3>'
+        f'<div style="margin-bottom:16px;">'
+        + _img_tag(ocr_overlay_path,
+                   "max-width:100%;border:1px solid #ccc;border-radius:6px;")
+        + '</div>'
+    )
+
+    cards = ""
+    for it in items:
+        eid = escape(str(it.get("element_id") or ""))
+        raw_txt = escape(str(it.get("raw_text") or eid))
+        dlen = it.get("digit_len", "")
+        qty_str = escape(f"{it['qty']}x") if it.get("qty") is not None else "?"
+        tp = str(it.get("thumbnail_path") or "")
+        bsize = it.get("bbox_size") or []
+        size_str = f"{bsize[0]}×{bsize[1]}" if len(bsize) == 2 else "—"
+        susp = bool(it.get("suspicious"))
+        susp_reason = escape(str(it.get("suspicious_reason") or ""))
+        border_col = "#e05040" if susp else "#d0d8e0"
+        thumb_style = (
+            "max-width:120px;max-height:120px;display:block;"
+            "border:1px solid #ccc;border-radius:4px;background:#f8f8f8;"
+        )
+        text_removed = bool(it.get("text_removed"))
+        trim_reason = escape(str(it.get("trim_reason") or ""))
+        win_src = escape(str(it.get("window_source") or ""))
+        susp_badge = (
+            f'<div style="font-size:10px;color:#c0392b;font-weight:600;'
+            f'margin-top:3px;">⚠ {susp_reason}</div>'
+            if susp else ""
+        )
+        trim_badge = (
+            f'<div style="font-size:10px;color:#1a6e2e;margin-top:2px;'
+            f'word-break:break-all;">✂ {trim_reason}</div>'
+            if text_removed else ""
+        )
+        win_badge = (
+            f'<div style="font-size:10px;color:#5566aa;margin-top:2px;">'
+            f'&#x1f5d7; {win_src}</div>'
+        ) if win_src else ""
+        cards += (
+            f'<div style="border:2px solid {border_col};border-radius:8px;padding:12px;'
+            f'min-width:140px;max-width:160px;display:inline-block;'
+            f'vertical-align:top;margin:6px;background:#fff;">'
+            + _img_tag(tp, thumb_style)
+            + f'<div style="margin-top:8px;font-size:13px;font-weight:600;">{eid}</div>'
+            f'<div style="font-size:11px;color:#778899;">raw: {raw_txt} ({dlen}d)</div>'
+            f'<div style="font-size:11px;color:#556677;">size: {size_str}</div>'
+            f'<div style="font-size:12px;color:#4a6070;">qty: {qty_str}</div>'
+            + win_badge
+            + trim_badge
+            + susp_badge
+            + '</div>'
+        )
+
+    rid = escape(str(manifest.get("run_id") or run_id))
+    pg = escape(str(manifest.get("page") or ""))
+    img_p = escape(str(manifest.get("image_path") or ""))
+    elem_count = manifest.get("element_candidate_count", len(items))
+    raw_count = manifest.get("raw_ocr_token_count", "?")
+
+    html = (
+        f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<title>Element Preview – {rid}</title>"
+        f"<style>body{{font-family:system-ui,sans-serif;margin:24px;"
+        f"background:#f4f6f8;color:#1a2a3a}}"
+        f"h1{{font-size:20px}}h3{{font-size:15px;color:#334455}}"
+        f".meta{{font-size:13px;color:#556677;margin-bottom:16px}}"
+        f"</style></head><body>"
+        f"<h1>Element Page Preview</h1>"
+        f"<div class='meta'>"
+        f"run: <strong>{rid}</strong> &nbsp;|&nbsp; page: <strong>{pg}</strong><br>"
+        f"image: <code>{img_p}</code><br>"
+        f"elements extracted: <strong>{elem_count}</strong> &nbsp;|&nbsp; "
+        f"raw OCR tokens: <strong>{raw_count}</strong>"
+        f"</div>"
+        + overlay_section
+        + f"<h3>Element cards</h3>"
+        + (cards if cards else "<p>No elements extracted.</p>")
+        + "</body></html>"
+    )
+    return HTMLResponse(content=html)
+
+
+# ── SAM2 segmentation routes ──────────────────────────────────────────────────
+
+@router.post("/debug/segment-element-crops")
+async def segment_element_crops(req: Request) -> JSONResponse:
+    """
+    Run hybrid segmentation (_hybrid_segment_crop) on every elem_*.png
+    found in the specified page extraction directories.
+
+    Input JSON
+    ----------
+    {
+      "pages": [309, 310, 311],
+      "mode":  "sam2_or_fallback"   (reserved; currently always hybrid)
+    }
+
+    Output per crop
+    ---------------
+    debug/element_page_extract/page_XXX/segmented/
+      elem_<id>_pXXX_mask.png
+      elem_<id>_pXXX_masked.png
+      elem_<id>_pXXX_overlay.png
+      elem_<id>_pXXX_meta.json
+
+    Returns
+    -------
+    {
+      total, sam2_success, fallback_success, failed,
+      average_coverage_pct, average_runtime_ms,
+      sam2_available, results
+    }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    raw_pages = body.get("pages") or []
+    try:
+        pages: List[int] = [int(p) for p in raw_pages]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="pages must be a list of integers")
+
+    if not pages:
+        raise HTTPException(status_code=400, detail="pages list is required")
+
+    # Ensure SAM2 is loaded (best-effort; falls back to colour if unavailable)
+    sam2_available, sam2_err = _sam2_load()
+
+    all_results: List[Dict[str, Any]] = []
+    sam2_raw_save_count = 0   # save raw SAM2 outputs for first 10 crops
+
+    for page in pages:
+        page_dir = _ELEMENT_PAGE_EXTRACT_ROOT / f"page_{page:03d}"
+        if not page_dir.exists():
+            continue
+
+        seg_dir = page_dir / "segmented"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+
+        crop_paths = sorted(page_dir.glob("elem_*.png"))
+        for crop_path in crop_paths:
+            stem    = crop_path.stem    # e.g. elem_4114309_p309
+            img_bgr = cv2.imread(str(crop_path))
+            if img_bgr is None or img_bgr.size == 0:
+                all_results.append({
+                    "stem": stem, "page": page,
+                    "segmentation_method": "failed",
+                    "error": "unreadable image",
+                    "sam2_loaded": False,
+                })
+                continue
+
+            # Pass a save prefix for the first 10 crops so raw SAM2 masks are
+            # written before the quality guards run — used for diagnostics.
+            raw_prefix: Optional[str] = None
+            if sam2_raw_save_count < 10:
+                raw_prefix = str(seg_dir / stem)
+                sam2_raw_save_count += 1
+
+            import time as _time
+            t0 = _time.time()
+            mask, method, info = _hybrid_segment_crop(img_bgr, save_sam2_raw_prefix=raw_prefix)
+            elapsed_ms = round((_time.time() - t0) * 1000)
+
+            # masked: part on white background
+            masked = img_bgr.copy()
+            masked[mask == 0] = 255
+
+            # overlay: green contour on original
+            overlay = img_bgr.copy()
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, cnts, -1, (0, 220, 80), 1)
+
+            cv2.imwrite(str(seg_dir / f"{stem}_mask.png"),    mask)
+            cv2.imwrite(str(seg_dir / f"{stem}_masked.png"),  masked)
+            cv2.imwrite(str(seg_dir / f"{stem}_overlay.png"), overlay)
+
+            # Paths to raw SAM2 diagnostic files (only present for first 10 crops)
+            sam2_raw_mask_path    = str(seg_dir / f"{stem}_sam2_raw_mask.png")
+            sam2_raw_overlay_path = str(seg_dir / f"{stem}_sam2_raw_overlay.png")
+
+            meta: Dict[str, Any] = {
+                "stem":                  stem,
+                "page":                  page,
+                "crop_path":             str(crop_path),
+                "segmentation_method":   method,
+                "iou":                   info.get("iou"),
+                "all_scores":            info.get("all_scores", []),
+                "coverage_pct":          info.get("coverage_pct", 0.0),
+                "largest_component_pct": info.get("largest_component_pct", 0.0),
+                "mask_components":       info.get("mask_components", 0),
+                "mask_bbox":             info.get("mask_bbox", []),
+                "reject_reason":         info.get("reject_reason"),
+                "elapsed_ms":            elapsed_ms,
+                "mask_path":             str(seg_dir / f"{stem}_mask.png"),
+                "masked_path":           str(seg_dir / f"{stem}_masked.png"),
+                "overlay_path":          str(seg_dir / f"{stem}_overlay.png"),
+                # ── SAM2 diagnostics (pre-guard) ──────────────────────────
+                "sam2_loaded":                      info.get("sam2_loaded", False),
+                "sam2_exception":                   info.get("sam2_exception"),
+                "sam2_mask_count":                  info.get("sam2_mask_count", 0),
+                "sam2_scores":                      info.get("all_scores", []),
+                "sam2_raw_coverage_pct":            info.get("sam2_raw_coverage_pct"),
+                "sam2_raw_largest_component_pct":   info.get("sam2_raw_largest_component_pct"),
+                "sam2_reject_reason":               info.get("sam2_reject_reason"),
+                "sam2_raw_mask_path":    sam2_raw_mask_path if raw_prefix else None,
+                "sam2_raw_overlay_path": sam2_raw_overlay_path if raw_prefix else None,
+            }
+            (seg_dir / f"{stem}_meta.json").write_text(
+                json.dumps(meta, indent=2, ensure_ascii=True), encoding="utf-8"
+            )
+            all_results.append(meta)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    ok      = [r for r in all_results if r.get("segmentation_method") != "failed"]
+    n_sam2  = sum(1 for r in ok if r.get("segmentation_method") == "sam2")
+    n_fb    = sum(1 for r in ok if r.get("segmentation_method") == "fallback_colour")
+    n_fail  = sum(1 for r in all_results if r.get("segmentation_method") == "failed")
+    avg_cov = round(sum(r.get("coverage_pct", 0) for r in ok) / max(len(ok), 1), 2)
+    avg_ms  = round(sum(r.get("elapsed_ms", 0)   for r in ok) / max(len(ok), 1))
+
+    # SAM2-specific diagnostic counters
+    n_sam2_attempted = sum(1 for r in all_results if r.get("sam2_loaded"))
+    n_sam2_exception = sum(1 for r in all_results if r.get("sam2_exception"))
+    n_sam2_rejected  = sum(1 for r in all_results if r.get("sam2_reject_reason"))
+
+    return JSONResponse({
+        "ok":                     True,
+        "total":                  len(all_results),
+        "sam2_success":           n_sam2,
+        "fallback_success":       n_fb,
+        "failed":                 n_fail,
+        "average_coverage_pct":   avg_cov,
+        "average_runtime_ms":     avg_ms,
+        "sam2_available":         sam2_available,
+        "sam2_error":             sam2_err if not sam2_available else None,
+        "pages_processed":        pages,
+        # ── SAM2 diagnostic summary ───────────────────────────────────────
+        "sam2_attempted":         n_sam2_attempted,
+        "sam2_exception_count":   n_sam2_exception,
+        "sam2_rejected_by_guard": n_sam2_rejected,
+        "sam2_accepted":          n_sam2,
+        "fallback_used":          n_fb,
+        "sam2_raw_saves":         sam2_raw_save_count,
+        "results":                all_results,
+    })
+
+
+@router.get("/debug/segment-element-crops-file")
+def segment_element_crops_file(path: str = Query(...)) -> FileResponse:
+    """Serve a file from any element_page_extract/segmented/ subdirectory."""
+    allowed_root = _ELEMENT_PAGE_EXTRACT_ROOT.resolve()
+    requested    = Path(str(path or "").strip()).expanduser()
+    if not requested.is_absolute():
+        requested = Path("/Users/olly/aim2build-instruction") / requested
+    try:
+        resolved = requested.resolve()
+    except Exception:
+        raise HTTPException(status_code=404, detail="file not found")
+    if allowed_root not in resolved.parents and resolved != allowed_root:
+        raise HTTPException(status_code=404, detail="file not found")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(str(resolved))
+
+
+@router.get("/debug/segment-element-crops-preview")
+def segment_element_crops_preview(page: int = Query(-1)) -> HTMLResponse:
+    """
+    HTML preview of segmentation results for one page.
+
+    Shows one row per element:  original | mask | masked | overlay
+    plus method badge, coverage %, reject_reason.
+    """
+    if page < 0:
+        # List available pages
+        pages_available: List[str] = []
+        if _ELEMENT_PAGE_EXTRACT_ROOT.exists():
+            for d in sorted(_ELEMENT_PAGE_EXTRACT_ROOT.iterdir()):
+                if d.is_dir() and (d / "segmented").exists():
+                    pages_available.append(d.name)
+        links = "".join(
+            f'<li><a href="/debug/segment-element-crops-preview?page='
+            f'{escape(p.replace("page_",""))}">{escape(p)}</a></li>'
+            for p in pages_available
+        )
+        return HTMLResponse(
+            "<h2>Segmentation Previews</h2>"
+            + (f"<ul>{links}</ul>" if links
+               else "<p>No segmented pages yet.</p>")
+            + "<p>POST to <code>/debug/segment-element-crops</code> first.</p>"
+        )
+
+    seg_dir = _ELEMENT_PAGE_EXTRACT_ROOT / f"page_{page:03d}" / "segmented"
+    if not seg_dir.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No segmented output for page {page}. "
+                   "Run POST /debug/segment-element-crops first."
+        )
+
+    meta_files = sorted(seg_dir.glob("*_meta.json"))
+    if not meta_files:
+        raise HTTPException(status_code=404, detail="No meta.json files found.")
+
+    def _seg_img(abs_path: str, style: str = "") -> str:
+        p = Path(abs_path) if abs_path else None
+        if p and p.exists():
+            url = f"/debug/segment-element-crops-file?path={_url_quote(str(p))}"
+            return f'<img src="{url}" loading="lazy" style="{style}">'
+        return (
+            '<div style="display:flex;align-items:center;justify-content:center;'
+            'background:#eee;border-radius:3px;color:#aaa;font-size:10px;'
+            'min-width:72px;min-height:72px;">—</div>'
+        )
+
+    def _orig_img(page_num: int, stem: str, style: str = "") -> str:
+        orig = _ELEMENT_PAGE_EXTRACT_ROOT / f"page_{page_num:03d}" / f"{stem}.png"
+        if orig.exists():
+            url = f"/debug/element-page-file?path={_url_quote(str(orig))}"
+            return f'<img src="{url}" loading="lazy" style="{style}">'
+        return '<div style="min-width:72px;min-height:72px;background:#eee;"></div>'
+
+    img_style = (
+        "width:80px;height:80px;object-fit:contain;"
+        "border:1px solid #ccc;border-radius:3px;background:#fff;"
+    )
+
+    METHOD_COL = {
+        "sam2":            "#2a7a2a",
+        "fallback_colour": "#7a5a14",
+        "failed":          "#8a1a1a",
+    }
+
+    rows_html = ""
+    for mf in meta_files:
+        try:
+            m = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        stem      = escape(str(m.get("stem", "")))
+        eid       = stem.replace("elem_", "").split("_p")[0]
+        method    = str(m.get("segmentation_method") or "?")
+        cov       = m.get("coverage_pct", 0)
+        lc        = m.get("largest_component_pct", 0)
+        nc        = m.get("mask_components", 0)
+        iou_val   = m.get("iou")
+        iou_str   = f"{iou_val:.3f}" if iou_val is not None else "—"
+        rej       = escape(str(m.get("reject_reason") or ""))
+        ms        = m.get("elapsed_ms", 0)
+        badge_col = METHOD_COL.get(method, "#555")
+
+        rows_html += (
+            f'<tr>'
+            f'<td style="font-size:12px;padding:4px 8px;white-space:nowrap;">'
+            f'  <strong>{eid}</strong>'
+            f'  <div style="font-size:10px;color:#778;">{stem}</div>'
+            f'</td>'
+            f'<td style="padding:3px;">{_orig_img(page, m.get("stem",""), img_style)}</td>'
+            f'<td style="padding:3px;">{_seg_img(str(m.get("mask_path","")), img_style)}</td>'
+            f'<td style="padding:3px;">{_seg_img(str(m.get("masked_path","")), img_style)}</td>'
+            f'<td style="padding:3px;">{_seg_img(str(m.get("overlay_path","")), img_style)}</td>'
+            f'<td style="font-size:11px;padding:4px 8px;white-space:nowrap;">'
+            f'  <span style="background:{badge_col};color:#fff;padding:1px 6px;'
+            f'border-radius:3px;font-size:10px;">{escape(method)}</span><br>'
+            f'  cov {cov:.1f}%&nbsp; lc {lc:.1f}%&nbsp; nc {nc}<br>'
+            f'  iou {iou_str}&nbsp; {ms}ms'
+            + (f'  <br><span style="color:#c80;font-size:10px;">⚠ {rej}</span>'
+               if rej else "")
+            + '</td>'
+            f'</tr>'
+        )
+
+    total     = len(meta_files)
+    n_sam2    = sum(1 for mf in meta_files
+                    if json.loads(mf.read_text()).get("segmentation_method") == "sam2")
+    n_fb      = total - n_sam2
+
+    html = (
+        f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<title>Segmentation Preview – page {page}</title>"
+        f"<style>"
+        f"body{{font-family:system-ui,sans-serif;margin:24px;background:#f4f6f8;color:#1a2a3a}}"
+        f"h1{{font-size:20px}}"
+        f"table{{border-collapse:collapse;background:#fff;border-radius:8px;"
+        f"overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.1)}}"
+        f"th{{background:#2a3a4a;color:#fff;padding:8px 12px;font-size:12px;text-align:left}}"
+        f"tr:nth-child(even){{background:#f8fafc}}"
+        f"td{{vertical-align:middle}}"
+        f"</style></head><body>"
+        f"<h1>Segmentation Preview — page {page}</h1>"
+        f"<div style='font-size:13px;margin-bottom:16px;color:#556677;'>"
+        f"total: <strong>{total}</strong> &nbsp;|&nbsp; "
+        f"sam2: <strong>{n_sam2}</strong> &nbsp;|&nbsp; "
+        f"fallback: <strong>{n_fb}</strong>"
+        f"</div>"
+        f"<table>"
+        f"<tr><th>element</th><th>original</th><th>mask</th>"
+        f"<th>masked</th><th>overlay</th><th>metrics</th></tr>"
+        + rows_html
+        + "</table></body></html>"
+    )
+    return HTMLResponse(content=html)
+
+
 @router.post("/debug/training-store/upload-r2")
 def training_store_upload_r2(
     bundle_id: str = Query(...),
@@ -6126,6 +7377,12 @@ def training_store_review_ui(
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Scrub Qty</button>'
+                f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="ai_crop_fix" '
+                f'data-current-candidate-path="{escape(str(copied_files.get("original_crop") or ""))}" '
+                f'data-current-alpha-path="{escape(str(candidate.get("qty_scrubbed_mask_path") or candidate.get("mask_path") or candidate.get("alpha_path") or ""))}" '
+                f'data-reference-candidate-path="{escape(str(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path") or ""))}" '
+                f'data-slot-overlay-path="{escape(str(split_candidate_paths.get("overlay_path") or ""))}" '
+                f'data-candidate-qty="{escape(str((list(candidate.get("qty_values") or []) or [""])[0]))}">AI Crop Fix</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_mask_expand">Needs Mask Expand</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_ocr_review">Needs OCR Review</button>'
                 f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_manual_crop">Needs Manual Crop</button>'
@@ -6147,6 +7404,12 @@ def training_store_review_ui(
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="accept">Accept Clean</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="reject">Reject</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="scrub">Needs Qty Scrub / Scrub Qty</button>'
+            f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="ai_crop_fix" '
+            f'data-current-candidate-path="{escape(str(copied_files.get("original_crop") or ""))}" '
+            f'data-current-alpha-path="{escape(str(candidate.get("qty_scrubbed_mask_path") or candidate.get("mask_path") or candidate.get("alpha_path") or ""))}" '
+            f'data-reference-candidate-path="{escape(str(candidate.get("qty_scrubbed_path") or candidate.get("thumbnail_path") or candidate.get("candidate_path") or ""))}" '
+            f'data-slot-overlay-path="{escape(str(split_candidate_paths.get("overlay_path") or ""))}" '
+            f'data-candidate-qty="{escape(str((list(candidate.get("qty_values") or []) or [""])[0]))}">AI Crop Fix</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_mask_expand">Needs Mask Expand</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_ocr_review">Needs OCR Review</button>'
             f'<button type="button" data-candidate-index="{escape(str(candidate.get("index", index)))}" data-candidate-action="needs_manual_crop">Needs Manual Crop</button>'
@@ -6551,6 +7814,7 @@ def training_store_review_ui(
     .candidate-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-top:8px; }}
     .candidate-actions button {{ padding:8px 9px; font-size:12px; min-width:0; white-space:normal; line-height:1.15; }}
     .candidate-actions button[data-candidate-action="scrub"] {{ grid-column:1 / -1; }}
+    .candidate-actions button[data-candidate-action="ai_crop_fix"] {{ grid-column:1 / -1; background:#eef6ff; border-color:#77a9df; color:#164f87; }}
     .candidate-actions button[data-candidate-action^="needs_"] {{ background:#fff8e8; border-color:#d59a20; color:#755000; }}
     .candidate-meta {{ color:#66727d; font-size:12px; line-height:1.35; margin-top:6px; }}
     .confirm-grid {{ display:grid; grid-template-columns:1fr; gap:18px; margin-top:10px; }}
@@ -6927,6 +8191,45 @@ def training_store_review_ui(
       button.addEventListener('click', async () => {{
         const action = button.dataset.candidateAction;
         const index = button.dataset.candidateIndex;
+        if (action === 'ai_crop_fix') {{
+          if (button.disabled) {{
+            return;
+          }}
+          button.disabled = true;
+          const originalText = button.textContent;
+          button.textContent = 'Fixing...';
+          const payload = {{
+            bundle_id: "{escape(selected_bundle_id)}",
+            candidate_id: String(index || ""),
+            current_candidate_path: button.dataset.currentCandidatePath || "",
+            current_alpha_path: button.dataset.currentAlphaPath || "",
+            reference_candidate_path: button.dataset.referenceCandidatePath || "",
+            slot_overlay_path: button.dataset.slotOverlayPath || "",
+            qty: button.dataset.candidateQty || null,
+            dry_run: false,
+            mode: "placeholder"
+          }};
+          const res = await fetch('/debug/training-store/ai-crop-fix', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(payload)
+          }});
+          if (!res.ok) {{
+            button.disabled = false;
+            button.textContent = originalText;
+            alert(await res.text());
+            return;
+          }}
+          const previewParams = new URLSearchParams({{
+            bundle_id: "{escape(selected_bundle_id)}",
+            candidate_id: String(index || "")
+          }});
+          const previewUrl = '/debug/training-store/ai-crop-fix-preview?' + previewParams.toString();
+          window.location.assign(previewUrl);
+          button.disabled = false;
+          button.textContent = originalText;
+          return;
+        }}
         const params = new URLSearchParams({{bundle_id: "{escape(selected_bundle_id)}", candidate_index: String(index || "")}});
         let endpoint = '/debug/training-store/reject-split-candidate';
         if (action === 'accept') {{
@@ -14533,3 +15836,737 @@ def manual_match_review(
     </html>
     """
     return HTMLResponse(content=html)
+
+
+# ─── Element Page Extractor ────────────────────────────────────────────────────
+
+
+def _element_page_ocr(img_bgr: np.ndarray) -> Dict[str, Any]:
+    """
+    Run pytesseract on the full image and return classified + raw tokens.
+
+    Returns:
+      qty_tokens      – {text, qty, x, y, w, h, cx, cy, conf}
+      elem_tokens     – {element_id, raw_text, x, y, w, h, cx, cy, conf, digit_len}
+      raw_ocr_tokens  – every non-empty token from every pass
+                        {text, x, y, w, h, conf, pass}
+      image_h, image_w
+    """
+    import pytesseract
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    img_h, img_w = gray.shape[:2]
+
+    scale = 2.0
+    big = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Inverted threshold – catches dark-background pages
+    thresh_inv = cv2.bitwise_not(thresh)
+
+    qty_tokens: List[Dict[str, Any]] = []
+    elem_tokens: List[Dict[str, Any]] = []
+    raw_ocr_tokens: List[Dict[str, Any]] = []
+    seen_raw: set = set()
+    seen_qty: set = set()
+    seen_elem: set = set()
+
+    # Each variant: (image, inv_scale, psm, config_extra, pass_label)
+    variants = [
+        (big,       1.0 / scale, 11, "-c tessedit_char_whitelist=0123456789xX", "big_psm11"),
+        (thresh,    1.0 / scale, 11, "-c tessedit_char_whitelist=0123456789xX", "thresh_psm11"),
+        (thresh_inv,1.0 / scale, 11, "-c tessedit_char_whitelist=0123456789xX", "thresh_inv_psm11"),
+        (big,       1.0 / scale,  6, "-c tessedit_char_whitelist=0123456789xX", "big_psm6"),
+        # Digit-only pass – best recall for pure numeric element IDs
+        (big,       1.0 / scale, 11, "-c tessedit_char_whitelist=0123456789",   "big_digits_psm11"),
+        (thresh,    1.0 / scale, 11, "-c tessedit_char_whitelist=0123456789",   "thresh_digits_psm11"),
+    ]
+
+    for variant_img, inv_scale, psm, cfg_extra, pass_label in variants:
+        cfg = f"--psm {psm} {cfg_extra}"
+        try:
+            data = pytesseract.image_to_data(
+                variant_img, config=cfg, output_type=pytesseract.Output.DICT,
+            )
+        except Exception:
+            continue
+        n = len(data.get("text") or [])
+        for i in range(n):
+            text = (data["text"][i] or "").strip()
+            if not text:
+                continue
+            conf = float(data["conf"][i] or -1)
+            bx = int(int(data["left"][i]  or 0) * inv_scale)
+            by = int(int(data["top"][i]   or 0) * inv_scale)
+            bw = int(int(data["width"][i] or 0) * inv_scale)
+            bh = int(int(data["height"][i]or 0) * inv_scale)
+            if bw <= 0 or bh <= 0:
+                continue
+
+            # ── raw token (deduplicated by position + text) ─────────────────
+            raw_key = (text, int(bx // 6), int(by // 6))
+            if raw_key not in seen_raw:
+                seen_raw.add(raw_key)
+                raw_ocr_tokens.append({
+                    "text": text,
+                    "x": bx, "y": by, "w": bw, "h": bh,
+                    "conf": conf,
+                    "pass": pass_label,
+                })
+
+            norm = re.sub(r"\s+", "", text.lower())
+
+            # ── qty token: "3x" / "x3" ──────────────────────────────────────
+            if re.fullmatch(r"\d+x|x\d+", norm):
+                digits = re.sub(r"x", "", norm)
+                try:
+                    qty_val = int(digits)
+                except ValueError:
+                    qty_val = 1
+                key = (int(bx // 8), int(by // 8))
+                if key not in seen_qty:
+                    seen_qty.add(key)
+                    qty_tokens.append({
+                        "text": norm,
+                        "qty": qty_val,
+                        "x": bx, "y": by, "w": bw, "h": bh,
+                        "cx": bx + bw // 2,
+                        "cy": by + bh // 2,
+                        "conf": conf,
+                    })
+                continue
+
+            # ── element candidate: 6-8 digit numeric token ──────────────────
+            digits_only = re.sub(r"[^0-9]", "", text)
+            dlen = len(digits_only)
+            if 6 <= dlen <= 8 and conf > 10:
+                key = (int(bx // 8), int(by // 8))
+                if key not in seen_elem:
+                    seen_elem.add(key)
+                    elem_tokens.append({
+                        "element_id": digits_only,
+                        "raw_text": text,
+                        "x": bx, "y": by, "w": bw, "h": bh,
+                        "cx": bx + bw // 2,
+                        "cy": by + bh // 2,
+                        "conf": conf,
+                        "digit_len": dlen,
+                    })
+
+    return {
+        "qty_tokens": qty_tokens,
+        "elem_tokens": elem_tokens,
+        "raw_ocr_tokens": raw_ocr_tokens,
+        "image_h": img_h,
+        "image_w": img_w,
+    }
+
+
+def _find_qty_above_element(
+    elem: Dict[str, Any],
+    qty_tokens: List[Dict[str, Any]],
+    col_half_w: int = 90,
+    max_search_above_px: int = 300,
+    min_thumb_gap_px: int = 20,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return the qty token that is directly above this element number and in
+    the same horizontal column.
+
+    Criteria:
+      • qty centre_x within col_half_w of element centre_x
+      • qty bottom edge is above element top with at least min_thumb_gap_px
+        gap (to ensure there is room for the thumbnail between them)
+      • qty is within max_search_above_px of element top
+      • Among candidates, pick the one with gap closest to the element
+        (smallest vertical gap, but still >= min_thumb_gap_px).
+    """
+    elem_cx = elem["x"] + elem["w"] // 2
+    elem_top = elem["y"]
+
+    best_token = None
+    best_gap = float("inf")
+
+    for qt in qty_tokens:
+        qt_cx = qt["x"] + qt["w"] // 2
+        qt_bottom = qt["y"] + qt["h"]
+
+        # Must be in the same column
+        if abs(qt_cx - elem_cx) > col_half_w:
+            continue
+        # Must be above the element with enough room for a thumbnail
+        gap = elem_top - qt_bottom
+        if gap < min_thumb_gap_px or gap > max_search_above_px:
+            continue
+
+        if gap < best_gap:
+            best_gap = gap
+            best_token = qt
+
+    return best_token
+
+
+def _find_part_thumbnail_above(
+    img_bgr: np.ndarray,
+    elem_x: int,
+    elem_y: int,
+    elem_w: int,
+    elem_h: int,
+    search_top: Optional[int] = None,    # explicit top boundary (qty_bottom + 4)
+    search_bottom: Optional[int] = None, # explicit bottom boundary (elem_y - 4)
+    # Fallback window when qty bbox is absent
+    fallback_max_gap_px: int = 120,
+    max_thumb_w: int = 180,
+    max_thumb_h: int = 160,
+    min_area: int = 150,
+    pad: int = 6,
+) -> Tuple[Optional[Tuple[int, int, int, int]], str]:
+    """
+    Return ((x, y, w, h), window_source) of the single part thumbnail.
+
+    When search_top / search_bottom are provided (qty-bounded window):
+      - The search region is exactly [search_top .. search_bottom] vertically
+        and [elem_cx-90 .. elem_cx+90] horizontally.
+      - Text boxes are already excluded by those boundaries; no post-trim needed.
+
+    Fallback (no qty box found):
+      - Search [elem_y - fallback_max_gap_px .. elem_y - 10].
+
+    Returns the padded bbox of the best component, plus a string describing
+    which window was used ('qty_bounded' or 'fallback').
+    """
+    img_h, img_w = img_bgr.shape[:2]
+    elem_cx = elem_x + elem_w // 2
+    half_w = 90
+
+    band_x1 = max(0, elem_cx - half_w)
+    band_x2 = min(img_w, elem_cx + half_w)
+
+    if search_top is not None and search_bottom is not None:
+        band_y1 = max(0, search_top)
+        band_y2 = min(img_h, search_bottom)
+        # If the bounded window is too small to contain a thumbnail, fall back
+        if band_y2 - band_y1 < 15:
+            band_y2 = max(0, elem_y - 10)
+            band_y1 = max(0, elem_y - fallback_max_gap_px)
+            window_source = "fallback_small_window"
+        else:
+            window_source = "qty_bounded"
+    else:
+        band_y2 = max(0, elem_y - 10)
+        band_y1 = max(0, elem_y - fallback_max_gap_px)
+        window_source = "fallback"
+
+    if band_y1 >= band_y2 or band_x1 >= band_x2:
+        return None, window_source
+
+    region = img_bgr[band_y1:band_y2, band_x1:band_x2]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+
+    _, binary = cv2.threshold(gray, 228, 255, cv2.THRESH_BINARY_INV)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    binary = cv2.dilate(binary, kernel, iterations=1)
+
+    num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+
+    best: Optional[Tuple[int, int, int, int]] = None
+    best_score = float("inf")
+
+    for lbl in range(1, num_labels):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        rx = int(stats[lbl, cv2.CC_STAT_LEFT])
+        ry = int(stats[lbl, cv2.CC_STAT_TOP])
+        rw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        rh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+
+        if rw > max_thumb_w or rh > max_thumb_h:
+            continue
+
+        comp_bottom_abs = band_y1 + ry + rh
+        comp_cx_abs = band_x1 + rx + rw // 2
+
+        vert_dist = elem_y - comp_bottom_abs
+        if vert_dist < 0:
+            continue
+
+        horiz_dist = abs(comp_cx_abs - elem_cx)
+        score = vert_dist + horiz_dist * 0.3
+
+        if score < best_score:
+            best_score = score
+            best = (band_x1 + rx, band_y1 + ry, rw, rh)
+
+    if best is None:
+        return None, window_source
+
+    bx, by, bw, bh = best
+    bx = max(0, bx - pad)
+    by = max(0, by - pad)
+    bx2 = min(img_w, bx + bw + pad * 2)
+    by2 = min(img_h, by + bh + pad * 2)
+    # In qty-bounded mode, don't let padding push the crop above the window top —
+    # that would pull in the qty text we specifically excluded.
+    if window_source == "qty_bounded":
+        by = max(by, band_y1)
+    return (bx, by, bx2 - bx, by2 - by), window_source
+
+
+def _trim_crop_from_ocr_tokens(
+    bx: int,
+    by: int,
+    bw: int,
+    bh: int,
+    ocr_tokens: List[Dict[str, Any]],
+    pad: int = 5,
+) -> Tuple[Tuple[int, int, int, int], bool, str]:
+    """
+    Given a crop bbox (bx, by, bw, bh) and a list of OCR tokens, trim any
+    crop edge that overlaps a text box.
+
+    Returns (trimmed_bbox, text_removed, trim_reason).
+
+    Trimming rules
+    --------------
+    For each token that overlaps the crop:
+      • Token centre in the top 40% of crop → trim the crop's top edge down
+        to just below the token bottom.
+      • Token centre in the bottom 40% of crop → trim the crop's bottom edge
+        up to just above the token top.
+      • Thin horizontal slivers outside those bands (centre in middle 20%)
+        are ignored – they're probably part of the image itself.
+
+    After trimming all tokens the crop is padded inward by `pad` px on any
+    adjusted edge, then all four edges are padded outward by `pad` px.
+    """
+    bx2 = bx + bw
+    by2 = by + bh
+    reasons: List[str] = []
+
+    for tok in ocr_tokens:
+        tx, ty, tw, th = tok["x"], tok["y"], tok["w"], tok["h"]
+        tx2, ty2 = tx + tw, ty + th
+
+        # Quick overlap check
+        if tx2 <= bx or tx < bx2 and ty2 <= by or ty >= by2:
+            continue
+        ox1 = max(bx, tx)
+        oy1 = max(by, ty)
+        ox2 = min(bx2, tx2)
+        oy2 = min(by2, ty2)
+        if ox2 <= ox1 or oy2 <= oy1:
+            continue
+
+        # Horizontal overlap fraction – only act if the text overlaps at
+        # least 25% of the crop width (avoids trimming on tiny corner touches)
+        horiz_overlap = (ox2 - ox1) / max(1, bw)
+        if horiz_overlap < 0.20:
+            continue
+
+        # Token centre position relative to crop height (0 = top, 1 = bottom)
+        tok_cy = (ty + ty2) / 2.0
+        rel_y = (tok_cy - by) / max(1, by2 - by)
+
+        label = tok.get("text", "?")
+        if rel_y < 0.40:
+            # Text is in the top portion → trim top edge down past token bottom
+            new_top = ty2 + pad
+            if new_top > by:
+                by = new_top
+                reasons.append(f"top↓ past '{label}' (rel={rel_y:.2f})")
+        elif rel_y > 0.60:
+            # Text is in the bottom portion → trim bottom edge up past token top
+            new_bot = ty - pad
+            if new_bot < by2:
+                by2 = new_bot
+                reasons.append(f"bot↑ past '{label}' (rel={rel_y:.2f})")
+        # Middle 20%: leave it – likely part of the image itself
+
+    # Sanity: ensure crop still has positive area
+    if by >= by2 or bx >= bx2:
+        return (bx, by, bw, bh), False, "trim_collapsed_reverted"
+
+    # Add uniform pad outward on all edges (constrained to original crop)
+    final_bx = max(bx - pad, bx)
+    final_by = max(by - pad, by)
+    final_bx2 = min(bx2 + pad, bx + bw)
+    final_by2 = min(by2 + pad, by + bh)
+
+    trimmed = (final_bx, final_by, final_bx2 - final_bx, final_by2 - final_by)
+    text_removed = bool(reasons)
+    return trimmed, text_removed, "; ".join(reasons)
+
+
+def _detect_crop_bg_color(crop: np.ndarray) -> Tuple[int, int, int]:
+    """
+    Estimate the background colour of a crop by taking the median of its
+    1-pixel border ring (top row, bottom row, left col, right col).
+    Returns (B, G, R) in OpenCV channel order.
+    Falls back to white when the crop is too small.
+    """
+    h, w = crop.shape[:2]
+    if h < 3 or w < 3:
+        return (255, 255, 255)
+    border = np.concatenate([
+        crop[0, :],          # top row
+        crop[-1, :],         # bottom row
+        crop[1:-1, 0],       # left column (excl. corners)
+        crop[1:-1, -1],      # right column (excl. corners)
+    ], axis=0)
+    median = np.median(border, axis=0).astype(int)
+    return (int(median[0]), int(median[1]), int(median[2]))
+
+
+def _blank_text_regions_in_crop(
+    crop: np.ndarray,
+    crop_x: int,
+    crop_y: int,
+    tokens: List[Dict[str, Any]],
+    bg_color: Tuple[int, int, int],
+) -> Tuple[np.ndarray, bool, List[str]]:
+    """
+    Fill OCR token boxes that overlap the crop with bg_color.
+
+    Parameters
+    ----------
+    crop     : the already-extracted crop image (numpy BGR array)
+    crop_x, crop_y : top-left of the crop in the original image coordinate system
+    tokens   : list of OCR token dicts with 'x','y','w','h','text' in
+               original-image coordinates
+    bg_color : (B, G, R) fill colour
+
+    Returns
+    -------
+    (cleaned_crop, text_was_removed, list_of_removed_text_strings)
+    """
+    crop_h, crop_w = crop.shape[:2]
+    out = crop.copy()
+    removed: List[str] = []
+
+    for tok in tokens:
+        tx, ty, tw, th = tok["x"], tok["y"], tok["w"], tok["h"]
+        # Intersection of token box and crop (in original-image coords)
+        ix1 = max(tx, crop_x) - crop_x
+        iy1 = max(ty, crop_y) - crop_y
+        ix2 = min(tx + tw, crop_x + crop_w) - crop_x
+        iy2 = min(ty + th, crop_y + crop_h) - crop_y
+        if ix2 > ix1 and iy2 > iy1:
+            out[iy1:iy2, ix1:ix2] = bg_color
+            removed.append(str(tok.get("text") or ""))
+
+    return out, bool(removed), removed
+
+
+def _nearest_qty_for_element(
+    elem: Dict[str, Any],
+    qty_tokens: List[Dict[str, Any]],
+    max_dist_px: int = 250,
+) -> Optional[int]:
+    """Return the qty value of the closest qty token to this element number."""
+    ex, ey = float(elem["cx"]), float(elem["cy"])
+    best_dist = float(max_dist_px)
+    best_qty: Optional[int] = None
+    for qt in qty_tokens:
+        dx = float(qt["cx"]) - ex
+        dy = float(qt["cy"]) - ey
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_qty = qt["qty"]
+    return best_qty
+
+
+# ── SAM2 helpers ──────────────────────────────────────────────────────────────
+
+def _sam2_load() -> Tuple[bool, str]:
+    """
+    Lazy-load SAM2 processor + model via HuggingFace Transformers.
+    Returns (ok, error_message).  Caches result in module-level globals.
+    """
+    global _sam2_processor, _sam2_model, _sam2_load_error
+    if _sam2_model is not None:
+        return True, ""
+    if _sam2_load_error is not None:
+        return False, _sam2_load_error
+    try:
+        from transformers import Sam2Processor, Sam2Model  # type: ignore
+        _sam2_processor = Sam2Processor.from_pretrained("facebook/sam2-hiera-tiny")
+        _sam2_model = Sam2Model.from_pretrained("facebook/sam2-hiera-tiny")
+        _sam2_model.eval()
+        return True, ""
+    except Exception as exc:
+        _sam2_load_error = str(exc)
+        return False, _sam2_load_error
+
+
+def _sam2_segment_crop(
+    img_bgr: np.ndarray,
+) -> Tuple[np.ndarray, float, List[float]]:
+    """
+    Run SAM2 on an already-extracted BGR crop.
+
+    Strategy
+    --------
+    Upscale to at least 512 px on the longest side.
+    Prompt with a 5-point cross pattern centred on the image.
+
+    Returns
+    -------
+    mask       : uint8 (H, W) array, 255 = foreground
+    best_iou   : IOU score of the chosen mask
+    all_scores : IOU scores for all candidate masks
+    """
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image as _Pil
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_pil = _Pil.fromarray(img_rgb)
+    h0, w0  = img_bgr.shape[:2]
+
+    scale  = max(512 / max(w0, h0), 1.0)
+    nw, nh = max(int(w0 * scale), 1), max(int(h0 * scale), 1)
+    img_up = img_pil.resize((nw, nh), _Pil.LANCZOS)
+
+    cx, cy = nw // 2, nh // 2
+    pts    = [[cx, cy],
+              [cx - nw // 4, cy], [cx + nw // 4, cy],
+              [cx, cy - nh // 4], [cx, cy + nh // 4]]
+    inputs = _sam2_processor(
+        images=img_up,
+        input_points=[[ pts ]],
+        input_labels=[[ [1] * len(pts) ]],
+        return_tensors="pt",
+    )
+
+    with torch.no_grad():
+        out = _sam2_model(**inputs)
+
+    pred       = out.pred_masks[0, 0]      # [num_masks, 256, 256]
+    iou_t      = out.iou_scores[0, 0]      # [num_masks]
+    all_scores = [round(float(s), 4) for s in iou_t.tolist()]
+    best       = int(iou_t.argmax().item())
+    best_iou   = float(iou_t[best].item())
+
+    logits  = pred[best].unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(logits, size=(nh, nw),
+                            mode="bilinear", align_corners=False)[0, 0]
+    mask_up  = (resized > 0).numpy().astype(np.uint8) * 255
+    from PIL import Image as _Pil2
+    mask_out = np.array(
+        _Pil2.fromarray(mask_up).resize((w0, h0), _Pil2.NEAREST)
+    )
+    return mask_out, best_iou, all_scores
+
+
+def _cv_fallback_mask(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    OpenCV fallback segmentation.
+    Detects background colour from the border ring, thresholds by colour
+    distance, then returns the largest connected foreground component.
+    Returns uint8 (H, W) mask with 255 = foreground.
+    """
+    arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    h, w = arr.shape[:2]
+    border = np.concatenate([
+        arr[0, :], arr[-1, :], arr[1:-1, 0], arr[1:-1, -1]
+    ], axis=0)
+    bg = np.median(border, axis=0)
+    diff   = np.abs(arr - bg).max(axis=2)
+    binary = (diff > 20).astype(np.uint8) * 255
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num <= 1:
+        return binary
+    areas   = [(int(stats[i, cv2.CC_STAT_AREA]), i) for i in range(1, num)]
+    largest = max(areas)[1]
+    out     = np.zeros_like(binary)
+    out[labels == largest] = 255
+    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.dilate(out, kernel, iterations=1)
+
+
+def _make_masked_and_overlay(
+    img_bgr: np.ndarray,
+    mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build masked_crop (part on white bg) and overlay (green contour on original).
+    Both returned as BGR uint8.
+    """
+    masked = img_bgr.copy()
+    masked[mask == 0] = 255   # white background
+
+    overlay = img_bgr.copy()
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 220, 80), 1)
+    return masked, overlay
+
+
+def _mask_quality_metrics(mask: np.ndarray) -> Dict[str, Any]:
+    """
+    Compute quality metrics for a binary mask (uint8, 255 = foreground).
+
+    Returns
+    -------
+    coverage_pct            : foreground pixels as % of total pixels
+    mask_components         : number of connected foreground components
+    largest_component_pct   : largest component area as % of ALL foreground pixels
+                              (100 = single clean object; low = fragmented)
+    mask_bbox               : [x, y, w, h] tight bounding box of all foreground
+    """
+    total_px  = int(mask.size)
+    fg_px     = int((mask > 0).sum())
+    coverage  = round(fg_px / max(total_px, 1) * 100, 2)
+
+    if fg_px == 0:
+        return {
+            "coverage_pct":           0.0,
+            "mask_components":        0,
+            "largest_component_pct":  0.0,
+            "mask_bbox":              [],
+        }
+
+    num, _labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    num_fg = num - 1   # exclude background label 0
+    if num_fg == 0:
+        return {
+            "coverage_pct":           coverage,
+            "mask_components":        0,
+            "largest_component_pct":  0.0,
+            "mask_bbox":              [],
+        }
+
+    largest_area = max(int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, num))
+    largest_pct  = round(largest_area / fg_px * 100, 2)
+
+    pts   = cv2.findNonZero(mask)
+    x, y, w, h = cv2.boundingRect(pts) if pts is not None else (0, 0, 0, 0)
+
+    return {
+        "coverage_pct":           coverage,
+        "mask_components":        num_fg,
+        "largest_component_pct":  largest_pct,
+        "mask_bbox":              [int(x), int(y), int(w), int(h)],
+    }
+
+
+def _hybrid_segment_crop(
+    img_bgr: np.ndarray,
+    save_sam2_raw_prefix: Optional[str] = None,
+) -> Tuple[np.ndarray, str, Dict[str, Any]]:
+    """
+    Hybrid segmentation pipeline for a single extracted crop.
+
+    Step 1 — attempt SAM2 (5-point cross prompt on 512px upscale).
+    Step 2 — evaluate quality with three guards:
+              • coverage_pct  < 5   → missed part (SAM2 confused by tiny crop)
+              • coverage_pct  > 85  → background flood
+              • largest_component_pct < 50 → fragmented / wrong object picked
+    Step 3 — if any guard fires, fall back to colour-threshold segmentation.
+
+    Parameters
+    ----------
+    save_sam2_raw_prefix : optional path prefix (str).
+        When given, the raw SAM2 mask and overlay are written to:
+          <prefix>_sam2_raw_mask.png
+          <prefix>_sam2_raw_overlay.png
+        This happens BEFORE the quality guards are evaluated — used for
+        diagnostic capture on the first N crops.
+
+    Returns
+    -------
+    mask    : uint8 (H, W)  255 = foreground
+    method  : 'sam2' | 'fallback_colour' | 'failed'
+    info    : dict with coverage_pct, largest_component_pct, mask_components,
+              mask_bbox, iou, all_scores, reject_reason,
+              sam2_loaded, sam2_exception, sam2_mask_count,
+              sam2_raw_coverage_pct, sam2_raw_largest_component_pct,
+              sam2_reject_reason
+    """
+    info: Dict[str, Any] = {
+        "iou":                              None,
+        "all_scores":                       [],
+        "reject_reason":                    None,
+        "coverage_pct":                     0.0,
+        "largest_component_pct":            0.0,
+        "mask_components":                  0,
+        "mask_bbox":                        [],
+        # ── SAM2 diagnostics (pre-guard) ──────────────────────────────────
+        "sam2_loaded":                      _sam2_model is not None,
+        "sam2_exception":                   None,
+        "sam2_mask_count":                  0,
+        "sam2_raw_coverage_pct":            None,
+        "sam2_raw_largest_component_pct":   None,
+        "sam2_reject_reason":               None,
+    }
+
+    # ── Attempt SAM2 ──────────────────────────────────────────────────────────
+    sam2_mask: Optional[np.ndarray] = None
+    if _sam2_model is not None:
+        try:
+            sam2_mask, iou, all_scores = _sam2_segment_crop(img_bgr)
+            info["iou"]            = round(iou, 4)
+            info["all_scores"]     = all_scores
+            info["sam2_mask_count"] = 1
+        except Exception as exc:
+            info["sam2_exception"] = str(exc)
+            info["reject_reason"]  = f"sam2_error: {exc}"
+
+    if sam2_mask is not None:
+        q = _mask_quality_metrics(sam2_mask)
+
+        # ── Record raw SAM2 quality BEFORE guards ─────────────────────────
+        info["sam2_raw_coverage_pct"]          = q["coverage_pct"]
+        info["sam2_raw_largest_component_pct"] = q["largest_component_pct"]
+
+        # ── Optionally save raw SAM2 mask + overlay for diagnostics ───────
+        if save_sam2_raw_prefix:
+            try:
+                cv2.imwrite(f"{save_sam2_raw_prefix}_sam2_raw_mask.png", sam2_mask)
+                raw_ov = img_bgr.copy()
+                cnts, _ = cv2.findContours(
+                    sam2_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(raw_ov, cnts, -1, (0, 100, 255), 1)
+                cv2.imwrite(f"{save_sam2_raw_prefix}_sam2_raw_overlay.png", raw_ov)
+            except Exception:
+                pass  # diagnostic save failure must never break the pipeline
+
+        # ── Quality guards ────────────────────────────────────────────────
+        reject_reason: Optional[str] = None
+        if q["coverage_pct"] < 5.0:
+            reject_reason = f"coverage_too_low ({q['coverage_pct']:.1f}%)"
+        elif q["coverage_pct"] > 85.0:
+            reject_reason = f"coverage_too_high ({q['coverage_pct']:.1f}%)"
+        elif q["largest_component_pct"] < 50.0:
+            reject_reason = (
+                f"fragmented (largest_cc={q['largest_component_pct']:.1f}%, "
+                f"components={q['mask_components']})"
+            )
+
+        if reject_reason is None:
+            # SAM2 accepted
+            info.update(q)
+            return sam2_mask, "sam2", info
+
+        # SAM2 rejected — record why and fall through to colour fallback
+        info["sam2_reject_reason"] = reject_reason
+        info["reject_reason"]      = reject_reason
+
+    # ── Colour-threshold fallback ──────────────────────────────────────────────
+    try:
+        fb_mask = _cv_fallback_mask(img_bgr)
+        q2      = _mask_quality_metrics(fb_mask)
+        info.update(q2)
+        if q2["coverage_pct"] == 0:
+            return fb_mask, "failed", info
+        return fb_mask, "fallback_colour", info
+    except Exception as exc:
+        # Return a blank mask if everything failed
+        blank = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+        info["reject_reason"] = (info.get("reject_reason") or "") + f"; fallback_error: {exc}"
+        return blank, "failed", info
+
