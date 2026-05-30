@@ -93,6 +93,9 @@ _ELEMENT_PAGE_EXTRACT_ROOT = Path("/Users/olly/aim2build-instruction/debug/eleme
 _SAM2_TEST_ROOT            = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
 _TRAINING_PACK_ROOT        = Path("/Users/olly/aim2build-instruction/debug/element_training_packs")
 _CLIP_EMBEDDINGS_ROOT      = Path("/Users/olly/aim2build-instruction/debug/clip_training_embeddings")
+_CATALOG_CLIP_ROOT         = Path("/Users/olly/aim2build-instruction/debug/catalog_clip_embeddings")
+_CATALOG_DB_PATH           = Path("/Users/olly/aim2build-instruction/debug/server_catalog/lego_catalog.db")
+_CATALOG_IMG_CACHE_ROOT    = Path("/Users/olly/aim2build-instruction/debug/part_image_cache")
 
 # Lazy-loaded SAM2 model state (populated on first POST /debug/sam2-test call)
 _sam2_processor: Any = None
@@ -105,6 +108,10 @@ _CLIP_PRETRAINED  = "laion2b_s34b_b79k"
 _clip_model: Any       = None
 _clip_preprocess: Any  = None
 _clip_load_error: Optional[str] = None
+
+# Lazy-loaded catalog embedding cache (populated on first match request)
+_cat_emb_matrix: Any = None        # np.ndarray (N, 512) float32
+_cat_emb_items:  Any = None        # List[Dict]  — aligned with matrix rows
 
 
 def _clip_load() -> Tuple[bool, str]:
@@ -6792,6 +6799,509 @@ async def generate_training_clip_embeddings(req: Request) -> JSONResponse:
             "manifest":    str(manifest_out),
         },
     })
+
+
+# ── Catalog CLIP helpers ───────────────────────────────────────────────────────
+
+def _catalog_query_parts(set_num: str) -> List[Dict[str, Any]]:
+    """
+    Return one row per distinct (part_num, color_id) in the given set's
+    inventory, with the best available image URL from the elements table.
+    """
+    import sqlite3 as _sqlite3
+    if not _CATALOG_DB_PATH.exists():
+        raise FileNotFoundError(f"Catalog DB not found: {_CATALOG_DB_PATH}")
+
+    conn = _sqlite3.connect(f"file:{_CATALOG_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = _sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                ip.part_num,
+                ip.color_id,
+                SUM(COALESCE(ip.quantity, 0)) AS qty,
+                MAX(COALESCE(e.img_rebrick, e.img_ldraw, e.img_custom)) AS img_url
+            FROM inventory_parts ip
+            INNER JOIN inventories inv
+                    ON inv.inventory_id = ip.inventory_id
+                   AND inv.set_num      = ?
+            LEFT JOIN elements e
+                   ON e.part_num  = ip.part_num
+                  AND e.color_id  = ip.color_id
+            GROUP BY ip.part_num, ip.color_id
+            ORDER BY ip.part_num, ip.color_id
+            """,
+            (f"{set_num}-1",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def _catalog_fetch_image(img_url: str, dest: Path) -> bool:
+    """Download img_url → dest (PNG), return True on success."""
+    import urllib.request as _urr
+    import io as _io
+    try:
+        req = _urr.Request(str(img_url), headers={"User-Agent": "aim2build-catalog/1.0"})
+        with _urr.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+        # Convert to PNG via PIL regardless of source format
+        from PIL import Image as _Pil
+        img = _Pil.open(_io.BytesIO(data)).convert("RGB")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        img.save(str(dest), format="PNG")
+        return True
+    except Exception:
+        return False
+
+
+@router.post("/debug/generate-catalog-clip-embeddings")
+async def generate_catalog_clip_embeddings(req: Request) -> JSONResponse:
+    """
+    Download (if needed) and CLIP-embed all catalog part images for a set.
+
+    Steps
+    -----
+    1. Query lego_catalog.db for all distinct (part_num, color_id) in the
+       set's inventory, retrieving the best available img_url.
+    2. Cache each image locally at:
+           debug/part_image_cache/<set_num>/<part_num>_<color_id>.png
+       (skip download if file already exists)
+    3. CLIP-embed all cached images (ViT-B-32 / laion2b_s34b_b79k, MPS).
+    4. Write:
+           debug/catalog_clip_embeddings/embeddings.npy  float32 (N, 512) L2-normalised
+           debug/catalog_clip_embeddings/items.json      index-aligned with embeddings
+           debug/catalog_clip_embeddings/manifest.json   run summary
+
+    Input JSON
+    ----------
+    { "set_num": "70618" }   -- defaults to "70618"
+
+    Returns
+    -------
+    catalog_count_scanned, embedded_count, skipped_count,
+    embedding_shape, output_paths, model_name
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    set_num: str = str(body.get("set_num") or "70618").strip()
+
+    # ── Load CLIP ─────────────────────────────────────────────────────────────
+    clip_ok, clip_err = _clip_load()
+    if not clip_ok:
+        raise HTTPException(status_code=503,
+            detail=f"CLIP unavailable: {clip_err}. "
+                   "Install with: pip install open-clip-torch")
+
+    # ── Query catalog DB ──────────────────────────────────────────────────────
+    try:
+        catalog_parts = _catalog_query_parts(set_num)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500,
+            detail=f"Catalog DB error: {exc}")
+
+    catalog_count_scanned = len(catalog_parts)
+    img_cache_dir = _CATALOG_IMG_CACHE_ROOT / set_num
+    img_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Download / cache images ───────────────────────────────────────────────
+    import torch
+    import numpy as np
+    from PIL import Image as _Pil
+
+    BATCH_SIZE = 32
+
+    load_tensors:  List[Any]            = []
+    embed_items:   List[Dict[str, Any]] = []
+    skipped:       List[Dict[str, Any]] = []
+
+    for part in catalog_parts:
+        part_num = str(part.get("part_num") or "")
+        color_id = int(part.get("color_id") or 0)
+        img_url  = part.get("img_url") or ""
+        qty      = int(part.get("qty") or 0)
+
+        # Canonical local filename: <part_num>_<color_id>.png
+        local_img = img_cache_dir / f"{part_num}_{color_id}.png"
+
+        # Download if not yet cached
+        if not local_img.exists():
+            if not img_url:
+                skipped.append({
+                    "part_num": part_num, "color_id": color_id,
+                    "reason": "no_img_url",
+                })
+                continue
+            ok = _catalog_fetch_image(img_url, local_img)
+            if not ok:
+                skipped.append({
+                    "part_num": part_num, "color_id": color_id,
+                    "img_url": img_url, "reason": "download_failed",
+                })
+                continue
+
+        # Load for embedding
+        try:
+            img    = _Pil.open(str(local_img)).convert("RGB")
+            tensor = _clip_preprocess(img).unsqueeze(0)
+        except Exception as exc:
+            skipped.append({
+                "part_num": part_num, "color_id": color_id,
+                "reason": f"load_error: {exc}",
+            })
+            continue
+
+        load_tensors.append(tensor)
+        embed_items.append({
+            "part_num": part_num,
+            "color_id": color_id,
+            "qty":      qty,
+            "img_path": str(local_img),
+            "img_url":  img_url,
+        })
+
+    if not load_tensors:
+        raise HTTPException(status_code=422,
+            detail=f"No catalog images available to embed "
+                   f"(scanned={catalog_count_scanned}, skipped={len(skipped)}). "
+                   "Check that img_url values are reachable and "
+                   "debug/server_catalog/lego_catalog.db is populated.")
+
+    # ── Batch encode ──────────────────────────────────────────────────────────
+    device_str = "mps" if torch.backends.mps.is_available() else "cpu"
+    all_tensors = torch.cat(load_tensors, dim=0).to(device_str)
+
+    all_feats: List[Any] = []
+    with torch.no_grad():
+        for b_start in range(0, all_tensors.shape[0], BATCH_SIZE):
+            batch = all_tensors[b_start : b_start + BATCH_SIZE]
+            feats = _clip_model.encode_image(batch)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            all_feats.append(feats.cpu().float())
+
+    embeddings: np.ndarray = torch.cat(all_feats, dim=0).numpy()
+    embed_dim = int(embeddings.shape[1])
+
+    # ── Build items.json (index-aligned with embeddings.npy) ─────────────────
+    items_out: List[Dict[str, Any]] = [
+        {
+            "embedding_index": idx,
+            "part_num":        m["part_num"],
+            "color_id":        m["color_id"],
+            "img_path":        m["img_path"],
+        }
+        for idx, m in enumerate(embed_items)
+    ]
+
+    # ── Write outputs ─────────────────────────────────────────────────────────
+    _CATALOG_CLIP_ROOT.mkdir(parents=True, exist_ok=True)
+
+    embeddings_path = _CATALOG_CLIP_ROOT / "embeddings.npy"
+    items_path      = _CATALOG_CLIP_ROOT / "items.json"
+    manifest_path   = _CATALOG_CLIP_ROOT / "manifest.json"
+
+    np.save(str(embeddings_path), embeddings)
+
+    items_path.write_text(
+        json.dumps(items_out, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
+
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "model":          _CLIP_MODEL_NAME,
+                "pretrained":     _CLIP_PRETRAINED,
+                "device":         device_str,
+                "embedding_dim":  embed_dim,
+                "count":          len(items_out),
+                "generated_at":   __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                "source_roots":   [str(img_cache_dir)],
+                "set_num":        set_num,
+                "skipped_count":  len(skipped),
+                "skipped":        skipped,
+            },
+            indent=2,
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+
+    return JSONResponse({
+        "ok":                   True,
+        "set_num":              set_num,
+        "catalog_count_scanned": catalog_count_scanned,
+        "embedded_count":       len(items_out),
+        "skipped_count":        len(skipped),
+        "embedding_shape":      list(embeddings.shape),
+        "model_name":           f"{_CLIP_MODEL_NAME} / {_CLIP_PRETRAINED}",
+        "device":               device_str,
+        "output_paths": {
+            "embeddings":  str(embeddings_path),
+            "items":       str(items_path),
+            "manifest":    str(manifest_path),
+        },
+    })
+
+
+# ── Catalog-match helpers ──────────────────────────────────────────────────────
+
+def _cat_emb_load():
+    """Load catalog embeddings once per process. Returns (matrix, items)."""
+    global _cat_emb_matrix, _cat_emb_items
+    if _cat_emb_matrix is not None:
+        return _cat_emb_matrix, _cat_emb_items
+    import numpy as np
+    emb_path   = _CATALOG_CLIP_ROOT / "embeddings.npy"
+    items_path = _CATALOG_CLIP_ROOT / "items.json"
+    if not emb_path.exists() or not items_path.exists():
+        raise FileNotFoundError(
+            "Catalog embeddings not found. "
+            "Run POST /debug/generate-catalog-clip-embeddings first."
+        )
+    _cat_emb_matrix = np.load(str(emb_path)).astype("float32")
+    _cat_emb_items  = json.loads(items_path.read_text(encoding="utf-8"))
+    return _cat_emb_matrix, _cat_emb_items
+
+
+def _clip_embed_image(img_path: str):
+    """Embed a single image file with the loaded CLIP model. Returns (512,) ndarray."""
+    import torch, numpy as np
+    from PIL import Image as _Pil
+    img    = _Pil.open(img_path).convert("RGB")
+    tensor = _clip_preprocess(img).unsqueeze(0)
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    with torch.no_grad():
+        feat = _clip_model.encode_image(tensor.to(device))
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+    return feat.cpu().float().numpy()[0]  # (512,)
+
+
+def _match_file_url(abs_path: str) -> str:
+    return f"/debug/clip-match-file?path={_url_quote(abs_path)}"
+
+
+@router.get("/debug/clip-match-file")
+def clip_match_file(path: str = Query(...)) -> FileResponse:
+    """Serve image files from training-pack and catalog-image-cache directories."""
+    allowed = [
+        _TRAINING_PACK_ROOT.resolve(),
+        _CATALOG_IMG_CACHE_ROOT.resolve(),
+        _CATALOG_CLIP_ROOT.resolve(),
+        _CLIP_EMBEDDINGS_ROOT.resolve(),
+    ]
+    requested = Path(str(path or "").strip())
+    if not requested.is_absolute():
+        requested = Path("/Users/olly/aim2build-instruction") / requested
+    try:
+        resolved = requested.resolve()
+    except Exception:
+        raise HTTPException(status_code=404, detail="not found")
+    if not any(
+        allowed_root in resolved.parents or resolved == allowed_root
+        for allowed_root in allowed
+    ):
+        raise HTTPException(status_code=404, detail="not found")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(str(resolved))
+
+
+@router.get("/debug/catalog-match-test")
+def catalog_match_test(stem: str = Query("")) -> HTMLResponse:
+    """
+    Visual nearest-neighbour test: training-pack crop → top-20 catalog matches.
+
+    GET /debug/catalog-match-test            → list all available training-pack stems
+    GET /debug/catalog-match-test?stem=...   → run match and show results
+    """
+    from html import escape as _esc
+
+    # ── No stem → show pack list ───────────────────────────────────────────────
+    if not stem:
+        stems = sorted(
+            d.name for d in _TRAINING_PACK_ROOT.iterdir()
+            if d.is_dir() and (d / "masked.png").exists()
+        )
+        links = "".join(
+            f'<li><a href="/debug/catalog-match-test?stem={_url_quote(s)}">{_esc(s)}</a></li>'
+            for s in stems
+        )
+        return HTMLResponse(
+            f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>Catalog Match Test</title>"
+            f"<style>body{{font-family:system-ui,sans-serif;margin:24px}}"
+            f"a{{color:#2a6bcc;text-decoration:none}}a:hover{{text-decoration:underline}}"
+            f"ul{{columns:3;column-gap:32px;list-style:none;padding:0}}"
+            f"li{{margin:3px 0;font-size:13px}}</style></head><body>"
+            f"<h2>Catalog Match Test — {len(stems)} training packs</h2>"
+            f"<p>Click a pack to run top-20 catalog matching.</p>"
+            f"<ul>{links}</ul></body></html>"
+        )
+
+    # ── Validate stem ──────────────────────────────────────────────────────────
+    pack_dir = _TRAINING_PACK_ROOT / stem
+    if not pack_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Training pack not found: {stem}")
+
+    masked_path  = pack_dir / "masked.png"
+    original_path = pack_dir / "original.png"
+    overlay_path  = pack_dir / "overlay.png"
+    meta_path     = pack_dir / "meta.json"
+
+    if not masked_path.exists():
+        raise HTTPException(status_code=404, detail=f"masked.png not found in {stem}")
+
+    # ── Load catalog embeddings ────────────────────────────────────────────────
+    try:
+        cat_matrix, cat_items = _cat_emb_load()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    # ── Load CLIP ─────────────────────────────────────────────────────────────
+    clip_ok, clip_err = _clip_load()
+    if not clip_ok:
+        raise HTTPException(status_code=503,
+            detail=f"CLIP unavailable: {clip_err}")
+
+    # ── Embed query ───────────────────────────────────────────────────────────
+    try:
+        import numpy as np
+        query_vec = _clip_embed_image(str(masked_path))   # (512,)
+    except Exception as exc:
+        raise HTTPException(status_code=500,
+            detail=f"Failed to embed query image: {exc}")
+
+    # ── Dot-product similarity (both sides L2-normalised = cosine sim) ─────────
+    scores = (cat_matrix @ query_vec).tolist()   # (N,)
+    ranked = sorted(enumerate(scores), key=lambda x: -x[1])[:20]
+
+    # ── Load pack meta ────────────────────────────────────────────────────────
+    pack_meta: Dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            pack_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    element_id = pack_meta.get("element_id", stem.replace("elem_", "").split("_p")[0])
+    page       = pack_meta.get("page", "?")
+    method     = pack_meta.get("segmentation_method", "?")
+    cov        = pack_meta.get("coverage_pct", 0)
+    iou_val    = pack_meta.get("iou")
+    iou_str    = f"{iou_val:.3f}" if iou_val is not None else "—"
+    qty        = pack_meta.get("qty", "?")
+
+    # ── Build nav (prev / next stem) ──────────────────────────────────────────
+    all_stems = sorted(
+        d.name for d in _TRAINING_PACK_ROOT.iterdir()
+        if d.is_dir() and (d / "masked.png").exists()
+    )
+    try:
+        idx     = all_stems.index(stem)
+        prev_s  = all_stems[idx - 1] if idx > 0          else all_stems[-1]
+        next_s  = all_stems[idx + 1] if idx < len(all_stems) - 1 else all_stems[0]
+    except ValueError:
+        prev_s = next_s = stem
+
+    def _img(path: Path, w: int = 120) -> str:
+        if path.exists():
+            url = _match_file_url(str(path))
+            return (f'<img src="{url}" loading="lazy" '
+                    f'style="width:{w}px;height:{w}px;object-fit:contain;'
+                    f'border:1px solid #ccc;border-radius:4px;background:#fff;">')
+        return f'<div style="width:{w}px;height:{w}px;background:#eee;border-radius:4px;"></div>'
+
+    # Left panel — query crop
+    left_html = (
+        f'<div style="min-width:200px;max-width:220px;">'
+        f'<div style="font-size:13px;font-weight:700;margin-bottom:8px;color:#1a2a3a;">'
+        f'  element {_esc(str(element_id))} &nbsp;<span style="font-weight:400;color:#778;">p{_esc(str(page))}</span>'
+        f'</div>'
+        f'<div style="font-size:11px;color:#556677;margin-bottom:10px;">'
+        f'  method: {_esc(method)} &nbsp;|&nbsp; cov: {cov:.1f}% &nbsp;|&nbsp; iou: {iou_str}<br>'
+        f'  qty: {_esc(str(qty))}'
+        f'</div>'
+        f'<div style="font-size:11px;color:#aaa;margin-bottom:4px;">original</div>'
+        + _img(original_path, 160)
+        + f'<div style="font-size:11px;color:#aaa;margin:8px 0 4px;">masked (query)</div>'
+        + _img(masked_path, 160)
+        + f'<div style="font-size:11px;color:#aaa;margin:8px 0 4px;">overlay</div>'
+        + _img(overlay_path, 160)
+        + f'<div style="margin-top:16px;font-size:11px;">'
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(prev_s)}">◀ prev</a>'
+        f'&nbsp;&nbsp;'
+        f'<a href="/debug/catalog-match-test">list</a>'
+        f'&nbsp;&nbsp;'
+        f'<a href="/debug/catalog-match-test?stem={_url_quote(next_s)}">next ▶</a>'
+        f'</div>'
+        f'</div>'
+    )
+
+    # Right panel — top-20 matches grid
+    match_cards = ""
+    for rank, (cat_idx, score) in enumerate(ranked, 1):
+        cat_item = cat_items[cat_idx]
+        part_num = cat_item.get("part_num", "?")
+        color_id = cat_item.get("color_id", "?")
+        img_p    = Path(cat_item.get("img_path", ""))
+        score_pct = f"{score * 100:.1f}%"
+        bar_w   = max(4, int(score * 100))
+
+        score_col = (
+            "#2a7a2a" if score >= 0.85 else
+            "#7a6a14" if score >= 0.70 else
+            "#556677"
+        )
+        match_cards += (
+            f'<div style="display:flex;flex-direction:column;align-items:center;'
+            f'background:#fff;border:1px solid #dde3ec;border-radius:6px;'
+            f'padding:8px;width:130px;box-shadow:0 1px 3px rgba(0,0,0,.06);">'
+            f'<div style="font-size:10px;color:#aaa;align-self:flex-start;">#{rank}</div>'
+            + _img(img_p, 110)
+            + f'<div style="font-size:12px;font-weight:600;margin-top:6px;color:#1a2a3a;">'
+            f'{_esc(str(part_num))}</div>'
+            f'<div style="font-size:11px;color:#778;">color {_esc(str(color_id))}</div>'
+            f'<div style="margin-top:4px;width:100%;background:#eee;border-radius:3px;height:4px;">'
+            f'  <div style="width:{bar_w}%;height:4px;background:{score_col};border-radius:3px;"></div>'
+            f'</div>'
+            f'<div style="font-size:11px;font-weight:600;color:{score_col};margin-top:2px;">'
+            f'{score_pct}</div>'
+            f'</div>'
+        )
+
+    right_html = (
+        f'<div>'
+        f'<div style="font-size:13px;font-weight:700;color:#1a2a3a;margin-bottom:12px;">'
+        f'Top 20 catalog matches</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:10px;">'
+        + match_cards
+        + f'</div></div>'
+    )
+
+    html = (
+        f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<title>Catalog Match — {_esc(stem)}</title>"
+        f"<style>"
+        f"body{{font-family:system-ui,sans-serif;margin:0;background:#f0f2f6;color:#1a2a3a}}"
+        f"h2{{font-size:17px;margin:0 0 16px}}"
+        f"a{{color:#2a6bcc;text-decoration:none}}a:hover{{text-decoration:underline}}"
+        f"</style></head><body>"
+        f"<div style='padding:20px 24px;'>"
+        f"<h2>Catalog Match Test — {_esc(stem)}</h2>"
+        f"<div style='display:flex;gap:32px;align-items:flex-start;'>"
+        + left_html
+        + right_html
+        + f"</div></div></body></html>"
+    )
+    return HTMLResponse(content=html)
 
 
 @router.post("/debug/training-store/upload-r2")
