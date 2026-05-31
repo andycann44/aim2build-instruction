@@ -3228,6 +3228,9 @@ def _segment_step_callout_slot(
     if slot_slice is None or getattr(slot_slice, "size", 0) == 0:
         return _error("slot slice empty after clipping")
 
+    # Ensure SAM2 is loaded (lazy — no-op if already loaded or unavailable)
+    _sam2_load()
+
     # Segment
     mask, method, info = _hybrid_segment_crop(slot_slice)
 
