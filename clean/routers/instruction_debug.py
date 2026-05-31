@@ -91,6 +91,7 @@ router = APIRouter()
 _PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 _AUTO_MASK_CACHE_DIR = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "auto_mask_cache"
+_STEP_SEG_DIR        = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "step_segmented_cutouts"
 _ELEMENT_PAGE_EXTRACT_ROOT = Path("/Users/olly/aim2build-instruction/debug/element_page_extract")
 _SAM2_TEST_ROOT            = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
 _TRAINING_PACK_ROOT        = Path("/Users/olly/aim2build-instruction/debug/element_training_packs")
@@ -98,6 +99,7 @@ _CLIP_EMBEDDINGS_ROOT      = Path("/Users/olly/aim2build-instruction/debug/clip_
 _CATALOG_CLIP_ROOT         = Path("/Users/olly/aim2build-instruction/debug/catalog_clip_embeddings")
 _CATALOG_DB_PATH           = Path("/Users/olly/aim2build-instruction/debug/server_catalog/lego_catalog.db")
 _CATALOG_IMG_CACHE_ROOT    = Path("/Users/olly/aim2build-instruction/debug/part_image_cache")
+_CATALOG_MATCH_FEEDBACK_DIR = Path("/Users/olly/aim2build-instruction/debug/catalog_match_feedback")
 
 # Lazy-loaded SAM2 model state (populated on first POST /debug/sam2-test call)
 _sam2_processor: Any = None
@@ -3142,6 +3144,129 @@ def _write_ai_snap_temp_crop_image(crop: Dict[str, Any]) -> Optional[Path]:
     return out_path
 
 
+def _segment_step_callout_slot(
+    crop: Dict[str, Any],
+    set_num: str,
+    bag: int,
+    crop_id: str,
+    slot_index: int,
+    slot_window: List[int],
+) -> Dict[str, Any]:
+    """Segment a single slot within a step-callout crop using the same pipeline as catalog-match-test.
+
+    Steps:
+      1. Read full page PNG at crop["crop_image_path"].
+      2. Slice at crop["crop_box"] to get the raw callout region.
+      3. Blank qty/OCR token boxes (_blank_text_regions_in_crop).
+      4. Sub-slice at slot_window to isolate this slot.
+      5. Run _hybrid_segment_crop() — SAM2 → quality guards → colour fallback.
+      6. Build masked (part on white) and overlay (green contour) images.
+      7. Persist to _STEP_SEG_DIR; write meta.json.
+      8. Return { ok, masked_path, overlay_path, mask_path, segmentation_method, coverage_pct, cache_hit }.
+
+    slot_window coords are relative to the callout crop (not the full page).
+    """
+    _error = lambda msg: {"ok": False, "masked_path": "", "overlay_path": "", "mask_path": "", "reason": msg, "cache_hit": False}
+
+    crop_image_path = str(crop.get("crop_image_path") or "").strip()
+    crop_box = _coerce_box_list(crop.get("crop_box"))
+    if not crop_image_path or crop_box is None:
+        return _error("crop_image_path or crop_box missing")
+
+    safe_set  = re.sub(r"[^0-9A-Za-z._-]+", "_", str(set_num or "").strip() or "set")
+    safe_crop = re.sub(r"[^0-9A-Za-z._-]+", "_", str(crop_id or "").strip() or "crop")
+    stem = f"{safe_set}_bag{int(bag)}_{safe_crop}_slot{int(slot_index)}"
+
+    _STEP_SEG_DIR.mkdir(parents=True, exist_ok=True)
+    masked_path  = _STEP_SEG_DIR / f"{stem}_masked.png"
+    overlay_path = _STEP_SEG_DIR / f"{stem}_overlay.png"
+    mask_path    = _STEP_SEG_DIR / f"{stem}_mask.png"
+    meta_path    = _STEP_SEG_DIR / f"{stem}_meta.json"
+
+    # Cache hit: all files present
+    if masked_path.exists() and mask_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        except Exception:
+            meta = {}
+        return {
+            "ok": True,
+            "masked_path": str(masked_path),
+            "overlay_path": str(overlay_path),
+            "mask_path": str(mask_path),
+            "segmentation_method": meta.get("segmentation_method", ""),
+            "coverage_pct": meta.get("coverage_pct", 0.0),
+            "cache_hit": True,
+        }
+
+    # Load full page image
+    page_img = cv2.imread(crop_image_path)
+    if page_img is None or getattr(page_img, "size", 0) == 0:
+        return _error("page image unreadable")
+
+    # Slice callout region from page
+    cx, cy, cw, ch = [int(v) for v in crop_box]
+    raw_callout = page_img[max(0, cy):max(0, cy) + max(0, ch), max(0, cx):max(0, cx) + max(0, cw)]
+    if raw_callout is None or getattr(raw_callout, "size", 0) == 0:
+        return _error("callout slice empty")
+
+    # Blank qty/OCR token boxes (coordinates are in original-page space)
+    qty_token_boxes = [dict(t) for t in list(crop.get("qty_token_boxes") or []) if isinstance(t, dict)]
+    bg_color = _detect_crop_bg_color(raw_callout)
+    clean_callout, _, _ = _blank_text_regions_in_crop(raw_callout, cx, cy, qty_token_boxes, bg_color)
+
+    # Sub-slice at slot_window (relative to callout crop)
+    if not slot_window or len(slot_window) < 4:
+        return _error("slot_window missing or invalid")
+    sw_x, sw_y, sw_w, sw_h = [int(v) for v in slot_window[:4]]
+    callout_h, callout_w = clean_callout.shape[:2]
+    sw_x = max(0, sw_x)
+    sw_y = max(0, sw_y)
+    sw_w = max(1, min(sw_w, callout_w - sw_x))
+    sw_h = max(1, min(sw_h, callout_h - sw_y))
+    slot_slice = clean_callout[sw_y:sw_y + sw_h, sw_x:sw_x + sw_w]
+    if slot_slice is None or getattr(slot_slice, "size", 0) == 0:
+        return _error("slot slice empty after clipping")
+
+    # Segment
+    mask, method, info = _hybrid_segment_crop(slot_slice)
+
+    # Build outputs
+    masked, overlay = _make_masked_and_overlay(slot_slice, mask)
+
+    cv2.imwrite(str(mask_path),    mask)
+    cv2.imwrite(str(masked_path),  masked)
+    cv2.imwrite(str(overlay_path), overlay)
+
+    coverage_pct = float(info.get("coverage_pct", 0.0))
+    meta_out = {
+        "stem": stem,
+        "set_num": set_num,
+        "bag": int(bag),
+        "crop_id": crop_id,
+        "slot_index": int(slot_index),
+        "segmentation_method": method,
+        "coverage_pct": coverage_pct,
+        "iou": info.get("iou"),
+        "reject_reason": info.get("reject_reason"),
+        "generated_at": _iso_now(),
+    }
+    try:
+        meta_path.write_text(json.dumps(meta_out, indent=2, ensure_ascii=True), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "ok": method != "failed",
+        "masked_path": str(masked_path),
+        "overlay_path": str(overlay_path),
+        "mask_path": str(mask_path),
+        "segmentation_method": method,
+        "coverage_pct": coverage_pct,
+        "cache_hit": False,
+    }
+
+
 def _analysis_bundle_slug(set_num: str, bag: int, crop_id: str) -> str:
     safe_set = re.sub(r"[^0-9A-Za-z._-]+", "_", str(set_num or "").strip() or "set")
     safe_crop = re.sub(r"[^0-9A-Za-z._-]+", "_", str(crop_id or "").strip() or "crop")
@@ -4485,6 +4610,8 @@ async def ai_rank_slot(req: Request):
     slot_index = _coerce_int(data.get("slot_index"))
     request_manual_color_filter_id = _coerce_int(data.get("manual_color_filter_id"))
     request_picked_rgb = data.get("picked_rgb") if isinstance(data.get("picked_rgb"), dict) else {}
+    request_step_masked_path  = str(data.get("step_masked_path") or "").strip()
+    request_part_cutout_path  = str(data.get("part_cutout_path") or "").strip()
 
     if bag is None or bag < 1:
         bag = 1
@@ -4572,7 +4699,21 @@ async def ai_rank_slot(req: Request):
             normalization_fallback_reason = "temp_crop_unavailable"
         else:
             rank_input_path = str(temp_crop_path)
-            if selected_qty_box is not None:
+            if request_step_masked_path and Path(request_step_masked_path).is_file():
+                rank_input_path = request_step_masked_path
+                normalization_fallback_reason = ""
+                print(
+                    "[ai-rank-slot] using step_masked_path as query image crop_id=%s slot_index=%s query_image_path=%s"
+                    % (str(crop_id), str(slot_index), request_step_masked_path)
+                )
+            elif request_part_cutout_path and Path(request_part_cutout_path).is_file():
+                rank_input_path = request_part_cutout_path
+                normalization_fallback_reason = ""
+                print(
+                    "[ai-rank-slot] using part_cutout_path as query image crop_id=%s slot_index=%s query_image_path=%s"
+                    % (str(crop_id), str(slot_index), request_part_cutout_path)
+                )
+            elif selected_qty_box is not None:
                 normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), selected_qty_box)
                 if bool(normalized_result.get("ok")) and str(normalized_result.get("normalized_path") or "").strip():
                     rank_input_path = str(normalized_result.get("normalized_path") or "").strip()
@@ -9012,6 +9153,12 @@ def catalog_match_test(
             + f'<div style="margin-top:6px;">'
             f'<a href="{overlay_url}" target="_blank" style="font-size:9px;color:#2a6bcc;">overlay ↗</a>'
             f'</div>'
+            + f'<div style="display:flex;gap:6px;margin-top:6px;">'
+            f'<button onclick=\'cmtConfirm(this,{json.dumps(stem)},{json.dumps(str(part_num))},{int(color_id) if str(color_id).lstrip("-").isdigit() else 0},{json.dumps(str(element_id))},{json.dumps(pack_meta.get("set_num",""))},{json.dumps(str(masked_path))})\' '
+            f'style="flex:1;font-size:10px;padding:3px 0;background:#d4edda;border:1px solid #7cbb8a;border-radius:3px;cursor:pointer;color:#1a4a24;">✓ Confirm</button>'
+            f'<button onclick=\'cmtReject(this,{json.dumps(stem)},{json.dumps(str(part_num))},{int(color_id) if str(color_id).lstrip("-").isdigit() else 0})\' '
+            f'style="flex:1;font-size:10px;padding:3px 0;background:#f8d7da;border:1px solid #c48a8f;border-radius:3px;cursor:pointer;color:#4a1a1e;">✗ Reject</button>'
+            f'</div>'
             f'</div>'
         )
 
@@ -9031,7 +9178,29 @@ def catalog_match_test(
         f"body{{font-family:system-ui,sans-serif;margin:0;background:#f0f2f6;color:#1a2a3a}}"
         f"h2{{font-size:17px;margin:0 0 16px}}"
         f"a{{color:#2a6bcc;text-decoration:none}}a:hover{{text-decoration:underline}}"
-        f"</style></head><body>"
+        f"</style>"
+        f"<script>"
+        f"async function cmtConfirm(btn,stem,partNum,colorId,elementId,setNum,maskedPath){{"
+        f"  btn.disabled=true;btn.textContent='…';"
+        f"  const payload={{crop_id:stem,set_num:setNum||'catalog_test',bag:0,"
+        f"    part_num:partNum,color_id:colorId,element_id:elementId||null,"
+        f"    ai_snap_input_path:maskedPath,"
+        f"    adjustments:[{{type:'catalog_match_confirm'}}]}};"
+        f"  const r=await fetch('/debug/save-label',{{method:'POST',"
+        f"    headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});"
+        f"  if(r.ok){{btn.textContent='✓';btn.style.background='#28a745';btn.style.color='#fff';}}"
+        f"  else{{btn.disabled=false;btn.textContent='err';btn.style.background='#dc3545';btn.style.color='#fff';}}"
+        f"}}"
+        f"async function cmtReject(btn,stem,partNum,colorId){{"
+        f"  btn.disabled=true;btn.textContent='…';"
+        f"  const r=await fetch('/debug/catalog-match-feedback',{{method:'POST',"
+        f"    headers:{{'Content-Type':'application/json'}},"
+        f"    body:JSON.stringify({{stem:stem,part_num:partNum,color_id:colorId,feedback:'reject',rejected_by:'andy'}})}});"
+        f"  if(r.ok){{btn.textContent='✗';btn.style.background='#6c757d';btn.style.color='#fff';}}"
+        f"  else{{btn.disabled=false;btn.textContent='err';btn.style.background='#dc3545';btn.style.color='#fff';}}"
+        f"}}"
+        f"</script>"
+        f"</head><body>"
         f"<div style='padding:20px 24px;'>"
         f"<h2>Catalog Match Test — {_esc(stem)}</h2>"
         f"<div style='display:flex;gap:32px;align-items:flex-start;'>"
@@ -9040,6 +9209,41 @@ def catalog_match_test(
         + f"</div></div></body></html>"
     )
     return HTMLResponse(content=html)
+
+
+@router.post("/debug/catalog-match-feedback")
+async def catalog_match_feedback(req: Request):
+    """Record a reject signal for a catalog-match-test candidate.
+
+    Writes to debug/catalog_match_feedback/{stem}.json — separate from
+    training labels; no effect on ranking or save-label.
+    """
+    data = await req.json()
+    stem = str(data.get("stem") or "").strip()
+    part_num = str(data.get("part_num") or "").strip()
+    color_id = int(data.get("color_id") or 0)
+    feedback = str(data.get("feedback") or "reject").strip()
+    rejected_by = str(data.get("rejected_by") or "").strip()
+    if not stem or not part_num:
+        raise HTTPException(status_code=400, detail="stem and part_num are required")
+    _CATALOG_MATCH_FEEDBACK_DIR.mkdir(parents=True, exist_ok=True)
+    path = _CATALOG_MATCH_FEEDBACK_DIR / f"{stem}.json"
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        existing = {}
+    rejects = list(existing.get("rejects") or [])
+    rejects.append({
+        "part_num": part_num,
+        "color_id": color_id,
+        "feedback": feedback,
+        "rejected_by": rejected_by,
+        "rejected_at": _iso_now(),
+    })
+    existing["stem"] = stem
+    existing["rejects"] = rejects
+    path.write_text(json.dumps(existing, indent=2, ensure_ascii=True), encoding="utf-8")
+    return {"ok": True, "stem": stem, "rejects": len(rejects)}
 
 
 @router.post("/debug/training-store/upload-r2")
@@ -13306,6 +13510,24 @@ async def auto_mask_slots(req: Request):
             slot["sam_refined_path"] = refine_result.get("sam_refined_path", "")
             slot["sam_refine_status"] = refine_result.get("sam_refine_status", "")
 
+    # Step-callout slot segmentation: run hybrid SAM2/colour segmentation on each slot window
+    # using the better catalog-match pipeline (text-scrubbed crop → _hybrid_segment_crop).
+    for _slot in list(result.get("slots") or []):
+        _slot_win = _slot.get("slot_window") or _slot.get("slot_crop_box")
+        if _slot_win and len(_slot_win) >= 4 and int(_slot_win[2]) > 0 and int(_slot_win[3]) > 0:
+            _seg = _segment_step_callout_slot(
+                crop, set_num, int(bag), crop_id,
+                slot_index=int(_slot.get("slot_index", 0)),
+                slot_window=list(_slot_win),
+            )
+            _slot["step_masked_path"] = str(_seg.get("masked_path", "")) if _seg.get("ok") else ""
+            _slot["step_seg_method"]  = str(_seg.get("segmentation_method", ""))
+            _slot["step_cache_hit"]   = bool(_seg.get("cache_hit", False))
+        else:
+            _slot["step_masked_path"] = ""
+            _slot["step_seg_method"]  = ""
+            _slot["step_cache_hit"]   = False
+
     # Confirmed-label memory: auto-predict parts for new slots from prior confirmed labels.
     # Runs after extraction and SAM (if any); never overwrites confirmed parts — that check
     # happens on the frontend using crop.parts.
@@ -13573,6 +13795,8 @@ async def buildability_clip_suggest(req: Request):
     bag = _coerce_int(data.get("bag")) or 1
     crop_id = str(data.get("crop_id") or "").strip()
     slot_index = _coerce_int(data.get("slot_index"))
+    bcs_step_masked_path  = str(data.get("step_masked_path") or "").strip()
+    bcs_part_cutout_path  = str(data.get("part_cutout_path") or "").strip()
     if not crop_id:
         raise HTTPException(status_code=400, detail="crop_id is required")
     if slot_index is None or slot_index < 0:
@@ -13621,7 +13845,19 @@ async def buildability_clip_suggest(req: Request):
             raise HTTPException(status_code=400, detail="crop image unavailable")
 
         rank_input_path = str(temp_crop_path)
-        if selected_qty_box is not None:
+        if bcs_step_masked_path and Path(bcs_step_masked_path).is_file():
+            rank_input_path = bcs_step_masked_path
+            print(
+                "[buildability-clip-suggest] using step_masked_path as query image crop_id=%s slot_index=%s query_image_path=%s"
+                % (str(crop_id), str(slot_index), bcs_step_masked_path)
+            )
+        elif bcs_part_cutout_path and Path(bcs_part_cutout_path).is_file():
+            rank_input_path = bcs_part_cutout_path
+            print(
+                "[buildability-clip-suggest] using part_cutout_path as query image crop_id=%s slot_index=%s query_image_path=%s"
+                % (str(crop_id), str(slot_index), bcs_part_cutout_path)
+            )
+        elif selected_qty_box is not None:
             normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), selected_qty_box)
             if bool(normalized_result.get("ok")) and str(normalized_result.get("normalized_path") or "").strip():
                 rank_input_path = str(normalized_result.get("normalized_path") or "").strip()
@@ -18258,6 +18494,7 @@ def instruction_buildability(
           crop.ai_snap_loading = true;
           crop.ai_snap_error = "";
           renderAiSnapStatus(crop);
+          const _aiSnapMaskSlot = Array.isArray(crop.auto_mask_slots) ? (crop.auto_mask_slots[slotIndex] || null) : null;
           const payload = {{
             set_num: {json.dumps(str(set_num))},
             bag: {bag_number},
@@ -18267,6 +18504,8 @@ def instruction_buildability(
               ? Number(crop.manual_color_filter_id)
               : null,
             picked_rgb: crop.picked_rgb || null,
+            step_masked_path: (_aiSnapMaskSlot && _aiSnapMaskSlot.step_masked_path) ? String(_aiSnapMaskSlot.step_masked_path) : "",
+            part_cutout_path: (_aiSnapMaskSlot && _aiSnapMaskSlot.part_cutout_path) ? String(_aiSnapMaskSlot.part_cutout_path) : "",
           }};
           const aiSnapEndpoint = buildabilityVariant === "realaisnap2"
             ? "/debug/buildability-clip-suggest"
