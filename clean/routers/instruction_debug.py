@@ -13834,11 +13834,7 @@ async def buildability_clip_suggest(req: Request):
     selected_qty_box = dict(qty_token_boxes[int(slot_index)]) if 0 <= int(slot_index) < len(qty_token_boxes) else None
 
     from tools.a2b_clip_match_probe import (
-        _embed_images,
         _ensure_catalog_image_for_pair,
-        _load_clip_model,
-        _load_rgb_image,
-        _sanitize_embeddings,
     )
 
     temp_crop_path: Optional[Path] = None
@@ -13865,8 +13861,7 @@ async def buildability_clip_suggest(req: Request):
             if bool(normalized_result.get("ok")) and str(normalized_result.get("normalized_path") or "").strip():
                 rank_input_path = str(normalized_result.get("normalized_path") or "").strip()
 
-        query_image = _load_rgb_image(Path(rank_input_path))
-        if query_image is None:
+        if not Path(rank_input_path).is_file():
             raise HTTPException(status_code=400, detail="normalized crop unavailable")
 
         parts_payload = load_instruction_set_parts(set_num)
@@ -13887,9 +13882,6 @@ async def buildability_clip_suggest(req: Request):
             image_path = _ensure_catalog_image_for_pair(part_num, color_id)
             if image_path is None or not image_path.exists():
                 continue
-            clip_image = _load_rgb_image(image_path)
-            if clip_image is None:
-                continue
             candidate_rows.append(
                 {
                     "part_num": part_num,
@@ -13899,21 +13891,39 @@ async def buildability_clip_suggest(req: Request):
                     "remaining_qty": remaining_qty,
                     "img_url": str(part.get("img_url") or "").strip(),
                     "image_path": str(image_path),
-                    "clip_image": clip_image,
                 }
             )
 
         if not candidate_rows:
             return {"ok": True, "mode": "clip-placeholder", "ranked_candidates": []}
 
-        model, processor, device = _load_clip_model()
-        _, query_vectors = _sanitize_embeddings([query_image], _embed_images([query_image], model, processor, device))
-        candidate_rows, candidate_vectors = _sanitize_embeddings(
-            candidate_rows,
-            _embed_images([item["clip_image"] for item in candidate_rows], model, processor, device),
-        )
-        if query_vectors.size == 0 or not candidate_rows or candidate_vectors.size == 0:
+        # Use open_clip ViT-B-32/laion2b_s34b_b79k — same model that generated
+        # catalog_clip_embeddings. Never use a2b_clip_match_probe._load_clip_model()
+        # here; that attempts openai/clip-vit-base-patch32 via transformers (wrong space).
+        clip_ok, clip_err = _clip_load()
+        if not clip_ok:
+            return {"ok": False, "mode": "clip-unavailable", "error": clip_err, "ranked_candidates": []}
+
+        try:
+            query_vec = _clip_embed_image(rank_input_path)  # (512,) L2-normalised
+        except Exception as _qe:
+            return {"ok": False, "mode": "clip-unavailable", "error": f"query embed failed: {_qe}", "ranked_candidates": []}
+
+        _valid_rows: List[Dict[str, Any]] = []
+        _cand_vecs: List[Any] = []
+        for _row in candidate_rows:
+            try:
+                _vec = _clip_embed_image(_row["image_path"])
+                _valid_rows.append(_row)
+                _cand_vecs.append(_vec)
+            except Exception:
+                continue
+        candidate_rows = _valid_rows
+        if not candidate_rows:
             return {"ok": True, "mode": "clip-placeholder", "ranked_candidates": []}
+
+        candidate_vectors = np.stack(_cand_vecs).astype(np.float32)  # (M, 512)
+        query_vectors = query_vec.reshape(1, -1).astype(np.float32)   # (1, 512)
 
         clip_memory_items = list(clip_memory_payload.get("items", []) or [])
         clip_memory_index = {
@@ -13966,13 +13976,11 @@ async def buildability_clip_suggest(req: Request):
                         normalized_saved_path = str(normalized_saved.get("normalized_path") or "").strip()
                         if not bool(normalized_saved.get("ok")) or not normalized_saved_path:
                             continue
-                        memory_image = _load_rgb_image(Path(normalized_saved_path))
-                        if memory_image is None:
+                        try:
+                            memory_vec = _clip_embed_image(normalized_saved_path)  # (512,)
+                        except Exception:
                             continue
-                        _, memory_vector_rows = _sanitize_embeddings(
-                            [memory_key],
-                            _embed_images([memory_image], model, processor, device),
-                        )
+                        memory_vector_rows = memory_vec.reshape(1, -1).astype(np.float32)
                         if memory_vector_rows.size == 0:
                             continue
                         memory_vector = np.asarray(memory_vector_rows, dtype=np.float32).reshape(-1)
