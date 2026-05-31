@@ -63,6 +63,7 @@ CATALOG_IMAGE_DIR_CANDIDATES = [
     REPO_ROOT / "debug" / "part_image_cache",
     REPO_ROOT / "debug" / "catalog_part_images",
     REPO_ROOT / "debug" / "element_images",
+    REPO_ROOT / "debug" / "part_image_cache" / "70618",  # Bag 1 images
 ]
 # TODO: Confirm the real local mirror path for catalog part images.
 # In this checkout, `debug/part_image_cache/<set>/manifest.json` points at remote
