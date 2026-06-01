@@ -85,6 +85,12 @@ from clean.services.ai_snap_crop_service import (
 from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
+from clean.services.bag_review_service import (
+    build_review_model,
+    mark_slot_ignored as bag_review_mark_slot_ignored,
+    mark_slot_unknown as bag_review_mark_slot_unknown,
+    save_slot_label as bag_review_save_slot_label,
+)
 
 router = APIRouter()
 
@@ -92,6 +98,7 @@ _PAGE_CALLOUT_DETECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 _AUTO_MASK_CACHE_DIR = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "auto_mask_cache"
 _STEP_SEG_DIR        = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "step_segmented_cutouts"
+_PART_CUTOUT_DIR     = Path(__file__).resolve().parents[2] / "debug" / "ai_training" / "part_cutouts"
 _ELEMENT_PAGE_EXTRACT_ROOT = Path("/Users/olly/aim2build-instruction/debug/element_page_extract")
 _SAM2_TEST_ROOT            = Path("/Users/olly/aim2build-instruction/debug/sam2_test")
 _TRAINING_PACK_ROOT        = Path("/Users/olly/aim2build-instruction/debug/element_training_packs")
@@ -4470,6 +4477,23 @@ async def save_label(req: Request):
     if not part_entry["part_num"]:
         raise HTTPException(status_code=400, detail="part_num is required")
 
+    selected_slot_index = _coerce_int(data.get("selected_slot_index"))
+    if selected_slot_index is not None and 0 <= int(selected_slot_index):
+        crop_record = bag_review_save_slot_label(
+            set_num,
+            int(bag),
+            crop_id,
+            int(selected_slot_index),
+            str(part_entry["part_num"]),
+            int(part_entry["color_id"] or 0),
+            qty=_coerce_int(data.get("qty")),
+        )
+        return {
+            "ok": True,
+            "path": str(_label_store_path(set_num, int(bag))),
+            "crop": crop_record,
+        }
+
     path = _label_store_path(set_num, bag)
     existing = _load_existing_labels(path)
     crop_record = _upsert_crop_entry(
@@ -4488,7 +4512,6 @@ async def save_label(req: Request):
         adjustments=data.get("adjustments"),
         notes=data.get("notes"),
     )
-    selected_slot_index = _coerce_int(data.get("selected_slot_index"))
     sequence = _build_qty_sequence(
         data.get("crop_qty", data.get("qty", [])),
         data.get("crop_qty_text", data.get("qty_text", [])),
@@ -4531,9 +4554,64 @@ async def save_label(req: Request):
             part_entry["qty_text"] = assigned_qty.get("qty_text")
             crop_record["parts"].append(part_entry)
     _refresh_crop_next_qty_index(crop_record)
+    if selected_slot_index is not None:
+        unknown_slots = [
+            int(item)
+            for item in list(crop_record.get("unknown_slots") or [])
+            if _coerce_int(item) is not None and int(item) != int(selected_slot_index)
+        ]
+        ignored_slots = [
+            int(item)
+            for item in list(crop_record.get("ignored_slots") or [])
+            if _coerce_int(item) is not None and int(item) != int(selected_slot_index)
+        ]
+        crop_record["unknown_slots"] = sorted(set(unknown_slots))
+        crop_record["ignored_slots"] = sorted(set(ignored_slots))
     crop_record["annotated_at"] = _iso_now()
     _write_labels(path, existing)
     return {"ok": True, "path": str(path), "crop": existing["crops"].get(crop_id)}
+
+
+@router.post("/debug/mark-slot-unknown")
+async def mark_slot_unknown(req: Request):
+    data = await req.json()
+
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    try:
+        bag = int(data.get("bag", 1) or 1)
+    except Exception:
+        bag = 1
+
+    crop_id = str(data.get("crop_id") or "").strip()
+    selected_slot_index = _coerce_int(data.get("selected_slot_index", data.get("slot_index")))
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+    if selected_slot_index is None or selected_slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+
+    crop_record = bag_review_mark_slot_unknown(set_num, int(bag), crop_id, int(selected_slot_index))
+    return {"ok": True, "path": str(_label_store_path(set_num, int(bag))), "crop": crop_record}
+
+
+@router.post("/debug/mark-slot-ignored")
+async def mark_slot_ignored(req: Request):
+    data = await req.json()
+
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    try:
+        bag = int(data.get("bag", 1) or 1)
+    except Exception:
+        bag = 1
+
+    crop_id = str(data.get("crop_id") or "").strip()
+    selected_slot_index = _coerce_int(data.get("selected_slot_index", data.get("slot_index")))
+    if not crop_id:
+        raise HTTPException(status_code=400, detail="crop_id is required")
+    if selected_slot_index is None or selected_slot_index < 0:
+        raise HTTPException(status_code=400, detail="slot_index is required")
+
+    crop_record = bag_review_mark_slot_ignored(set_num, int(bag), crop_id, int(selected_slot_index))
+    return {"ok": True, "path": str(_label_store_path(set_num, int(bag))), "crop": crop_record}
 
 
 @router.post("/debug/save-manual-color-calibration")
@@ -8697,6 +8775,114 @@ def _clip_embed_image(img_path: str):
         feat = _clip_model.encode_image(tensor.to(device))
         feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.cpu().float().numpy()[0]  # (512,)
+
+
+def _extract_fg_median_rgb(path: str) -> Optional[Tuple[int, int, int]]:
+    """Return median RGB of foreground pixels in a masked part image.
+
+    Excludes:
+    - white background pixels (all channels > 240)
+    - page background pixels, auto-detected from the top 3 rows of the image
+      (covers instruction-page colours such as the pale blue-grey used in set 70618)
+
+    Returns None if path is invalid or fewer than 50 foreground pixels remain.
+    """
+    try:
+        img_bgr = cv2.imread(str(path))
+        if img_bgr is None or img_bgr.size == 0:
+            return None
+        r = img_bgr[:, :, 2].astype(np.float32)
+        g = img_bgr[:, :, 1].astype(np.float32)
+        b = img_bgr[:, :, 0].astype(np.float32)
+
+        # Auto-detect page background from top 3 border rows (or whole image if tiny)
+        _border_rows = max(3, img_bgr.shape[0] // 10)
+        _border = img_bgr[:_border_rows, :, :]
+        _bg_r = float(np.median(_border[:, :, 2]))
+        _bg_g = float(np.median(_border[:, :, 1]))
+        _bg_b = float(np.median(_border[:, :, 0]))
+
+        # Distance from auto-detected background
+        dist_bg = np.sqrt((r - _bg_r) ** 2 + (g - _bg_g) ** 2 + (b - _bg_b) ** 2)
+
+        white_mask = (r > 240) & (g > 240) & (b > 240)
+        bg_mask = dist_bg < 45
+        fg_mask = ~white_mask & ~bg_mask
+
+        if int(np.count_nonzero(fg_mask)) < 50:
+            return None
+        med_r = int(np.median(r[fg_mask]))
+        med_g = int(np.median(g[fg_mask]))
+        med_b = int(np.median(b[fg_mask]))
+        return (med_r, med_g, med_b)
+    except Exception:
+        return None
+
+
+def _load_set_color_rgb_map(set_num: str) -> Dict[int, Tuple[int, int, int]]:
+    """Return {color_id: (R, G, B)} for all colours in the catalog DB.
+
+    Reads from lego_catalog.db. Falls back to an empty dict on any error.
+    Prefer _build_calibrated_color_lut() for per-set calibrated values.
+    """
+    try:
+        import sqlite3 as _sqlite3
+        db_path = Path(__file__).resolve().parents[2] / "debug" / "server_catalog" / "lego_catalog.db"
+        if not db_path.exists():
+            return {}
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute("SELECT color_id, rgb FROM colors WHERE rgb IS NOT NULL").fetchall()
+        finally:
+            conn.close()
+        result: Dict[int, Tuple[int, int, int]] = {}
+        for cid, rgb_hex in rows:
+            if not rgb_hex or len(str(rgb_hex).strip()) < 6:
+                continue
+            h = str(rgb_hex).strip().lstrip("#")
+            try:
+                rv = int(h[0:2], 16)
+                gv = int(h[2:4], 16)
+                bv = int(h[4:6], 16)
+                result[int(cid)] = (rv, gv, bv)
+            except Exception:
+                continue
+        return result
+    except Exception:
+        return {}
+
+
+def _build_calibrated_color_lut(set_num: str) -> Dict[int, Tuple[int, int, int]]:
+    """Return {color_id: (R, G, B)} merging DB values with per-set manual samples.
+
+    Manual calibration samples (from the colour-picker UI) are averaged per
+    color_id and override the generic DB hex values for that colour.  Colour IDs
+    with no samples fall back to the DB value.  This gives print-accurate RGB
+    references for the specific set's physical colours.
+    """
+    result = _load_set_color_rgb_map(set_num)
+    try:
+        calib = _load_manual_color_calibration(set_num)
+        by_cid: Dict[int, List[Tuple[int, int, int]]] = {}
+        for s in list(calib.get("samples") or []):
+            cid = _coerce_int(s.get("color_id"))
+            rgb = s.get("sample_rgb") if isinstance(s.get("sample_rgb"), dict) else {}
+            rv = _coerce_int(rgb.get("r"))
+            gv = _coerce_int(rgb.get("g"))
+            bv = _coerce_int(rgb.get("b"))
+            if cid is None or rv is None or gv is None or bv is None:
+                continue
+            by_cid.setdefault(int(cid), []).append((int(rv), int(gv), int(bv)))
+        for cid, rgbs in by_cid.items():
+            n = len(rgbs)
+            result[cid] = (
+                sum(t[0] for t in rgbs) // n,
+                sum(t[1] for t in rgbs) // n,
+                sum(t[2] for t in rgbs) // n,
+            )
+    except Exception:
+        pass
+    return result
 
 
 # ── Shape/silhouette helpers (Phase 4 reranker) ────────────────────────────────
@@ -13864,6 +14050,11 @@ async def buildability_clip_suggest(req: Request):
         if not Path(rank_input_path).is_file():
             raise HTTPException(status_code=400, detail="normalized crop unavailable")
 
+        # ── Colour-aware ranking helpers ──────────────────────────────────────
+        # Use calibrated LUT (empirical samples override DB hex values).
+        _color_rgb_map: Dict[int, Tuple[int, int, int]] = _build_calibrated_color_lut(set_num)
+        _query_fg_rgb: Optional[Tuple[int, int, int]] = _extract_fg_median_rgb(rank_input_path)
+
         parts_payload = load_instruction_set_parts(set_num)
         parts = _prepare_instruction_parts_for_display(list(parts_payload.get("parts", []) or []))
         assigned_totals = _assigned_part_totals_from_labels(labels_payload)
@@ -13961,56 +14152,88 @@ async def buildability_clip_suggest(req: Request):
                 memory_key = (str(saved_crop_id).strip(), int(saved_slot_index), saved_part_num, int(saved_color_id))
                 if memory_key in clip_memory_index:
                     continue
-                if not (0 <= int(saved_slot_index) < len(saved_qty_boxes)):
-                    continue
-                saved_temp_crop_path = _write_ai_snap_temp_crop_image(resolved_saved_crop)
-                if saved_temp_crop_path is None:
-                    continue
-                try:
-                    with tempfile.TemporaryDirectory(prefix="clip_memory_") as memory_dir:
-                        normalized_saved = normalize_slot_crop_from_qty(
-                            str(saved_temp_crop_path),
-                            saved_qty_boxes[int(saved_slot_index)],
-                            output_dir=memory_dir,
+                # Resolve best embed source — same priority as buildability-clip-suggest.
+                _mem_step = _STEP_SEG_DIR / (
+                    f"{set_num}_bag{int(bag)}_{saved_crop_id}_slot{int(saved_slot_index)}_masked.png"
+                )
+                _mem_direct_path: Optional[str] = None
+                if _mem_step.is_file():
+                    _mem_direct_path = str(_mem_step)
+                else:
+                    _mem_cutout_hits = sorted(
+                        _PART_CUTOUT_DIR.glob(
+                            f"{set_num}_bag{int(bag)}_{saved_crop_id}"
+                            f"_slot{int(saved_slot_index)}_*_cutout.png"
                         )
-                        normalized_saved_path = str(normalized_saved.get("normalized_path") or "").strip()
-                        if not bool(normalized_saved.get("ok")) or not normalized_saved_path:
-                            continue
-                        try:
-                            memory_vec = _clip_embed_image(normalized_saved_path)  # (512,)
-                        except Exception:
-                            continue
-                        memory_vector_rows = memory_vec.reshape(1, -1).astype(np.float32)
-                        if memory_vector_rows.size == 0:
-                            continue
-                        memory_vector = np.asarray(memory_vector_rows, dtype=np.float32).reshape(-1)
-                        memory_vector = np.nan_to_num(
-                            memory_vector,
-                            nan=0.0,
-                            posinf=0.0,
-                            neginf=0.0,
-                        ).astype(np.float32, copy=False)
-                        if memory_vector.size == 0:
-                            continue
-                        memory_norm = float(np.sqrt(np.sum(memory_vector * memory_vector, dtype=np.float32)))
-                        if not np.isfinite(memory_norm) or memory_norm <= 1e-8:
-                            continue
-                        memory_item = {
-                            "crop_id": str(saved_crop_id).strip(),
-                            "slot_index": int(saved_slot_index),
-                            "part_num": saved_part_num,
-                            "color_id": int(saved_color_id),
-                            "embedding": memory_vector.tolist(),
-                            "updated_at": _iso_now(),
-                        }
-                        clip_memory_items.append(memory_item)
-                        clip_memory_index[memory_key] = memory_item
-                        clip_memory_dirty = True
-                finally:
+                    )
+                    if _mem_cutout_hits:
+                        _mem_direct_path = str(_mem_cutout_hits[-1])
+
+                memory_vec = None
+                saved_temp_crop_path = None
+                if _mem_direct_path:
+                    # Preferred: embed from masked/cutout image (same source as live CLIP ranking).
+                    print(
+                        "[clip-memory] using direct path crop_id=%s slot=%s path=%s"
+                        % (str(saved_crop_id), str(saved_slot_index), _mem_direct_path)
+                    )
                     try:
-                        saved_temp_crop_path.unlink(missing_ok=True)
+                        memory_vec = _clip_embed_image(_mem_direct_path)
                     except Exception:
                         pass
+                else:
+                    # Fallback: normalise raw crop (legacy).
+                    # Guard: qty_boxes required for normalize path.
+                    if not (0 <= int(saved_slot_index) < len(saved_qty_boxes)):
+                        continue
+                    saved_temp_crop_path = _write_ai_snap_temp_crop_image(resolved_saved_crop)
+                    if saved_temp_crop_path is not None:
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="clip_memory_") as memory_dir:
+                                normalized_saved = normalize_slot_crop_from_qty(
+                                    str(saved_temp_crop_path),
+                                    saved_qty_boxes[int(saved_slot_index)],
+                                    output_dir=memory_dir,
+                                )
+                                normalized_saved_path = str(normalized_saved.get("normalized_path") or "").strip()
+                                if bool(normalized_saved.get("ok")) and normalized_saved_path:
+                                    try:
+                                        memory_vec = _clip_embed_image(normalized_saved_path)
+                                    except Exception:
+                                        pass
+                        finally:
+                            try:
+                                saved_temp_crop_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                if memory_vec is None:
+                    continue
+                memory_vector_rows = memory_vec.reshape(1, -1).astype(np.float32)
+                if memory_vector_rows.size == 0:
+                    continue
+                memory_vector = np.asarray(memory_vector_rows, dtype=np.float32).reshape(-1)
+                memory_vector = np.nan_to_num(
+                    memory_vector,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32, copy=False)
+                if memory_vector.size == 0:
+                    continue
+                memory_norm = float(np.sqrt(np.sum(memory_vector * memory_vector, dtype=np.float32)))
+                if not np.isfinite(memory_norm) or memory_norm <= 1e-8:
+                    continue
+                memory_item = {
+                    "crop_id": str(saved_crop_id).strip(),
+                    "slot_index": int(saved_slot_index),
+                    "part_num": saved_part_num,
+                    "color_id": int(saved_color_id),
+                    "embedding": memory_vector.tolist(),
+                    "updated_at": _iso_now(),
+                }
+                clip_memory_items.append(memory_item)
+                clip_memory_index[memory_key] = memory_item
+                clip_memory_dirty = True
         if clip_memory_dirty:
             clip_memory_payload["items"] = clip_memory_items
             clip_memory_payload["updated_at"] = _iso_now()
@@ -14151,6 +14374,7 @@ async def buildability_clip_suggest(req: Request):
                         score = float(memory_similarity[0, int(idx)])
                         if pair not in memory_similarity_by_pair or score > memory_similarity_by_pair[pair]:
                             memory_similarity_by_pair[pair] = score
+        import math as _math
         scored_candidates: List[Dict[str, Any]] = []
         for idx, candidate in enumerate(candidate_rows):
             clip_score = float(similarity[0, int(idx)])
@@ -14158,20 +14382,82 @@ async def buildability_clip_suggest(req: Request):
                 str(candidate.get("part_num") or "").strip(),
                 int(candidate.get("color_id", 0) or 0),
             )
+            cand_color_id = int(candidate.get("color_id", 0) or 0)
             good_label_boost = 0.08 if pair in saved_good_pairs else 0.0
             memory_similarity_score = float(memory_similarity_by_pair.get(pair, 0.0))
             memory_bank_boost = min(0.12, max(0.0, memory_similarity_score - 0.85) * 0.6)
-            boosted_score = clip_score + good_label_boost + memory_bank_boost
+
+            # ── Colour match boost ─────────────────────────────────────────────
+            # Compare query foreground median RGB to the candidate's color_id expected RGB.
+            # Full boost (+0.10 max) only for distinctive colours; capped lower for
+            # near-neutral or transparent colours where foreground RGB is uninformative.
+            #
+            # Cap tiers:
+            #   NEUTRAL_ZERO  (47 Trans-Clear, 15 White): colour is near-white in DB;
+            #                 foreground grey cannot discriminate → cap at 0.02
+            #   NEUTRAL_LOW   (71 LBG, 72 DBG, 179 Flat Silver, 1103 Pearl Titanium):
+            #                 grey tones are ambiguous in print → cap at 0.04
+            #   DISTINCTIVE   (all others): full 0.10 cap
+            _NEUTRAL_ZERO_CIDS = {15, 47}          # Trans-Clear, White
+            _NEUTRAL_LOW_CIDS  = {71, 72, 179, 1103}  # Grey-family
+
+            colour_boost = 0.0
+            if _query_fg_rgb is not None and cand_color_id in _color_rgb_map:
+                _cr, _cg, _cb = _color_rgb_map[cand_color_id]
+                _rgb_dist = float(
+                    ((_query_fg_rgb[0] - _cr) ** 2
+                     + (_query_fg_rgb[1] - _cg) ** 2
+                     + (_query_fg_rgb[2] - _cb) ** 2) ** 0.5
+                )
+                if cand_color_id in _NEUTRAL_ZERO_CIDS:
+                    _max_boost = 0.02
+                elif cand_color_id in _NEUTRAL_LOW_CIDS:
+                    _max_boost = 0.04
+                else:
+                    _max_boost = 0.10
+                colour_boost = max(0.0, (120.0 - _rgb_dist) / 120.0 * _max_boost)
+
+            # ── Required-qty prior ─────────────────────────────────────────────
+            # Log-scaled; higher remaining_qty = slightly more probable.
+            _rem_qty = int(candidate.get("remaining_qty", 0) or 0)
+            qty_prior = min(0.04, _math.log1p(_rem_qty) / _math.log1p(60) * 0.04)
+
+            # ── Catch-all false-positive penalty ──────────────────────────────
+            # Penalise candidates with medium-CLIP score but no colour/label support.
+            # Exempt transparent/near-white IDs: their fg colour is uninformative so
+            # a low colour_boost is expected rather than evidence of a false positive.
+            _penalty_exempt_cids = {15, 47}
+            catch_all_penalty = (
+                -0.08
+                if (clip_score < 0.60 and colour_boost < 0.02
+                    and good_label_boost == 0.0
+                    and cand_color_id not in _penalty_exempt_cids)
+                else 0.0
+            )
+
+            boosted_score = (
+                clip_score
+                + good_label_boost
+                + memory_bank_boost
+                + colour_boost
+                + qty_prior
+                + catch_all_penalty
+            )
             scored_candidates.append(
                 {
                     "candidate": candidate,
                     "clip_score": clip_score,
                     "good_label_boost": good_label_boost,
+                    "memory_bank_boost": memory_bank_boost,
+                    "colour_boost": colour_boost,
+                    "qty_prior": qty_prior,
+                    "catch_all_penalty": catch_all_penalty,
                     "boosted_score": boosted_score,
                 }
             )
         scored_candidates.sort(key=lambda item: item["boosted_score"], reverse=True)
         top_candidates = scored_candidates[: min(10, len(scored_candidates))]
+        _query_fg_rgb_out = list(_query_fg_rgb) if _query_fg_rgb else None
         ranked_candidates = [
             {
                 "rank": int(index + 1),
@@ -14185,7 +14471,12 @@ async def buildability_clip_suggest(req: Request):
                 "image_path": str(item["candidate"].get("image_path") or ""),
                 "clip_score": round(float(item["clip_score"]), 4),
                 "good_label_boost": round(float(item["good_label_boost"]), 4),
+                "memory_bank_boost": round(float(item["memory_bank_boost"]), 4),
+                "colour_boost": round(float(item["colour_boost"]), 4),
+                "qty_prior": round(float(item["qty_prior"]), 4),
+                "catch_all_penalty": round(float(item["catch_all_penalty"]), 4),
                 "boosted_score": round(float(item["boosted_score"]), 4),
+                "query_fg_rgb": _query_fg_rgb_out,
             }
             for index, item in enumerate(top_candidates)
         ]
@@ -20075,59 +20366,16 @@ def manual_match_review(
         ),
     )
     lego_colors_json = json.dumps(lego_colors)
-    labels_payload = _load_existing_labels(_label_store_path(str(set_num), bag_number))
-    crops = _load_crop_detection_cache(str(set_num), bag_number)
-    if crops is None:
-        crops = _build_instruction_callout_crops(str(set_num), bag_number, ai_enabled=False)
+    review_model = build_review_model(str(set_num), bag_number)
+    review_crops: List[Dict[str, Any]] = list(review_model.get("crops") or [])
+    assigned_qty_by_key: Dict[str, int] = dict(review_model.get("assigned_qty_by_key") or {})
     crop_tiles: List[str] = []
-    review_crops: List[Dict[str, Any]] = []
-    for crop in crops:
-        saved_crop = dict(labels_payload.get("crops", {}).get(crop["crop_id"]) or {})
-        status = str(saved_crop.get("status") or "needs_adjust").strip().lower()
-        if status == "hidden":
-            continue
-        saved_qty_text = _coerce_str_list(saved_crop.get("qty_text", []) or saved_crop.get("crop_qty_text", []))
-        if saved_qty_text:
-            crop["qty_text"] = saved_qty_text
-            crop["qty_numbers"] = _coerce_int_list(saved_crop.get("qty", []))
-            crop["qty_label"] = ", ".join(saved_qty_text) if saved_qty_text else "none"
-        crop_qty_text = (
-            _coerce_str_list(crop.get("candidate_detected_qty_text", []))
-            or _coerce_str_list(crop.get("detected_qty_text", []))
-            or saved_qty_text
-            or _coerce_str_list(crop.get("qty_text", []))
-        )
-        crop_qty = (
-            _coerce_int_list(crop.get("candidate_detected_qty_numbers", []))
-            if crop_qty_text
-            else (
-                _coerce_int_list(saved_crop.get("qty", []) or saved_crop.get("crop_qty", []))
-                or _coerce_int_list(crop.get("qty_numbers", []))
-            )
-        )
-        saved_parts = list(saved_crop.get("parts", []) or [])
-        slot_state = _crop_qty_slot_state({"parts": saved_parts}, crop_qty, crop_qty_text)
-        slot_sequence = _build_qty_sequence(crop_qty, crop_qty_text)
-        review_crops.append(
-            {
-                "crop_id": str(crop.get("crop_id") or ""),
-                "page": int(crop.get("page", 0) or 0),
-                "step": int(crop.get("step", 0) or 0),
-            "crop_qty": list(crop_qty),
-            "crop_qty_text": list(crop_qty_text),
-                "crop_box": list(crop.get("crop_box", []) or []),
-                "crop_box_format": str(crop.get("crop_box_format") or "xywh"),
-                "crop_image_path": str(crop.get("crop_image_path") or ""),
-                "next_qty": slot_state.get("next_slot", {}),
-                "slot_sequence": slot_sequence,
-                "filled_slots": int(slot_state.get("filled_slots", 0) or 0),
-            }
-        )
+    for crop in review_crops:
         slot_buttons = "".join(
-            f'<button type="button" class="slot-btn{" assigned" if idx < int(slot_state.get("filled_slots", 0) or 0) else ""}" data-crop-slot data-crop-id="{escape(str(crop.get("crop_id") or ""))}" data-slot-index="{idx}" data-slot-assigned="{str(idx < int(slot_state.get("filled_slots", 0) or 0)).lower()}">Slot {idx + 1}: {escape(str(slot.get("qty_text") or slot.get("qty") or "none"))}</button>'
-            for idx, slot in enumerate(slot_sequence)
+            f'<button type="button" class="slot-btn{" assigned" if slot.get("saved_label") else ""}{" unknown" if slot.get("unknown") else ""}{" ignored" if slot.get("ignored") else ""}" data-crop-slot data-crop-id="{escape(str(crop.get("crop_id") or ""))}" data-slot-index="{int(slot.get("slot_index", idx) or 0)}" data-slot-assigned="{str(bool(slot.get("saved_label"))).lower()}" data-slot-unknown="{str(bool(slot.get("unknown"))).lower()}" data-slot-ignored="{str(bool(slot.get("ignored"))).lower()}">{escape(str(slot.get("display_text") or ("Slot " + str(idx + 1) + ": needs review")))}</button>'
+            for idx, slot in enumerate(list(crop.get("slots") or []))
         ) or '<div class="slot-empty">No qty slots</div>'
-        thumb = _build_crop_image_html(crop)
+        thumb = _build_crop_image_html({"data_uri": crop.get("original_data_uri")})
         crop_tiles.append(
             f"""
             <div class="crop-tile" data-crop-tile data-crop-id="{escape(str(crop.get('crop_id') or ''))}">
@@ -20141,14 +20389,6 @@ def manual_match_review(
             </div>
             """
         )
-    assigned_qty_by_key: Dict[str, int] = {}
-    for crop_data in dict(labels_payload.get("crops") or {}).values():
-        for part_data in list((crop_data or {}).get("parts", []) or []):
-            part_entry = _normalize_part_entry(part_data if isinstance(part_data, dict) else {})
-            if not part_entry["part_num"]:
-                continue
-            key = f"{part_entry['part_num']}::{int(part_entry['color_id'] or 0)}"
-            assigned_qty_by_key[key] = assigned_qty_by_key.get(key, 0) + int(part_entry.get("qty") or 1)
     candidate_tiles: List[str] = []
     review_parts: Dict[str, Dict[str, Any]] = {}
     for idx, part in enumerate(sorted(parts, key=lambda item: (str(item.get("part_num") or ""), int(item.get("color_id", 0) or 0))), start=1):
@@ -20198,6 +20438,10 @@ def manual_match_review(
         .crop-tile.selected, .part-tile-review.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
         .crop-thumb {{ min-height: 110px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
         .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; }}
+        .progress-summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-top: 14px; }}
+        .progress-stat {{ border: 1px solid #d6dee8; border-radius: 8px; background: #f8fbff; padding: 10px; font-size: 12px; }}
+        .progress-stat strong {{ display: block; font-size: 18px; color: #1f2d3d; margin-bottom: 2px; }}
+        .progress-actions {{ margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
         .part-grid-review {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; align-content: start; }}
         .part-tile-review {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; cursor: pointer; }}
         .part-thumb-review {{ min-height: 96px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
@@ -20206,9 +20450,29 @@ def manual_match_review(
         .slot-list {{ margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
         .slot-btn {{ border: 1px solid #d6dee8; border-radius: 8px; background: #f8fbff; padding: 6px 8px; text-align: left; cursor: pointer; font-size: 12px; }}
         .slot-btn.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
-        .slot-btn.assigned {{ background: #eef6ef; border-color: #7db28a; color: #2f6c41; cursor: default; }}
+        .slot-btn.assigned {{ background: #eef6ef; border-color: #7db28a; color: #2f6c41; cursor: pointer; }}
+        .slot-btn.unknown {{ background: #fff8df; border-color: #e1c36a; color: #725b10; }}
+        .slot-btn.ignored {{ background: #eef2f7; border-color: #9aa8b6; color: #4d6175; text-decoration: line-through; }}
         .slot-empty {{ color: #6c7c8d; font-size: 12px; }}
         .hidden {{ display: none !important; }}
+        .slot-review-panel {{ margin-bottom: 16px; }}
+        .slot-review-head {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; flex-wrap: wrap; }}
+        .slot-review-meta {{ color: #627283; font-size: 12px; line-height: 1.45; }}
+        .slot-preview-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }}
+        .slot-preview-tile {{ border: 1px solid #d6dee8; border-radius: 8px; overflow: hidden; background: #f8fbff; }}
+        .slot-preview-frame {{ min-height: 116px; display: flex; align-items: center; justify-content: center; padding: 8px; background: #fff; }}
+        .slot-preview-frame img {{ max-width: 100%; max-height: 150px; display: block; object-fit: contain; }}
+        .slot-preview-tile figcaption {{ padding: 7px 8px; font-size: 11px; color: #627283; border-top: 1px solid #d6dee8; }}
+        .saved-label-box {{ margin-top: 12px; border: 1px solid #d6dee8; border-radius: 8px; padding: 10px; font-size: 13px; background: #f8fbff; }}
+        .candidate-suggestions {{ display: grid; gap: 8px; margin-top: 10px; }}
+        .candidate-suggestion {{ display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; gap: 10px; align-items: center; border: 1px solid #d6dee8; border-radius: 8px; background: #fff; padding: 8px; text-align: left; }}
+        .candidate-suggestion.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
+        .candidate-suggestion img {{ max-width: 64px; max-height: 64px; object-fit: contain; }}
+        .candidate-score-details {{ color: #627283; font-size: 11px; line-height: 1.35; margin-top: 3px; }}
+        .manual-entry-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }}
+        .manual-entry-grid label {{ display: grid; gap: 4px; font-size: 12px; color: #627283; }}
+        .manual-entry-grid input {{ border: 1px solid #cbd6e2; border-radius: 8px; padding: 8px; font-size: 13px; }}
+        .slot-action-row {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }}
         .candidate-filter-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 6px; font-size: 13px; color: #627283; flex-wrap: wrap; }}
         .candidate-filter-controls {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; overflow: visible; align-content: flex-start; padding: 2px 0 4px; }}
         .candidate-filter-clear {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; color: #627283; padding: 10px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }}
@@ -20231,9 +20495,12 @@ def manual_match_review(
         .manual-crop-preview-meta {{ padding: 10px 14px 12px; font-size: 12px; line-height: 1.45; color: #4d6175; }}
         .manual-crop-preview-slot-list {{ display: flex; flex-direction: column; gap: 6px; padding: 0 14px 12px; }}
         .assign-btn {{ border: 0; border-radius: 10px; background: #cf1f1f; color: #fff; padding: 10px 14px; font-weight: 700; cursor: pointer; }}
+        .secondary-btn {{ border: 1px solid #cbd6e2; border-radius: 10px; background: #fff; color: #32465a; padding: 9px 12px; font-weight: 700; cursor: pointer; }}
         .assign-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+        .secondary-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
         @media (max-width: 980px) {{
           .layout {{ grid-template-columns: 1fr; }}
+          .slot-preview-grid {{ grid-template-columns: 1fr; }}
         }}
       </style>
     </head>
@@ -20243,6 +20510,17 @@ def manual_match_review(
           <h1>Manual Match Review</h1>
           <p>set_num: {escape(str(set_num))}</p>
           <p>bag: {bag_number}</p>
+          <div class="progress-summary" id="review-progress-summary">
+            <div class="progress-stat"><strong id="progress-total">0</strong>total slots</div>
+            <div class="progress-stat"><strong id="progress-confirmed">0</strong>confirmed</div>
+            <div class="progress-stat"><strong id="progress-unknown">0</strong>unknown</div>
+            <div class="progress-stat"><strong id="progress-needs">0</strong>needs review</div>
+            <div class="progress-stat"><strong id="progress-percent">0%</strong>complete</div>
+          </div>
+          <div class="progress-actions">
+            <button type="button" class="secondary-btn" id="next-unreviewed-btn">Next unreviewed slot</button>
+            <span class="slot-empty" id="next-unreviewed-label"></span>
+          </div>
           <div class="status-bar">
             <span id="manual-match-status">Selected crop: none | Selected part: none</span>
             <button type="button" class="assign-btn" id="manual-assign-btn" disabled>Assign Selected</button>
@@ -20268,6 +20546,34 @@ def manual_match_review(
           </div>
         </div>
         <div class="card manual-review-panel manual-review-right">
+          <div class="slot-review-panel">
+            <div class="slot-review-head">
+              <div>
+                <h2>Selected Slot</h2>
+                <div class="slot-review-meta" id="slot-review-meta">Select a slot to review it.</div>
+              </div>
+              <button type="button" class="secondary-btn" id="reload-candidates-btn" disabled>Reload Top 5</button>
+            </div>
+            <div class="slot-preview-grid" id="slot-preview-grid"></div>
+            <div class="saved-label-box" id="saved-label-box">Saved label: none</div>
+            <h3>Top 5 Candidates</h3>
+            <div class="candidate-suggestions" id="candidate-suggestions">
+              <div class="slot-empty">Select a slot to fetch suggestions.</div>
+            </div>
+            <div class="manual-entry-grid">
+              <label>Manual part_num<input id="manual-part-num" placeholder="e.g. 3024" /></label>
+              <label>Manual color_id<input id="manual-color-id" placeholder="e.g. 71" inputmode="numeric" /></label>
+              <label>Manual color name<input id="manual-color-name" placeholder="optional" /></label>
+              <label>Manual element_id<input id="manual-element-id" placeholder="optional" /></label>
+            </div>
+            <div class="slot-action-row">
+              <button type="button" class="assign-btn" id="accept-top-btn" disabled>Accept Top Candidate</button>
+              <button type="button" class="secondary-btn" id="save-review-label-btn" disabled>Save Label</button>
+              <button type="button" class="secondary-btn" id="mark-unknown-btn" disabled>Mark Unknown</button>
+              <button type="button" class="secondary-btn" id="ignore-slot-btn" disabled>Ignore Extra Slot</button>
+              <button type="button" class="secondary-btn" id="save-next-unreviewed-btn" disabled>Save + Next</button>
+            </div>
+          </div>
           <h2>Candidate Parts</h2>
           <p>Full remaining part library for set {escape(str(set_num))} / bag {bag_number}</p>
           <div class="candidate-filter-bar">
@@ -20326,6 +20632,455 @@ def manual_match_review(
         let cropPickerActive = false;
         let previewDismissed = false;
         let previewSelectionKey = "";
+        let selectedSuggestion = null;
+        let topCandidates = [];
+        let candidateRequestSerial = 0;
+        function escapeHtml(value) {{
+          return String(value == null ? "" : value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+        }}
+        function selectedCrop() {{
+          return selectedCropId ? cropReviewMap.get(selectedCropId) : null;
+        }}
+        function selectedSlot() {{
+          const crop = selectedCrop();
+          if (!crop || selectedSlotIndex === null) {{
+            return null;
+          }}
+          const slots = Array.isArray(crop.slots) ? crop.slots : [];
+          return slots.find((slot) => Number(slot.slot_index) === Number(selectedSlotIndex)) || null;
+        }}
+        function slotConfirmed(slot) {{
+          return !!(slot && slot.saved_label && String(slot.saved_label.part_num || "").trim());
+        }}
+        function slotUnknown(slot) {{
+          return !!(slot && slot.unknown);
+        }}
+        function slotIgnored(slot) {{
+          return !!(slot && slot.ignored);
+        }}
+        function computeProgress() {{
+          let total = 0;
+          let confirmed = 0;
+          let unknown = 0;
+          let ignored = 0;
+          reviewCrops.forEach((crop) => {{
+            (Array.isArray(crop.slots) ? crop.slots : []).forEach((slot) => {{
+              total += 1;
+              if (slotConfirmed(slot)) {{
+                confirmed += 1;
+              }} else if (slotUnknown(slot)) {{
+                unknown += 1;
+              }} else if (slotIgnored(slot)) {{
+                ignored += 1;
+              }}
+            }});
+          }});
+          const complete = confirmed + unknown + ignored;
+          const needs = Math.max(0, total - complete);
+          return {{ total, confirmed, unknown, ignored, needs, complete, percent: total ? Math.round((complete / total) * 100) : 0 }};
+        }}
+        function findNextUnreviewed(fromCropId, fromSlotIndex, includeCurrent) {{
+          const flat = [];
+          reviewCrops.forEach((crop) => {{
+            (Array.isArray(crop.slots) ? crop.slots : []).forEach((slot) => {{
+              flat.push({{ crop, slot }});
+            }});
+          }});
+          if (!flat.length) {{
+            return null;
+          }}
+          let start = flat.findIndex((item) => String(item.crop.crop_id || "") === String(fromCropId || "") && Number(item.slot.slot_index) === Number(fromSlotIndex));
+          if (start < 0) {{
+            start = -1;
+          }}
+          const firstOffset = includeCurrent ? 0 : 1;
+          for (let offset = firstOffset; offset <= flat.length; offset += 1) {{
+            const item = flat[(start + offset + flat.length) % flat.length];
+            if (item && !slotConfirmed(item.slot) && !slotUnknown(item.slot)) {{
+              return item;
+            }}
+          }}
+          return null;
+        }}
+        function renderProgress() {{
+          const progress = computeProgress();
+          const setters = [
+            ["progress-total", progress.total],
+            ["progress-confirmed", progress.confirmed],
+            ["progress-unknown", progress.unknown],
+            ["progress-needs", progress.needs],
+            ["progress-percent", progress.percent + "%"],
+          ];
+          setters.forEach(([id, value]) => {{
+            const el = document.getElementById(id);
+            if (el) {{
+              el.textContent = String(value);
+            }}
+          }});
+          const next = findNextUnreviewed(selectedCropId, selectedSlotIndex === null ? -1 : selectedSlotIndex, false)
+            || findNextUnreviewed("", -1, true);
+          const nextButton = document.getElementById("next-unreviewed-btn");
+          const nextLabel = document.getElementById("next-unreviewed-label");
+          if (nextButton) {{
+            nextButton.disabled = !next;
+          }}
+          if (nextLabel) {{
+            nextLabel.textContent = next
+              ? ("next: " + String(next.crop.crop_id || "") + " slot " + String(Number(next.slot.slot_index) + 1))
+              : "all slots reviewed";
+          }}
+        }}
+        function selectSlot(cropId, slotIndex) {{
+          selectedCropId = String(cropId || "");
+          selectedSlotIndex = slotIndex === null ? null : Number(slotIndex);
+          selectedSuggestion = null;
+          topCandidates = [];
+          refreshSlotUI();
+          updateManualMatchStatus();
+          renderSlotReviewPanel();
+          if (selectedSlotIndex !== null) {{
+            loadTopCandidates();
+          }}
+        }}
+        function selectNextUnreviewed(includeCurrent) {{
+          const next = findNextUnreviewed(selectedCropId, selectedSlotIndex === null ? -1 : selectedSlotIndex, !!includeCurrent);
+          if (next) {{
+            selectSlot(next.crop.crop_id, next.slot.slot_index);
+          }}
+        }}
+        function imageSrcForLocalPath(path) {{
+          const text = String(path || "");
+          if (!text) {{
+            return "";
+          }}
+          return "/debug/manual-page-image?path=" + encodeURIComponent(text);
+        }}
+        function imageSrcForCandidate(candidate) {{
+          const url = String((candidate && candidate.image_url) || "");
+          if (url) {{
+            return url;
+          }}
+          return imageSrcForLocalPath((candidate && candidate.image_path) || "");
+        }}
+        function renderImageTile(title, src, emptyText) {{
+          return `
+            <figure class="slot-preview-tile">
+              <div class="slot-preview-frame">${{src ? `<img src="${{escapeHtml(src)}}" alt="${{escapeHtml(title)}}" />` : `<span class="slot-empty">${{escapeHtml(emptyText || "unavailable")}}</span>`}}</div>
+              <figcaption>${{escapeHtml(title)}}</figcaption>
+            </figure>
+          `;
+        }}
+        function renderSlotReviewPanel() {{
+          const crop = selectedCrop();
+          const slot = selectedSlot();
+          const meta = document.getElementById("slot-review-meta");
+          const grid = document.getElementById("slot-preview-grid");
+          const savedBox = document.getElementById("saved-label-box");
+          const reloadBtn = document.getElementById("reload-candidates-btn");
+          const canAct = !!(crop && slot && selectedSlotIndex !== null);
+          document.getElementById("accept-top-btn").disabled = !canAct || !topCandidates.length;
+          document.getElementById("save-review-label-btn").disabled = !canAct;
+          document.getElementById("mark-unknown-btn").disabled = !canAct;
+          document.getElementById("ignore-slot-btn").disabled = !canAct;
+          document.getElementById("save-next-unreviewed-btn").disabled = !canAct;
+          if (reloadBtn) {{
+            reloadBtn.disabled = !canAct;
+          }}
+          if (!crop || !slot) {{
+            if (meta) meta.textContent = "Select a slot to review it.";
+            if (grid) grid.innerHTML = "";
+            if (savedBox) savedBox.textContent = "Saved label: none";
+            return;
+          }}
+          if (meta) {{
+            meta.textContent = "crop_id: " + String(crop.crop_id || "") + " | slot_index: " + String(slot.slot_index) + " | page " + String(crop.page || "?") + " | step " + String(crop.step || "?");
+          }}
+          if (grid) {{
+            grid.innerHTML = [
+              renderImageTile("original crop", crop.original_data_uri || "", "original unavailable"),
+              renderImageTile("step segmented cutout", slot.step_masked_url || "", "no step mask"),
+              renderImageTile("part cutout", slot.part_cutout_url || "", "no part cutout"),
+            ].join("");
+          }}
+          if (savedBox) {{
+            if (slotConfirmed(slot)) {{
+              const label = slot.saved_label;
+              savedBox.innerHTML = "Saved label: <strong>" + escapeHtml(label.part_num) + "</strong> / color " + escapeHtml(label.color_id) + (label.color_name ? " / " + escapeHtml(label.color_name) : "");
+            }} else if (slotUnknown(slot)) {{
+              savedBox.innerHTML = "Saved label: <strong>unknown</strong>";
+            }} else if (slotIgnored(slot)) {{
+              savedBox.innerHTML = "Saved label: <strong>ignored extra slot</strong>";
+            }} else {{
+              savedBox.textContent = "Saved label: none";
+            }}
+          }}
+        }}
+        function renderCandidateSuggestions(message) {{
+          const list = document.getElementById("candidate-suggestions");
+          if (!list) {{
+            return;
+          }}
+          if (message) {{
+            list.innerHTML = '<div class="slot-empty">' + escapeHtml(message) + '</div>';
+            return;
+          }}
+          if (!topCandidates.length) {{
+            list.innerHTML = '<div class="slot-empty">No candidates returned.</div>';
+            return;
+          }}
+          list.innerHTML = topCandidates.slice(0, 5).map((candidate, index) => {{
+            const src = imageSrcForCandidate(candidate);
+            const selected = selectedSuggestion && Number(selectedSuggestion.rank) === Number(candidate.rank);
+            const components = ["clip_score", "good_label_boost", "memory_bank_boost", "colour_boost", "qty_prior", "catch_all_penalty"]
+              .filter((key) => candidate[key] !== undefined && candidate[key] !== null)
+              .map((key) => key + ": " + candidate[key])
+              .join(" | ");
+            return `
+              <button type="button" class="candidate-suggestion${{selected ? " selected" : ""}}" data-suggestion-index="${{index}}">
+                <div>${{src ? `<img src="${{escapeHtml(src)}}" alt="${{escapeHtml(candidate.part_num || "")}}" />` : '<span class="slot-empty">No image</span>'}}</div>
+                <div>
+                  <strong>#${{candidate.rank || index + 1}} ${{escapeHtml(candidate.part_num || "")}}</strong><br/>
+                  color_id: ${{escapeHtml(candidate.color_id)}} | score: ${{escapeHtml(candidate.score)}}
+                  <div class="candidate-score-details">${{escapeHtml(components)}}</div>
+                </div>
+                <span class="secondary-btn">Choose</span>
+              </button>
+            `;
+          }}).join("");
+          list.querySelectorAll("[data-suggestion-index]").forEach((button) => {{
+            button.addEventListener("click", () => {{
+              const index = Number(button.dataset.suggestionIndex || 0);
+              selectedSuggestion = topCandidates[index] || null;
+              selectedPartKey = "";
+              document.querySelectorAll("[data-part-tile]").forEach((node) => node.classList.remove("selected"));
+              renderCandidateSuggestions();
+              updateManualMatchStatus();
+            }});
+          }});
+        }}
+        async function loadTopCandidates() {{
+          const crop = selectedCrop();
+          const slot = selectedSlot();
+          if (!crop || !slot) {{
+            renderCandidateSuggestions("Select a slot to fetch suggestions.");
+            return;
+          }}
+          const requestId = ++candidateRequestSerial;
+          renderCandidateSuggestions("Fetching Top 5...");
+          try {{
+            const payload = {{
+              set_num: {json.dumps(str(set_num))},
+              bag: {bag_number},
+              crop_id: crop.crop_id,
+              slot_index: slot.slot_index,
+              step_masked_path: slot.step_masked_path || "",
+              part_cutout_path: slot.part_cutout_path || "",
+            }};
+            const res = await fetch("/debug/buildability-clip-suggest", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify(payload),
+            }});
+            if (requestId !== candidateRequestSerial) {{
+              return;
+            }}
+            if (!res.ok) {{
+              renderCandidateSuggestions("Suggestion fetch failed.");
+              return;
+            }}
+            const data = await res.json();
+            topCandidates = Array.isArray(data.ranked_candidates) ? data.ranked_candidates.slice(0, 5) : [];
+            selectedSuggestion = null;
+            renderCandidateSuggestions();
+            renderSlotReviewPanel();
+          }} catch (error) {{
+            if (requestId === candidateRequestSerial) {{
+              renderCandidateSuggestions("Suggestion fetch failed: " + String(error));
+            }}
+          }}
+        }}
+        function partFromManualEntry() {{
+          const partNum = String(document.getElementById("manual-part-num")?.value || "").trim();
+          const colorIdRaw = String(document.getElementById("manual-color-id")?.value || "").trim();
+          if (!partNum || !colorIdRaw) {{
+            return null;
+          }}
+          const colorId = Number(colorIdRaw);
+          if (!Number.isFinite(colorId)) {{
+            return null;
+          }}
+          return {{
+            part_num: partNum,
+            color_id: colorId,
+            color_name: String(document.getElementById("manual-color-name")?.value || "").trim(),
+            element_id: String(document.getElementById("manual-element-id")?.value || "").trim(),
+          }};
+        }}
+        function currentChosenPart() {{
+          if (selectedSuggestion) {{
+            return {{
+              part_num: String(selectedSuggestion.part_num || ""),
+              color_id: Number(selectedSuggestion.color_id || 0),
+              color_name: String(selectedSuggestion.color_name || ""),
+              element_id: String(selectedSuggestion.element_id || ""),
+            }};
+          }}
+          const manual = partFromManualEntry();
+          if (manual) {{
+            return manual;
+          }}
+          if (selectedPartKey && reviewParts[selectedPartKey]) {{
+            return reviewParts[selectedPartKey];
+          }}
+          return null;
+        }}
+        async function saveCurrentLabel(moveNext) {{
+          const crop = selectedCrop();
+          const slot = selectedSlot();
+          const part = currentChosenPart();
+          if (!crop || !slot || selectedSlotIndex === null || !part || !String(part.part_num || "").trim()) {{
+            document.getElementById("manual-match-status").textContent = "Pick a candidate, library part, or manual part/color first.";
+            return false;
+          }}
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.crop_qty || [],
+            crop_qty_text: crop.crop_qty_text || [],
+            crop_box: crop.crop_box || [],
+            crop_box_format: crop.crop_box_format || "xywh",
+            crop_image_path: crop.crop_image_path || "",
+            qty: slot.qty != null ? slot.qty : null,
+            qty_text: slot.qty_text ? slot.qty_text : null,
+            part_num: part.part_num,
+            color_id: part.color_id,
+            color_name: part.color_name || null,
+            element_id: part.element_id || null,
+            selected_slot_index: selectedSlotIndex,
+            adjustments: [{{ type: "manual_match_review", slot_index: selectedSlotIndex }}],
+            review_status: "reviewed",
+          }};
+          const res = await fetch("/debug/save-label", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+          }});
+          if (!res.ok) {{
+            let detail = "Save failed";
+            try {{
+              const errorPayload = await res.json();
+              detail = errorPayload.detail || detail;
+            }} catch (_error) {{}}
+            document.getElementById("manual-match-status").textContent = detail;
+            return false;
+          }}
+          slot.saved_label = {{
+            part_num: part.part_num,
+            color_id: Number(part.color_id || 0),
+            color_name: part.color_name || "",
+            element_id: part.element_id || "",
+            qty: slot.qty,
+            qty_text: slot.qty_text,
+            selected_slot_index: selectedSlotIndex,
+          }};
+          slot.unknown = false;
+          slot.ignored = false;
+          crop.unknown_slots = (Array.isArray(crop.unknown_slots) ? crop.unknown_slots : []).filter((item) => Number(item) !== Number(selectedSlotIndex));
+          crop.ignored_slots = (Array.isArray(crop.ignored_slots) ? crop.ignored_slots : []).filter((item) => Number(item) !== Number(selectedSlotIndex));
+          crop.filled_slots = (Array.isArray(crop.slots) ? crop.slots : []).filter(slotConfirmed).length;
+          document.getElementById("manual-match-status").textContent = "Saved: " + crop.crop_id + " slot " + String(Number(selectedSlotIndex) + 1) + " -> " + part.part_num + "::" + part.color_id;
+          refreshSlotUI();
+          renderProgress();
+          renderSlotReviewPanel();
+          if (moveNext) {{
+            selectNextUnreviewed(false);
+          }}
+          return true;
+        }}
+        async function markCurrentUnknown() {{
+          const crop = selectedCrop();
+          const slot = selectedSlot();
+          if (!crop || !slot || selectedSlotIndex === null) {{
+            return;
+          }}
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.crop_qty || [],
+            crop_qty_text: crop.crop_qty_text || [],
+            crop_box: crop.crop_box || [],
+            crop_box_format: crop.crop_box_format || "xywh",
+            crop_image_path: crop.crop_image_path || "",
+            selected_slot_index: selectedSlotIndex,
+            review_status: "reviewed",
+            adjustments: [{{ type: "manual_match_unknown", slot_index: selectedSlotIndex }}],
+          }};
+          const res = await fetch("/debug/mark-slot-unknown", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+          }});
+          if (!res.ok) {{
+            document.getElementById("manual-match-status").textContent = "Mark unknown failed";
+            return;
+          }}
+          slot.unknown = true;
+          slot.ignored = false;
+          document.getElementById("manual-match-status").textContent = "Marked unknown: " + crop.crop_id + " slot " + String(Number(selectedSlotIndex) + 1);
+          refreshSlotUI();
+          renderProgress();
+          renderSlotReviewPanel();
+          selectNextUnreviewed(false);
+        }}
+        async function ignoreCurrentSlot() {{
+          const crop = selectedCrop();
+          const slot = selectedSlot();
+          if (!crop || !slot || selectedSlotIndex === null) {{
+            return;
+          }}
+          const payload = {{
+            set_num: {json.dumps(str(set_num))},
+            bag: {bag_number},
+            crop_id: crop.crop_id,
+            page: crop.page,
+            step: crop.step,
+            crop_qty: crop.crop_qty || [],
+            crop_qty_text: crop.crop_qty_text || [],
+            crop_box: crop.crop_box || [],
+            crop_box_format: crop.crop_box_format || "xywh",
+            crop_image_path: crop.crop_image_path || "",
+            selected_slot_index: selectedSlotIndex,
+            review_status: "reviewed",
+            adjustments: [{{ type: "manual_match_ignore_extra_slot", slot_index: selectedSlotIndex }}],
+          }};
+          const res = await fetch("/debug/mark-slot-ignored", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+          }});
+          if (!res.ok) {{
+            document.getElementById("manual-match-status").textContent = "Ignore slot failed";
+            return;
+          }}
+          slot.ignored = true;
+          slot.unknown = false;
+          document.getElementById("manual-match-status").textContent = "Ignored extra slot: " + crop.crop_id + " slot " + String(Number(selectedSlotIndex) + 1);
+          refreshSlotUI();
+          renderProgress();
+          renderSlotReviewPanel();
+          selectNextUnreviewed(false);
+        }}
         function isMetallicStyleColorName(colorName) {{
           const normalized = String(colorName || "").toLowerCase();
           return [
@@ -20529,20 +21284,28 @@ def manual_match_review(
           const button = document.getElementById("manual-assign-btn");
           if (status) {{
             const slotText = selectedSlotIndex === null ? "none" : String(Number(selectedSlotIndex) + 1);
-            status.textContent = "Selected crop: " + (selectedCropId || "none") + " | Selected slot: " + slotText + " | Selected part: " + (selectedPartKey || "none");
+            const chosen = currentChosenPart();
+            const chosenText = chosen ? (String(chosen.part_num || "") + "::" + String(chosen.color_id || 0)) : "none";
+            status.textContent = "Selected crop: " + (selectedCropId || "none") + " | Selected slot: " + slotText + " | Selected part: " + chosenText;
           }}
           if (button) {{
-            button.disabled = !(selectedCropId && selectedPartKey && selectedSlotIndex !== null);
+            button.disabled = !(selectedCropId && currentChosenPart() && selectedSlotIndex !== null);
           }}
         }}
         function refreshSlotUI() {{
           reviewCrops.forEach((crop) => {{
-            const filled = Number(crop.filled_slots || 0);
             document.querySelectorAll('[data-crop-slot][data-crop-id="' + crop.crop_id + '"]').forEach((node) => {{
               const idx = Number(node.dataset.slotIndex || -1);
-              const assigned = idx > -1 && idx < filled;
+              const slot = (Array.isArray(crop.slots) ? crop.slots : []).find((item) => Number(item.slot_index) === idx);
+              const assigned = slotConfirmed(slot);
+              const unknown = slotUnknown(slot);
+              const ignored = slotIgnored(slot);
               node.dataset.slotAssigned = assigned ? "true" : "false";
+              node.dataset.slotUnknown = unknown ? "true" : "false";
+              node.dataset.slotIgnored = ignored ? "true" : "false";
               node.classList.toggle("assigned", assigned);
+              node.classList.toggle("unknown", unknown);
+              node.classList.toggle("ignored", ignored);
               node.classList.toggle("selected", crop.crop_id === selectedCropId && idx === selectedSlotIndex);
             }});
             const cropTile = document.querySelector('[data-crop-tile][data-crop-id="' + crop.crop_id + '"]');
@@ -20591,14 +21354,13 @@ def manual_match_review(
             page ${{String(crop.page || "?")}} | step ${{String(crop.step || "?")}} | selected slot: ${{slotText}}
           `;
           const sequence = Array.isArray(crop.slot_sequence) ? crop.slot_sequence : [];
-          const filled = Number(crop.filled_slots || 0);
+          const detailSlots = Array.isArray(crop.slots) ? crop.slots : [];
           slots.innerHTML = sequence.length
             ? sequence.map((slot, idx) => `
                 <button
                   type="button"
-                  class="slot-btn${{idx < filled ? " assigned" : ""}}${{idx === Number(selectedSlotIndex) ? " selected" : ""}}"
+                  class="slot-btn${{slotConfirmed(detailSlots.find((item) => Number(item.slot_index) === idx)) ? " assigned" : ""}}${{slotUnknown(detailSlots.find((item) => Number(item.slot_index) === idx)) ? " unknown" : ""}}${{slotIgnored(detailSlots.find((item) => Number(item.slot_index) === idx)) ? " ignored" : ""}}${{idx === Number(selectedSlotIndex) ? " selected" : ""}}"
                   data-preview-slot-index="${{idx}}"
-                  data-preview-slot-assigned="${{idx < filled ? "true" : "false"}}"
                 >
                   Slot ${{idx + 1}}: ${{slot && (slot.qty_text || slot.qty || "none")}}
                 </button>
@@ -20606,13 +21368,7 @@ def manual_match_review(
             : '<div class="slot-empty">No qty slots</div>';
           slots.querySelectorAll("[data-preview-slot-index]").forEach((button) => {{
             button.addEventListener("click", () => {{
-              if (String(button.dataset.previewSlotAssigned || "") === "true") {{
-                return;
-              }}
-              selectedCropId = String(crop.crop_id || "");
-              selectedSlotIndex = Number(button.dataset.previewSlotIndex || 0);
-              refreshSlotUI();
-              updateManualMatchStatus();
+              selectSlot(String(crop.crop_id || ""), Number(button.dataset.previewSlotIndex || 0));
             }});
           }});
           syncCropPickerUI();
@@ -20642,13 +21398,7 @@ def manual_match_review(
         }}
         document.querySelectorAll("[data-crop-slot]").forEach((el) => {{
           el.addEventListener("click", () => {{
-            if (String(el.dataset.slotAssigned || "") === "true") {{
-              return;
-            }}
-            selectedCropId = String(el.dataset.cropId || "");
-            selectedSlotIndex = Number(el.dataset.slotIndex || 0);
-            refreshSlotUI();
-            updateManualMatchStatus();
+            selectSlot(String(el.dataset.cropId || ""), Number(el.dataset.slotIndex || 0));
           }});
         }});
         document.querySelectorAll("[data-crop-tile]").forEach((el) => {{
@@ -20658,8 +21408,12 @@ def manual_match_review(
             }}
             selectedCropId = String(el.dataset.cropId || "");
             selectedSlotIndex = null;
+            selectedSuggestion = null;
+            topCandidates = [];
             refreshSlotUI();
             updateManualMatchStatus();
+            renderSlotReviewPanel();
+            renderCandidateSuggestions("Select a slot to fetch suggestions.");
           }});
         }});
         document.getElementById("manual-crop-preview-close")?.addEventListener("click", () => {{
@@ -20679,75 +21433,59 @@ def manual_match_review(
         document.querySelectorAll("[data-part-tile]").forEach((el) => {{
           el.addEventListener("click", () => {{
             selectedPartKey = String(el.dataset.partKey || "");
+            selectedSuggestion = null;
             document.querySelectorAll("[data-part-tile]").forEach((node) => node.classList.toggle("selected", node === el));
+            renderCandidateSuggestions();
+            updateManualMatchStatus();
+          }});
+        }});
+        ["manual-part-num", "manual-color-id", "manual-color-name", "manual-element-id"].forEach((id) => {{
+          document.getElementById(id)?.addEventListener("input", () => {{
+            if (id === "manual-part-num" || id === "manual-color-id") {{
+              selectedSuggestion = null;
+              selectedPartKey = "";
+              document.querySelectorAll("[data-part-tile]").forEach((node) => node.classList.remove("selected"));
+              renderCandidateSuggestions();
+            }}
             updateManualMatchStatus();
           }});
         }});
         document.getElementById("manual-assign-btn")?.addEventListener("click", async () => {{
-          const crop = cropReviewMap.get(selectedCropId);
-          const part = reviewParts[selectedPartKey];
-          const sequence = crop && Array.isArray(crop.slot_sequence) ? crop.slot_sequence : [];
-          const slot = selectedSlotIndex !== null ? sequence[Number(selectedSlotIndex)] : null;
-          if (!crop || !part || selectedSlotIndex === null || !slot) {{
-            return;
+          await saveCurrentLabel(true);
+        }});
+        document.getElementById("save-review-label-btn")?.addEventListener("click", async () => {{
+          await saveCurrentLabel(false);
+        }});
+        document.getElementById("save-next-unreviewed-btn")?.addEventListener("click", async () => {{
+          await saveCurrentLabel(true);
+        }});
+        document.getElementById("accept-top-btn")?.addEventListener("click", async () => {{
+          if (topCandidates.length) {{
+            selectedSuggestion = topCandidates[0];
+            renderCandidateSuggestions();
+            updateManualMatchStatus();
+            await saveCurrentLabel(true);
           }}
-          const payload = {{
-            set_num: {json.dumps(str(set_num))},
-            bag: {bag_number},
-            crop_id: crop.crop_id,
-            page: crop.page,
-            step: crop.step,
-            crop_qty: crop.crop_qty || [],
-            crop_qty_text: crop.crop_qty_text || [],
-            crop_box: crop.crop_box || [],
-            crop_box_format: crop.crop_box_format || "xywh",
-            crop_image_path: crop.crop_image_path || "",
-            qty: slot.qty != null ? slot.qty : null,
-            qty_text: slot.qty_text ? slot.qty_text : null,
-            part_num: part.part_num,
-            color_id: colourOverride !== null ? colourOverride.color_id : part.color_id,
-            color_name: colourOverride !== null ? colourOverride.color_name : (part.color_name || null),
-            element_id: part.element_id || null,
-            selected_slot_index: selectedSlotIndex,
-            adjustments: [{{ type: "manual_match_slot", slot_index: selectedSlotIndex }}],
-          }};
-          const res = await fetch("/debug/save-label", {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify(payload),
-          }});
-          if (!res.ok) {{
-            let detail = "Assign failed";
-            try {{
-              const errorPayload = await res.json();
-              detail = errorPayload.detail || detail;
-            }} catch (_error) {{}}
-            document.getElementById("manual-match-status").textContent = detail;
-            return;
-          }}
-          crop.filled_slots = Math.max(Number(crop.filled_slots || 0), Number(selectedSlotIndex) + 1);
-          document.getElementById("manual-match-status").textContent = "Assigned: " + selectedCropId + " slot " + String(Number(selectedSlotIndex) + 1) + " -> " + selectedPartKey;
-          if (Number.isFinite(Number(part.remaining_qty))) {{
-            part.remaining_qty = Number(part.remaining_qty) - Number(slot.qty || 1);
-          }}
-          const selectedTile = document.querySelector('[data-part-tile].selected');
-          if (selectedTile) {{
-            const tileIndex = String(selectedTile.dataset.partTileIndex || "");
-            const remainingEl = tileIndex ? document.getElementById("remaining-qty-" + tileIndex) : null;
-            if (remainingEl) {{
-              remainingEl.textContent = String(part.remaining_qty);
-            }}
-            if (part.remaining_qty <= 0) {{
-              selectedTile.style.opacity = "0.45";
-            }}
-          }}
-          selectNextOpenSlot(selectedCropId);
-          console.log("Assigned", payload);
+        }});
+        document.getElementById("mark-unknown-btn")?.addEventListener("click", async () => {{
+          await markCurrentUnknown();
+        }});
+        document.getElementById("ignore-slot-btn")?.addEventListener("click", async () => {{
+          await ignoreCurrentSlot();
+        }});
+        document.getElementById("reload-candidates-btn")?.addEventListener("click", async () => {{
+          await loadTopCandidates();
+        }});
+        document.getElementById("next-unreviewed-btn")?.addEventListener("click", () => {{
+          selectNextUnreviewed(false);
         }});
         renderCandidateFilterControls();
         applyActiveColourFilter();
         refreshSlotUI();
         updateManualMatchStatus();
+        renderProgress();
+        renderSlotReviewPanel();
+        renderCandidateSuggestions("Select a slot to fetch suggestions.");
       </script>
     </body>
     </html>
@@ -21486,4 +22224,3 @@ def _hybrid_segment_crop(
         blank = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
         info["reject_reason"] = (info.get("reject_reason") or "") + f"; fallback_error: {exc}"
         return blank, "failed", info
-
