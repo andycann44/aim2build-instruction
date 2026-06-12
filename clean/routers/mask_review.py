@@ -165,11 +165,27 @@ def mask_review_page(
 ):
     crops    = _load_bag_crops(set_num, bag)
     verdicts = _load_verdicts(set_num, bag)
+    crop_ids = {
+        str(crop.get("crop_id") or "").strip()
+        for crop in crops
+        if str(crop.get("crop_id") or "").strip()
+    }
+    active_verdicts = {
+        crop_id: verdict
+        for crop_id, verdict in verdicts.items()
+        if crop_id in crop_ids
+    }
 
-    n_total    = len(crops)
-    n_reviewed = len(verdicts)
-    n_pass     = sum(1 for v in verdicts.values() if v == "pass")
-    n_fail     = sum(1 for v in verdicts.values() if v == "fail")
+    n_total    = len(crop_ids)
+    n_reviewed = sum(1 for crop_id in crop_ids if crop_id in active_verdicts)
+    n_pass     = sum(
+        1 for crop_id in crop_ids
+        if active_verdicts.get(crop_id) == "pass"
+    )
+    n_fail     = sum(
+        1 for crop_id in crop_ids
+        if active_verdicts.get(crop_id) == "fail"
+    )
 
     cards: List[str] = []
     for crop in crops:
@@ -193,7 +209,7 @@ def mask_review_page(
             _FULL_CROP_MASK_OVERLAY_DIR / f"{stem}_master_island_overlay.png"
         ) if stem else ""
 
-        verdict     = verdicts.get(crop_id, "")
+        verdict     = active_verdicts.get(crop_id, "")
         pass_sel    = "selected" if verdict == "pass" else ""
         fail_sel    = "selected" if verdict == "fail" else ""
 

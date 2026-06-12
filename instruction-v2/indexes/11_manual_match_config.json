@@ -1,0 +1,22 @@
+{
+  "stage": 10,
+  "name": "manual_match_config",
+  "purpose": "Human override layer for provisional V2 matching. This is not a review label source of truth.",
+  "status_values": [
+    "pending",
+    "accepted",
+    "rejected",
+    "needs_ai_check"
+  ],
+  "schema": {
+    "crop_id": "string",
+    "segment_index": "integer",
+    "force_part_num": "string or null",
+    "force_color_id": "integer or null",
+    "reject_candidate_part_nums": "array of strings",
+    "reject_candidate_color_ids": "array of integers",
+    "notes": "string",
+    "status": "pending/accepted/rejected/needs_ai_check"
+  },
+  "overrides": []
+}

@@ -1,0 +1,1068 @@
+{
+  "stage": "05c",
+  "name": "v1_crop_cache_import",
+  "created_at": "2026-06-03T11:54:24.487315+00:00",
+  "set_num": "70618",
+  "source": "v1_crop_cache",
+  "read_only": true,
+  "input_files": [
+    "/Users/olly/aim2build-instruction/debug/crop_cache/70618_bag1.json",
+    "/Users/olly/aim2build-instruction/debug/crop_cache/70618_bag2.json"
+  ],
+  "entry_count": 37,
+  "entries": [
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 7,
+      "step_number": 1,
+      "crop_index": 1,
+      "crop_id": "p7_s1_c1",
+      "stem": "p7_s1_c1",
+      "crop_box": [
+        944,
+        25,
+        309,
+        160
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_007.png",
+      "qty_text": [
+        "1x",
+        "2x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        2,
+        1
+      ],
+      "v1_source": "page_level_callout_assignment",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 7,
+      "step_number": 2,
+      "crop_index": 2,
+      "crop_id": "p7_s2_c2",
+      "stem": "p7_s2_c2",
+      "crop_box": [
+        944,
+        593,
+        309,
+        100
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_007.png",
+      "qty_text": [
+        "3x"
+      ],
+      "qty_numbers": [
+        3
+      ],
+      "v1_source": "page_level_callout_assignment",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 8,
+      "step_number": 3,
+      "crop_index": 1,
+      "crop_id": "p8_s3_c1",
+      "stem": "p8_s3_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        157
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_008.png",
+      "qty_text": [
+        "3x",
+        "1x"
+      ],
+      "qty_numbers": [
+        3,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 8,
+      "step_number": 4,
+      "crop_index": 2,
+      "crop_id": "p8_s4_c2",
+      "stem": "p8_s4_c2",
+      "crop_box": [
+        29,
+        596,
+        313,
+        157
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_008.png",
+      "qty_text": [
+        "3x",
+        "1x"
+      ],
+      "qty_numbers": [
+        3,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 9,
+      "step_number": 5,
+      "crop_index": 1,
+      "crop_id": "p9_s5_c1",
+      "stem": "p9_s5_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        156
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_009.png",
+      "qty_text": [
+        "3x",
+        "1x"
+      ],
+      "qty_numbers": [
+        3,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 9,
+      "step_number": 6,
+      "crop_index": 2,
+      "crop_id": "p9_s6_c2",
+      "stem": "p9_s6_c2",
+      "crop_box": [
+        114,
+        596,
+        313,
+        155
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_009.png",
+      "qty_text": [
+        "2x",
+        "1x"
+      ],
+      "qty_numbers": [
+        2,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 11,
+      "step_number": 9,
+      "crop_index": 1,
+      "crop_id": "p11_s9_c1",
+      "stem": "p11_s9_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_011.png",
+      "qty_text": [
+        "24x"
+      ],
+      "qty_numbers": [
+        24
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 11,
+      "step_number": 10,
+      "crop_index": 2,
+      "crop_id": "p11_s10_c2",
+      "stem": "p11_s10_c2",
+      "crop_box": [
+        114,
+        596,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_011.png",
+      "qty_text": [
+        "2x",
+        "2x",
+        "2x"
+      ],
+      "qty_numbers": [
+        2,
+        2,
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 12,
+      "step_number": 11,
+      "crop_index": 1,
+      "crop_id": "p12_s11_c1",
+      "stem": "p12_s11_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_012.png",
+      "qty_text": [
+        "8x",
+        "4x",
+        "4x"
+      ],
+      "qty_numbers": [
+        8,
+        4,
+        4
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 12,
+      "step_number": 12,
+      "crop_index": 2,
+      "crop_id": "p12_s12_c2",
+      "stem": "p12_s12_c2",
+      "crop_box": [
+        29,
+        596,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_012.png",
+      "qty_text": [
+        "6x"
+      ],
+      "qty_numbers": [
+        6
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 13,
+      "step_number": 13,
+      "crop_index": 1,
+      "crop_id": "p13_s13_c1",
+      "stem": "p13_s13_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_013.png",
+      "qty_text": [
+        "6x"
+      ],
+      "qty_numbers": [
+        6
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 13,
+      "step_number": 14,
+      "crop_index": 2,
+      "crop_id": "p13_s14_c2",
+      "stem": "p13_s14_c2",
+      "crop_box": [
+        114,
+        596,
+        313,
+        111
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_013.png",
+      "qty_text": [
+        "1x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 14,
+      "step_number": 15,
+      "crop_index": 1,
+      "crop_id": "p14_s15_c1",
+      "stem": "p14_s15_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_014.png",
+      "qty_text": [
+        "10x",
+        "0x"
+      ],
+      "qty_numbers": [
+        10,
+        0
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 14,
+      "step_number": 16,
+      "crop_index": 2,
+      "crop_id": "p14_s16_c2",
+      "stem": "p14_s16_c2",
+      "crop_box": [
+        29,
+        624,
+        313,
+        200
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_014.png",
+      "qty_text": [
+        "1x"
+      ],
+      "qty_numbers": [
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 15,
+      "step_number": 17,
+      "crop_index": 1,
+      "crop_id": "p15_s17_c1",
+      "stem": "p15_s17_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        100
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_015.png",
+      "qty_text": [
+        "1x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 15,
+      "step_number": 18,
+      "crop_index": 2,
+      "crop_id": "p15_s18_c2",
+      "stem": "p15_s18_c2",
+      "crop_box": [
+        114,
+        624,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_015.png",
+      "qty_text": [
+        "2x"
+      ],
+      "qty_numbers": [
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 16,
+      "step_number": 19,
+      "crop_index": 1,
+      "crop_id": "p16_s19_c1",
+      "stem": "p16_s19_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        146
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_016.png",
+      "qty_text": [
+        "2x",
+        "2x",
+        "2x",
+        "2x",
+        "2x",
+        "2x"
+      ],
+      "qty_numbers": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 17,
+      "step_number": 20,
+      "crop_index": 1,
+      "crop_id": "p17_s20_c1",
+      "stem": "p17_s20_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        104
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_017.png",
+      "qty_text": [
+        "2x",
+        "4x",
+        "2x"
+      ],
+      "qty_numbers": [
+        2,
+        4,
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 18,
+      "step_number": 21,
+      "crop_index": 1,
+      "crop_id": "p18_s21_c1",
+      "stem": "p18_s21_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        164
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_018.png",
+      "qty_text": [
+        "1x",
+        "2x",
+        "2x",
+        "1x",
+        "1x",
+        "2x",
+        "1x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        2,
+        2,
+        1,
+        1,
+        2,
+        1,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 20,
+      "step_number": 23,
+      "crop_index": 1,
+      "crop_id": "p20_s23_c1",
+      "stem": "p20_s23_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        158
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_020.png",
+      "qty_text": [
+        "4x",
+        "2x"
+      ],
+      "qty_numbers": [
+        4,
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 20,
+      "step_number": 24,
+      "crop_index": 2,
+      "crop_id": "p20_s24_c2",
+      "stem": "p20_s24_c2",
+      "crop_box": [
+        29,
+        674,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_020.png",
+      "qty_text": [
+        "6x"
+      ],
+      "qty_numbers": [
+        6
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 1,
+      "page": 21,
+      "step_number": 25,
+      "crop_index": 1,
+      "crop_id": "p21_s25_c1",
+      "stem": "p21_s25_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        100
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_021.png",
+      "qty_text": [
+        "3x"
+      ],
+      "qty_numbers": [
+        3
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 22,
+      "step_number": 26,
+      "crop_index": 1,
+      "crop_id": "p22_s26_c1",
+      "stem": "p22_s26_c1",
+      "crop_box": [
+        29,
+        363,
+        313,
+        164
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_022.png",
+      "qty_text": [
+        "1x",
+        "1x",
+        "1x",
+        "1x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 23,
+      "step_number": 27,
+      "crop_index": 1,
+      "crop_id": "p23_s27_c1",
+      "stem": "p23_s27_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        161
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_023.png",
+      "qty_text": [
+        "1x",
+        "1x",
+        "1x",
+        "1x",
+        "1x",
+        "1x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 24,
+      "step_number": 28,
+      "crop_index": 1,
+      "crop_id": "p24_s28_c1",
+      "stem": "p24_s28_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_024.png",
+      "qty_text": [
+        "8x",
+        "8x"
+      ],
+      "qty_numbers": [
+        8,
+        8
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 25,
+      "step_number": 29,
+      "crop_index": 1,
+      "crop_id": "p25_s29_c1",
+      "stem": "p25_s29_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_025.png",
+      "qty_text": [
+        "2x",
+        "2x"
+      ],
+      "qty_numbers": [
+        2,
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 26,
+      "step_number": 30,
+      "crop_index": 1,
+      "crop_id": "p26_s30_c1",
+      "stem": "p26_s30_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        165
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_026.png",
+      "qty_text": [
+        "8x"
+      ],
+      "qty_numbers": [
+        8
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 27,
+      "step_number": 31,
+      "crop_index": 1,
+      "crop_id": "p27_s31_c1",
+      "stem": "p27_s31_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_027.png",
+      "qty_text": [
+        "2x"
+      ],
+      "qty_numbers": [
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 28,
+      "step_number": 32,
+      "crop_index": 1,
+      "crop_id": "p28_s32_c1",
+      "stem": "p28_s32_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        168
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_028.png",
+      "qty_text": [
+        "3x",
+        "1x",
+        "2x",
+        "1x"
+      ],
+      "qty_numbers": [
+        3,
+        1,
+        2,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 29,
+      "step_number": 33,
+      "crop_index": 1,
+      "crop_id": "p29_s33_c1",
+      "stem": "p29_s33_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_029.png",
+      "qty_text": [
+        "1x",
+        "1x",
+        "1x",
+        "1x"
+      ],
+      "qty_numbers": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 30,
+      "step_number": 34,
+      "crop_index": 1,
+      "crop_id": "p30_s34_c1",
+      "stem": "p30_s34_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_030.png",
+      "qty_text": [
+        "2x",
+        "1x"
+      ],
+      "qty_numbers": [
+        2,
+        1
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 31,
+      "step_number": 35,
+      "crop_index": 1,
+      "crop_id": "p31_s35_c1",
+      "stem": "p31_s35_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        114
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_031.png",
+      "qty_text": [
+        "16x",
+        "8x",
+        "8x",
+        "8x",
+        "8x"
+      ],
+      "qty_numbers": [
+        16,
+        8,
+        8,
+        8,
+        8
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 32,
+      "step_number": 36,
+      "crop_index": 1,
+      "crop_id": "p32_s36_c1",
+      "stem": "p32_s36_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        192
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_032.png",
+      "qty_text": [
+        "1x",
+        "1x",
+        "1x",
+        "2x",
+        "1x",
+        "1x",
+        "1x",
+        "2x"
+      ],
+      "qty_numbers": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        1,
+        1,
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 34,
+      "step_number": 37,
+      "crop_index": 1,
+      "crop_id": "p34_s37_c1",
+      "stem": "p34_s37_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_034.png",
+      "qty_text": [
+        "2x"
+      ],
+      "qty_numbers": [
+        2
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 35,
+      "step_number": 38,
+      "crop_index": 1,
+      "crop_id": "p35_s38_c1",
+      "stem": "p35_s38_c1",
+      "crop_box": [
+        114,
+        132,
+        313,
+        171
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_035.png",
+      "qty_text": [
+        "4x",
+        "4x",
+        "4x",
+        "6x",
+        "4x",
+        "4x"
+      ],
+      "qty_numbers": [
+        4,
+        4,
+        4,
+        6,
+        4,
+        4
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 37,
+      "step_number": 39,
+      "crop_index": 1,
+      "crop_id": "p37_s39_c1",
+      "stem": "p37_s39_c1",
+      "crop_box": [
+        114,
+        29,
+        313,
+        98
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_037.png",
+      "qty_text": [
+        "2x",
+        "4x"
+      ],
+      "qty_numbers": [
+        2,
+        4
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    },
+    {
+      "set_num": "70618",
+      "bag": 2,
+      "page": 38,
+      "step_number": 40,
+      "crop_index": 1,
+      "crop_id": "p38_s40_c1",
+      "stem": "p38_s40_c1",
+      "crop_box": [
+        29,
+        29,
+        313,
+        97
+      ],
+      "crop_box_format": "xywh",
+      "crop_image_path": "/Users/olly/aim2build-instruction/debug/70618/70618_01/pages/page_038.png",
+      "qty_text": [
+        "4x"
+      ],
+      "qty_numbers": [
+        4
+      ],
+      "v1_source": "edge_detect",
+      "source": "v1_crop_cache"
+    }
+  ]
+}

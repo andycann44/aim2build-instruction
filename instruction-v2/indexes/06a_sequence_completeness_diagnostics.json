@@ -1,0 +1,105 @@
+{
+  "stage": "diagnostic",
+  "name": "sequence_completeness_diagnostics",
+  "input_manifests": [
+    "indexes/04_bag_map.json",
+    "indexes/02_page_index.json",
+    "indexes/06_callout_crop_box_map.json"
+  ],
+  "method": "diagnostic_only_visible_step_probe_vs_emitted_callout_steps",
+  "rules": [
+    "Do not auto-create crops.",
+    "Do not promote probe output.",
+    "Every number in a monotonic visible sequence must either have an emitted crop or appear in missing_steps."
+  ],
+  "page_filter": [
+    78,
+    79
+  ],
+  "entry_count": 2,
+  "missing_report_count": 2,
+  "step_probe_path": "debug/sequence_completeness/05_step_probe.json",
+  "entries": [
+    {
+      "bag": 4,
+      "page": 78,
+      "visible_step_numbers": [
+        7,
+        124,
+        125,
+        126,
+        127
+      ],
+      "emitted_callout_steps": [
+        124,
+        125
+      ],
+      "sequence_reports": [
+        {
+          "visible_sequence": [
+            124,
+            125,
+            126,
+            127
+          ],
+          "emitted_steps_in_sequence": [
+            124,
+            125
+          ],
+          "missing_steps": [
+            126,
+            127
+          ],
+          "status": "missing_steps_reported"
+        }
+      ],
+      "missing_steps": [
+        126,
+        127
+      ],
+      "diagnostic_only": true,
+      "debug_overlay_path": "debug/sequence_completeness/step_probe/bag_04_page_078.png",
+      "source": "page_level_step_number_probe_vs_06_callout_crop_box_map"
+    },
+    {
+      "bag": 4,
+      "page": 79,
+      "visible_step_numbers": [
+        128,
+        129,
+        130,
+        131
+      ],
+      "emitted_callout_steps": [
+        128,
+        129
+      ],
+      "sequence_reports": [
+        {
+          "visible_sequence": [
+            128,
+            129,
+            130,
+            131
+          ],
+          "emitted_steps_in_sequence": [
+            128,
+            129
+          ],
+          "missing_steps": [
+            130,
+            131
+          ],
+          "status": "missing_steps_reported"
+        }
+      ],
+      "missing_steps": [
+        130,
+        131
+      ],
+      "diagnostic_only": true,
+      "debug_overlay_path": "debug/sequence_completeness/step_probe/bag_04_page_079.png",
+      "source": "page_level_step_number_probe_vs_06_callout_crop_box_map"
+    }
+  ]
+}

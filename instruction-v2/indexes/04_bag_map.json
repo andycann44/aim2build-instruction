@@ -1,0 +1,519 @@
+{
+  "stage": 3,
+  "name": "bag_page_ranges",
+  "input_manifests": [
+    "indexes/03d_v1_bag_truth_import.json",
+    "indexes/03_bag_candidates.json",
+    "indexes/03b_bag_gap_review.json"
+  ],
+  "method": "priority_v1_bag_truth_then_human_gap_review_then_candidates",
+  "page_count": 312,
+  "candidate_count": 33,
+  "v1_bag_truth_count": 15,
+  "v1_bag_truth_source": "indexes/03d_v1_bag_truth_import.json",
+  "accepted_gap_correction_count": 1,
+  "accepted_gap_corrections": [
+    {
+      "page": 81,
+      "observed_bag_number": 5,
+      "window_id": "gap_after_bag_03_before_bag_04",
+      "review_source": "human",
+      "notes": [
+        "Screenshot/page review shows page 81 clearly starts bag 5."
+      ],
+      "confidence": 0.99
+    }
+  ],
+  "accepted_bag_1_bootstrap": {
+    "page": 6,
+    "earliest_step_1_page": 7,
+    "rule": "earliest_step_1_previous_page",
+    "review_source": "instruction_v2_bootstrap_rule",
+    "confidence": 0.775,
+    "evidence_reason": "Page 7 is the earliest build-page step-1 candidate by sequence_gap_inference; previous page 6 has material/start-page evidence",
+    "step_1_detection_reason": "Bootstrap scan did not OCR step 1, but page 7 has step-box evidence immediately before page 8, where printed step 3 was detected.",
+    "previous_page_evidence": {
+      "page": 6,
+      "image_path": "pages/70618_01/page_006.png",
+      "score": 97.5,
+      "confidence": 0.775,
+      "reasons": [
+        "+ orange_arrow_components",
+        "+ large_number_like_groups",
+        "+ central_number_like_group",
+        "+ near_window_start",
+        "+ combined_arrow_and_number_structure"
+      ],
+      "signals": {
+        "orange_arrow_component_count": 1,
+        "dark_component_count": 8,
+        "large_number_group_count": 3,
+        "central_number_group_count": 1,
+        "early_window_bias": 1,
+        "structure_score": 0.775,
+        "scan_region": {
+          "left": 0,
+          "top": 0,
+          "width": 1565,
+          "height": 1191
+        }
+      },
+      "number_like_groups": [
+        {
+          "x": 185,
+          "y": 52,
+          "w": 103,
+          "h": 59,
+          "pixels": 2269,
+          "components": 1,
+          "pale_label_background_score": 0.9842,
+          "center_score": 0.8738
+        },
+        {
+          "x": 16,
+          "y": 103,
+          "w": 68,
+          "h": 42,
+          "pixels": 1323,
+          "components": 1,
+          "pale_label_background_score": 0.9329,
+          "center_score": 0.2381
+        },
+        {
+          "x": 16,
+          "y": 58,
+          "w": 71,
+          "h": 38,
+          "pixels": 1290,
+          "components": 1,
+          "pale_label_background_score": 0.9148,
+          "center_score": 0.2452
+        }
+      ],
+      "detected_bag_number": 8,
+      "detected_bag_number_confidence": 0.88,
+      "detected_bag_number_source": "geometry_two_holes_after_v1_panel_number_ocr_fallback",
+      "detected_bag_number_box": {
+        "x": 58,
+        "y": 112,
+        "w": 69,
+        "h": 75
+      },
+      "detected_bag_number_ocr_raw": "",
+      "detected_bag_number_candidates": [
+        {
+          "detected_bag_number": 8,
+          "confidence": 0.88,
+          "source": "geometry_two_holes_after_v1_panel_number_ocr_fallback",
+          "ocr_raw": "",
+          "number_box": {
+            "x": 58,
+            "y": 112,
+            "w": 69,
+            "h": 75
+          },
+          "component_pixels": 992,
+          "arrow_relationship_score": 0,
+          "arrow_box": null,
+          "selection_score": 100.4,
+          "geometry_features": {
+            "holes": 4,
+            "topFill": 0.5797101449275363,
+            "midFill": 0.30434782608695654,
+            "bottomFill": 0.2028985507246377,
+            "upperLeft": 0.5182829888712241,
+            "lowerLeft": 0.08436532507739938,
+            "lowerRight": 0.4481203007518797,
+            "aspect": 0.92
+          }
+        }
+      ],
+      "analysis_source": "instruction_v2_gap_window_scan"
+    },
+    "requires_human_review": true
+  },
+  "bag_count": 15,
+  "front_matter_candidate_clusters": [
+    {
+      "start_page": 1,
+      "end_page": 5,
+      "evidence_pages": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reason": "candidate cluster before first build range; retained as overview/front-matter evidence"
+    }
+  ],
+  "bags": [
+    {
+      "bag": 1,
+      "start_page": 6,
+      "end_page": 21,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        6
+      ],
+      "evidence": [
+        {
+          "page": 6,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_006.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-27T21:19:53.326671+00:00",
+          "updated_at": "2026-04-27T21:19:53.326671+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 2,
+      "start_page": 22,
+      "end_page": 38,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        22
+      ],
+      "evidence": [
+        {
+          "page": 22,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_022.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-27T10:15:31.548694+00:00",
+          "updated_at": "2026-04-27T10:15:31.548694+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 3,
+      "start_page": 39,
+      "end_page": 57,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        39
+      ],
+      "evidence": [
+        {
+          "page": 39,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_039.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-27T10:41:16.639040+00:00",
+          "updated_at": "2026-04-27T10:41:16.639040+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 4,
+      "start_page": 58,
+      "end_page": 80,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        58
+      ],
+      "evidence": [
+        {
+          "page": 58,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_058.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T06:31:41.142715+00:00",
+          "updated_at": "2026-04-28T06:31:41.142715+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 5,
+      "start_page": 81,
+      "end_page": 103,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        81
+      ],
+      "evidence": [
+        {
+          "page": 81,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_081.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T05:51:08.566453+00:00",
+          "updated_at": "2026-04-28T05:51:08.566453+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 6,
+      "start_page": 104,
+      "end_page": 130,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        104
+      ],
+      "evidence": [
+        {
+          "page": 104,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_104.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T11:37:32.772241+00:00",
+          "updated_at": "2026-04-28T11:37:32.772241+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 7,
+      "start_page": 131,
+      "end_page": 147,
+      "confidence": -0.15,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        131
+      ],
+      "evidence": [
+        {
+          "page": 131,
+          "score": -0.15,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_131.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T15:19:18.913531+00:00",
+          "updated_at": "2026-04-28T15:19:18.913531+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 8,
+      "start_page": 148,
+      "end_page": 163,
+      "confidence": -0.15,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        148
+      ],
+      "evidence": [
+        {
+          "page": 148,
+          "score": -0.15,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_148.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T18:13:07.287952+00:00",
+          "updated_at": "2026-04-28T18:13:07.287952+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 9,
+      "start_page": 164,
+      "end_page": 178,
+      "confidence": -0.15,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        164
+      ],
+      "evidence": [
+        {
+          "page": 164,
+          "score": -0.15,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_164.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T18:14:07.017024+00:00",
+          "updated_at": "2026-04-28T18:14:07.017024+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 10,
+      "start_page": 179,
+      "end_page": 193,
+      "confidence": -0.15,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        179
+      ],
+      "evidence": [
+        {
+          "page": 179,
+          "score": -0.15,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_179.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T19:04:53.640075+00:00",
+          "updated_at": "2026-04-28T19:04:53.640075+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 11,
+      "start_page": 194,
+      "end_page": 212,
+      "confidence": 0.65,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        194
+      ],
+      "evidence": [
+        {
+          "page": 194,
+          "score": 0.65,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_194.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T19:05:20.635123+00:00",
+          "updated_at": "2026-04-28T19:05:20.635123+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 12,
+      "start_page": 213,
+      "end_page": 236,
+      "confidence": -0.15,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "detector",
+      "evidence_pages": [
+        213
+      ],
+      "evidence": [
+        {
+          "page": 213,
+          "score": -0.15,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_213.png",
+          "v1_source": "detector",
+          "created_at": "2026-04-28T19:05:35.577583+00:00",
+          "updated_at": "2026-04-28T19:05:35.577583+00:00"
+        }
+      ]
+    },
+    {
+      "bag": 13,
+      "start_page": 237,
+      "end_page": 265,
+      "confidence": 0.998,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "manual",
+      "evidence_pages": [
+        237
+      ],
+      "evidence": [
+        {
+          "page": 237,
+          "score": 0.998,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_237.png",
+          "v1_source": "manual",
+          "created_at": "2026-04-29 05:50:53",
+          "updated_at": "2026-04-29 05:50:53"
+        }
+      ]
+    },
+    {
+      "bag": 14,
+      "start_page": 266,
+      "end_page": 273,
+      "confidence": 0.998,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "manual",
+      "evidence_pages": [
+        266
+      ],
+      "evidence": [
+        {
+          "page": 266,
+          "score": 0.998,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_266.png",
+          "v1_source": "manual",
+          "created_at": "2026-04-29 05:50:53",
+          "updated_at": "2026-04-29 05:50:53"
+        }
+      ]
+    },
+    {
+      "bag": 15,
+      "start_page": 274,
+      "end_page": 312,
+      "confidence": 0.998,
+      "source": "v1_bag_truth_db",
+      "bag_number_source": "v1_bag_truth_db",
+      "observed_bag_number": null,
+      "v1_source": "manual",
+      "evidence_pages": [
+        274
+      ],
+      "evidence": [
+        {
+          "page": 274,
+          "score": 0.998,
+          "source": "v1_bag_truth_db",
+          "debug_image_path": "pages/70618_01/page_274.png",
+          "v1_source": "manual",
+          "created_at": "2026-04-28 20:59:25",
+          "updated_at": "2026-04-28 20:59:25"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Source priority: 03d V1 bag truth import, then accepted 03b human gap-review corrections, then 03 bag candidates.",
+    "It does not read debug/, training labels, clean routes, OCR, or step detection.",
+    "The V1 truth import manifest is read-only evidence produced from debug/bag_truth.db by Stage 3d.",
+    "Accepted human gap-review pages preserve review_source and observed_bag_number evidence.",
+    "Accepted Bag 1 bootstrap evidence is only applied when no V1 bag truth import is available."
+  ]
+}

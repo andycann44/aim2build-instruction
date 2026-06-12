@@ -3029,9 +3029,11 @@ def _load_crop_for_ai_snap(set_num: str, bag: int, crop_id: str) -> Optional[Dic
     saved_qty_numbers = _coerce_int_list(saved_crop.get("qty", []))
     crop["page"] = int(saved_crop.get("page", crop.get("page", 0)) or crop.get("page", 0) or 0)
     crop["step"] = int(saved_crop.get("step", crop.get("step", 0)) or crop.get("step", 0) or 0)
-    crop["crop_box"] = _coerce_box_list(saved_crop.get("crop_box")) or _coerce_box_list(crop.get("crop_box")) or []
-    crop["crop_box_format"] = str(saved_crop.get("crop_box_format") or crop.get("crop_box_format") or "xywh")
-    crop["crop_image_path"] = str(saved_crop.get("crop_image_path") or crop.get("crop_image_path") or "")
+    # Prefer crop_cache (built_crops) for spatial fields — it is more up-to-date than
+    # the snapshot stored in training_labels, which may reflect an older crop detection run.
+    crop["crop_box"] = _coerce_box_list(crop.get("crop_box")) or _coerce_box_list(saved_crop.get("crop_box")) or []
+    crop["crop_box_format"] = str(crop.get("crop_box_format") or saved_crop.get("crop_box_format") or "xywh")
+    crop["crop_image_path"] = str(crop.get("crop_image_path") or saved_crop.get("crop_image_path") or "")
     crop["confidence"] = _coerce_float(saved_crop.get("confidence", crop.get("confidence")))
     built_qty_token_boxes = [
         dict(item)
@@ -3203,6 +3205,11 @@ def _segment_step_callout_slot(
             "mask_path": str(mask_path),
             "segmentation_method": meta.get("segmentation_method", ""),
             "coverage_pct": meta.get("coverage_pct", 0.0),
+            "sam2_available": meta.get("sam2_available"),
+            "sam2_loaded": meta.get("sam2_loaded"),
+            "sam2_used": meta.get("sam2_used"),
+            "border_touch_pct": meta.get("border_touch_pct"),
+            "fallback_reject_reason": meta.get("fallback_reject_reason"),
             "cache_hit": True,
         }
 
@@ -3220,7 +3227,47 @@ def _segment_step_callout_slot(
     # Blank qty/OCR token boxes (coordinates are in original-page space)
     qty_token_boxes = [dict(t) for t in list(crop.get("qty_token_boxes") or []) if isinstance(t, dict)]
     bg_color = _detect_crop_bg_color(raw_callout)
-    clean_callout, _, _ = _blank_text_regions_in_crop(raw_callout, cx, cy, qty_token_boxes, bg_color)
+
+    # ── TEMP DEBUG: save pre-blank callout for p23_s27_c1 slot0 ───────────
+    _debug_this_slot = (str(crop_id) == "p23_s27_c1" and int(slot_index) == 0)
+    _debug_dir = _STEP_SEG_DIR / "_debug_p23_s27_c1_slot0"
+    if _debug_this_slot:
+        _debug_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(_debug_dir / "callout_before_blank.png"), raw_callout)
+    # ── END TEMP DEBUG ──────────────────────────────────────────────────────
+
+    clean_callout, _blanked, _blanked_texts = _blank_text_regions_in_crop(raw_callout, cx, cy, qty_token_boxes, bg_color)
+
+    # ── TEMP DEBUG: save post-blank callout and token info ─────────────────
+    if _debug_this_slot:
+        cv2.imwrite(str(_debug_dir / "callout_after_blank.png"), clean_callout)
+        _blanked_info = []
+        for t in qty_token_boxes:
+            tx, ty, tw, th = t["x"], t["y"], t["w"], t["h"]
+            ix1 = max(tx, cx) - cx
+            iy1 = max(ty, cy) - cy
+            ix2 = min(tx + tw, cx + cw) - cx
+            iy2 = min(ty + th, cy + ch) - cy
+            hit = ix2 > ix1 and iy2 > iy1
+            _blanked_info.append({
+                "text": t.get("text"), "x": tx, "y": ty, "w": tw, "h": th,
+                "source_region": t.get("source_region", ""),
+                "intersects_callout": hit,
+                "callout_rect": [ix1, iy1, ix2, iy2] if hit else None,
+            })
+        (_debug_dir / "token_blanking_info.json").write_text(
+            json.dumps({
+                "crop_id": crop_id, "slot_index": int(slot_index),
+                "crop_box_xywh": list(crop_box), "cx": cx, "cy": cy, "cw": cw, "ch": ch,
+                "bg_color_bgr": list(bg_color),
+                "qty_token_boxes_count": len(qty_token_boxes),
+                "tokens": _blanked_info,
+                "blanked_texts": _blanked_texts,
+                "blank_changed_callout": _blanked,
+            }, indent=2),
+            encoding="utf-8",
+        )
+    # ── END TEMP DEBUG ──────────────────────────────────────────────────────
 
     # Sub-slice at slot_window (relative to callout crop)
     if not slot_window or len(slot_window) < 4:
@@ -3234,6 +3281,11 @@ def _segment_step_callout_slot(
     slot_slice = clean_callout[sw_y:sw_y + sw_h, sw_x:sw_x + sw_w]
     if slot_slice is None or getattr(slot_slice, "size", 0) == 0:
         return _error("slot slice empty after clipping")
+
+    # ── TEMP DEBUG: save slot_slice input ──────────────────────────────────
+    if _debug_this_slot:
+        cv2.imwrite(str(_debug_dir / "slot_slice_input_slot0.png"), slot_slice)
+    # ── END TEMP DEBUG ──────────────────────────────────────────────────────
 
     # Ensure SAM2 is loaded (lazy — no-op if already loaded or unavailable)
     _sam2_load()
@@ -3249,6 +3301,36 @@ def _segment_step_callout_slot(
     cv2.imwrite(str(overlay_path), overlay)
 
     coverage_pct = float(info.get("coverage_pct", 0.0))
+
+    # ── TEMP DEBUG: save mask and final metrics JSON ────────────────────────
+    if _debug_this_slot:
+        cv2.imwrite(str(_debug_dir / "slot0_mask_output.png"), mask)
+        (_debug_dir / "slot0_debug_metrics.json").write_text(
+            json.dumps({
+                "crop_id": crop_id, "slot_index": int(slot_index),
+                "crop_box_xywh": list(crop_box), "cx": cx, "cy": cy, "cw": cw, "ch": ch,
+                "slot_window_xywh": [sw_x, sw_y, sw_w, sw_h],
+                "slot_slice_shape_wh": [slot_slice.shape[1], slot_slice.shape[0]],
+                "page_coords_y1y2_x1x2": [cy + sw_y, cy + sw_y + sw_h, cx + sw_x, cx + sw_x + sw_w],
+                "bg_color_bgr": list(bg_color),
+                "blank_changed_callout": _blanked,
+                "blanked_texts": _blanked_texts,
+                "sam2_available": info.get("sam2_available"),
+                "sam2_loaded": info.get("sam2_loaded"),
+                "sam2_used": info.get("sam2_used"),
+                "sam2_reject_reason": info.get("sam2_reject_reason"),
+                "segmentation_method": method,
+                "coverage_pct": coverage_pct,
+                "border_touch_pct": info.get("border_touch_pct"),
+                "reject_reason": info.get("reject_reason"),
+                "fallback_reject_reason": info.get("fallback_reject_reason"),
+                "iou": info.get("iou"),
+                "debug_dir": str(_debug_dir),
+            }, indent=2),
+            encoding="utf-8",
+        )
+    # ── END TEMP DEBUG ──────────────────────────────────────────────────────
+
     meta_out = {
         "stem": stem,
         "set_num": set_num,
@@ -3259,6 +3341,11 @@ def _segment_step_callout_slot(
         "coverage_pct": coverage_pct,
         "iou": info.get("iou"),
         "reject_reason": info.get("reject_reason"),
+        "sam2_available": info.get("sam2_available"),
+        "sam2_loaded": info.get("sam2_loaded"),
+        "sam2_used": info.get("sam2_used"),
+        "border_touch_pct": info.get("border_touch_pct"),
+        "fallback_reject_reason": info.get("fallback_reject_reason"),
         "generated_at": _iso_now(),
     }
     try:
@@ -3273,6 +3360,11 @@ def _segment_step_callout_slot(
         "mask_path": str(mask_path),
         "segmentation_method": method,
         "coverage_pct": coverage_pct,
+        "sam2_available": info.get("sam2_available"),
+        "sam2_loaded": info.get("sam2_loaded"),
+        "sam2_used": info.get("sam2_used"),
+        "border_touch_pct": info.get("border_touch_pct"),
+        "fallback_reject_reason": info.get("fallback_reject_reason"),
         "cache_hit": False,
     }
 
@@ -22150,17 +22242,23 @@ def _hybrid_segment_crop(
         "mask_components":                  0,
         "mask_bbox":                        [],
         # ── SAM2 diagnostics (pre-guard) ──────────────────────────────────
+        "sam2_available":                   _sam2_model is not None,
         "sam2_loaded":                      _sam2_model is not None,
+        "sam2_used":                        False,
         "sam2_exception":                   None,
         "sam2_mask_count":                  0,
         "sam2_raw_coverage_pct":            None,
         "sam2_raw_largest_component_pct":   None,
         "sam2_reject_reason":               None,
+        # ── Fallback diagnostics ───────────────────────────────────────────
+        "border_touch_pct":                 None,
+        "fallback_reject_reason":           None,
     }
 
     # ── Attempt SAM2 ──────────────────────────────────────────────────────────
     sam2_mask: Optional[np.ndarray] = None
     if _sam2_model is not None:
+        info["sam2_used"] = True
         try:
             sam2_mask, iou, all_scores = _sam2_segment_crop(img_bgr)
             info["iou"]            = round(iou, 4)
@@ -22216,8 +22314,53 @@ def _hybrid_segment_crop(
         fb_mask = _cv_fallback_mask(img_bgr)
         q2      = _mask_quality_metrics(fb_mask)
         info.update(q2)
+
         if q2["coverage_pct"] == 0:
             return fb_mask, "failed", info
+
+        # ── Fallback quality guards ────────────────────────────────────────
+        # Guard 1 — coverage ceiling.
+        # A real LEGO part should not cover more than 70 % of a reasonably
+        # cropped slot window.  Values above this almost always mean the
+        # largest "foreground" component is actually the page-background blob
+        # (e.g. blue instruction-page fill mistakenly classified as foreground
+        # when the crop border happens to be white).
+        #
+        # Guard 2 — border touch.
+        # Count what fraction of the image-border pixels are foreground.
+        # A real part floating in the crop has few/no border pixels covered.
+        # A background blob (which forms a frame around the part) touches
+        # the border extensively (often > 50 %).
+        border_px = np.concatenate([
+            fb_mask[0, :],
+            fb_mask[-1, :],
+            fb_mask[1:-1, 0],
+            fb_mask[1:-1, -1],
+        ])
+        border_touch_pct = round(
+            float((border_px > 0).sum()) / max(len(border_px), 1) * 100.0, 2
+        )
+        info["border_touch_pct"] = border_touch_pct
+
+        fallback_reject_reason: Optional[str] = None
+        if q2["coverage_pct"] > 70.0:
+            fallback_reject_reason = (
+                f"fallback_coverage_too_high ({q2['coverage_pct']:.1f}% > 70%)"
+            )
+        elif border_touch_pct > 30.0:
+            fallback_reject_reason = (
+                f"fallback_border_touch ({border_touch_pct:.1f}% > 30%)"
+            )
+
+        info["fallback_reject_reason"] = fallback_reject_reason
+
+        if fallback_reject_reason:
+            info["reject_reason"] = (
+                (info.get("reject_reason") or "") + f"; {fallback_reject_reason}"
+            ).lstrip("; ")
+            blank = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+            return blank, "failed", info
+
         return fb_mask, "fallback_colour", info
     except Exception as exc:
         # Return a blank mask if everything failed

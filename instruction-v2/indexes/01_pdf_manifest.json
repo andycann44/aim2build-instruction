@@ -1,0 +1,12 @@
+{
+  "stage": 1,
+  "name": "pdf_render",
+  "created_at_utc": "2026-06-02T09:32:56.955257+00:00",
+  "run_id": "70618_01",
+  "pdf": {
+    "source_path": "/Users/olly/aim2build-instruction/instructions/70618/70618_01.pdf",
+    "saved_path": "pdfs/70618_01.pdf",
+    "file_name": "70618_01.pdf",
+    "sha256": "f73dcd49c888bdb12739d6e4a701337d8d55a162c8413c925928df3bb5769c21"
+  }
+}
