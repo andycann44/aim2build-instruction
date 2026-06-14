@@ -104,8 +104,29 @@ def ensure_schema() -> Dict[str, Any]:
                 );
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bag_review_exports (
+                    id SERIAL PRIMARY KEY,
+                    set_num TEXT NOT NULL,
+                    bag_num INTEGER NOT NULL,
+                    schema_version TEXT,
+                    exported_at TIMESTAMP,
+                    manifest_path TEXT,
+                    r2_prefix TEXT,
+                    progress_json JSONB,
+                    metadata_json JSONB NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE (set_num, bag_num)
+                );
+                """
+            )
         conn.commit()
-    return {"ok": True, "tables": ["training_bundle_index", "candidate_training_examples"]}
+    return {
+        "ok": True,
+        "tables": ["training_bundle_index", "candidate_training_examples", "bag_review_exports"],
+    }
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -884,3 +905,59 @@ def reset_bag_index_rows(*, set_num: str, bag_num: Any) -> Dict[str, Any]:
         "training_bundle_index_deleted_count": len(index_rows or []),
         "training_bundle_index_bundle_ids": sorted(str(row.get("bundle_id") or "") for row in list(index_rows or [])),
     }
+
+
+def upsert_bag_review_export(
+    *,
+    set_num: str,
+    bag_num: int,
+    metadata: Dict[str, Any],
+    manifest_path: str,
+) -> Dict[str, Any]:
+    """Persist reviewed bag metadata to Azure-hosted Postgres."""
+    ensure_schema()
+    set_text = str(set_num or "").strip()
+    bag_number = int(bag_num or 0)
+    if not set_text:
+        raise ValueError("set_num is required")
+    if bag_number < 1:
+        raise ValueError("bag_num must be >= 1")
+
+    progress = metadata.get("progress") if isinstance(metadata.get("progress"), dict) else {}
+    row = {
+        "set_num": set_text,
+        "bag_num": bag_number,
+        "schema_version": str(metadata.get("schema_version") or ""),
+        "exported_at": str(metadata.get("exported_at") or ""),
+        "manifest_path": str(manifest_path or ""),
+        "r2_prefix": str(metadata.get("r2_prefix") or ""),
+        "progress_json": json.dumps(progress),
+        "metadata_json": json.dumps(metadata),
+    }
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bag_review_exports (
+                    set_num, bag_num, schema_version, exported_at,
+                    manifest_path, r2_prefix, progress_json, metadata_json
+                ) VALUES (
+                    %(set_num)s, %(bag_num)s, %(schema_version)s, %(exported_at)s,
+                    %(manifest_path)s, %(r2_prefix)s, %(progress_json)s::jsonb, %(metadata_json)s::jsonb
+                )
+                ON CONFLICT (set_num, bag_num) DO UPDATE SET
+                    schema_version = EXCLUDED.schema_version,
+                    exported_at = EXCLUDED.exported_at,
+                    manifest_path = EXCLUDED.manifest_path,
+                    r2_prefix = EXCLUDED.r2_prefix,
+                    progress_json = EXCLUDED.progress_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = NOW()
+                RETURNING *;
+                """,
+                row,
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return {"ok": True, "row": _json_safe_row(dict(result or {}))}

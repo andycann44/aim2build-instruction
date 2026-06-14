@@ -25,6 +25,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from clean.services.ai_snap_crop_service import create_shape_masks_for_callout_slots
+from clean.services.full_crop_mask_paths import find_full_mask_stem
 
 # ---------------------------------------------------------------------------
 # Paths  (mirror the constants in ai_snap_crop_service.py)
@@ -102,19 +103,7 @@ def _load_bag_crops(set_num: str, bag: int) -> List[Dict[str, Any]]:
 
 
 def _find_mask_stem(set_num: str, bag: int, crop_id: str) -> Optional[str]:
-    """
-    Return the base stem (without _full_mask suffix) for the most recent mask
-    files for this crop, or None if none exist yet.
-    Example: '70618_bag2_p22_s26_c1_edf149117a2c'
-    """
-    safe_set  = "".join(ch for ch in str(set_num)  if ch.isalnum() or ch in "-_")
-    safe_crop = "".join(ch for ch in str(crop_id)  if ch.isalnum() or ch in "-_")
-    pattern   = f"{safe_set}_bag{bag}_{safe_crop}_*_full_mask.png"
-    matches   = sorted(_FULL_CROP_MASK_DIR.glob(pattern))
-    if not matches:
-        return None
-    latest = max(matches, key=lambda p: p.stat().st_mtime)
-    return latest.stem.removesuffix("_full_mask")
+    return find_full_mask_stem(set_num, bag, crop_id)
 
 
 def _load_verdicts(set_num: str, bag: int) -> Dict[str, str]:

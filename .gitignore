@@ -22,6 +22,7 @@ debug/*.db
 # Temp
 /tmp/
 *.work
+instruction-v2/docs/paste.md
 
 # VSCode
 .vscode/
