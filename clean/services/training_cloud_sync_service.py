@@ -679,3 +679,191 @@ def prepare_bundle_for_azure(bundle_id: str) -> Dict[str, Any]:
             "files": files,
         },
     }
+
+
+_AZURE_BLOB_CONNECTION_KEY = "AZURE_STORAGE_CONNECTION_STRING"
+_AZURE_BLOB_ACCOUNT_NAME_KEY = "AZURE_STORAGE_ACCOUNT_NAME"
+_AZURE_BLOB_ACCOUNT_KEY_KEY = "AZURE_STORAGE_ACCOUNT_KEY"
+_AZURE_BLOB_CONTAINER_KEY = "AZURE_STORAGE_CONTAINER"
+_AZURE_BLOB_OPTIONAL_KEYS = [_AZURE_BLOB_CONTAINER_KEY]
+_AZURE_BLOB_DEFAULT_CONTAINER = "bag-review-metadata"
+
+
+def _azure_blob_config_keys() -> List[str]:
+    return [
+        _AZURE_BLOB_CONNECTION_KEY,
+        _AZURE_BLOB_ACCOUNT_NAME_KEY,
+        _AZURE_BLOB_ACCOUNT_KEY_KEY,
+        *_AZURE_BLOB_OPTIONAL_KEYS,
+    ]
+
+
+def _azure_blob_config_complete(values: Dict[str, str]) -> bool:
+    if str(values.get(_AZURE_BLOB_CONNECTION_KEY) or "").strip():
+        return True
+    return bool(
+        str(values.get(_AZURE_BLOB_ACCOUNT_NAME_KEY) or "").strip()
+        and str(values.get(_AZURE_BLOB_ACCOUNT_KEY_KEY) or "").strip()
+    )
+
+
+def _load_azure_blob_config() -> Dict[str, Any]:
+    local_env = _read_local_env_file()
+    values: Dict[str, str] = {}
+    sources: Dict[str, str] = {}
+    for key in _azure_blob_config_keys():
+        env_value = str(os.environ.get(key) or "").strip()
+        if env_value:
+            values[key] = env_value
+            sources[key] = "environment"
+            continue
+        file_value = str(local_env.get(key) or "").strip()
+        if file_value:
+            values[key] = file_value
+            sources[key] = ".env"
+    missing: List[str] = []
+    if not _azure_blob_config_complete(values):
+        if not str(values.get(_AZURE_BLOB_CONNECTION_KEY) or "").strip():
+            missing.append(_AZURE_BLOB_CONNECTION_KEY)
+        if not (
+            str(values.get(_AZURE_BLOB_ACCOUNT_NAME_KEY) or "").strip()
+            and str(values.get(_AZURE_BLOB_ACCOUNT_KEY_KEY) or "").strip()
+        ):
+            missing.extend(
+                key
+                for key in (_AZURE_BLOB_ACCOUNT_NAME_KEY, _AZURE_BLOB_ACCOUNT_KEY_KEY)
+                if not str(values.get(key) or "").strip()
+            )
+    present = {key: bool(str(values.get(key) or "").strip()) for key in _azure_blob_config_keys()}
+    present["azure_blob_auth"] = _azure_blob_config_complete(values)
+    return {
+        "values": values,
+        "missing": missing,
+        "present": present,
+        "sources": sources,
+    }
+
+
+def _azure_blob_config_summary(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "present": dict(config.get("present") or {}),
+        "missing": list(config.get("missing") or []),
+        "sources": dict(config.get("sources") or {}),
+    }
+
+
+def _azure_storage_account_name(values: Dict[str, str]) -> str:
+    connection_string = str(values.get(_AZURE_BLOB_CONNECTION_KEY) or "").strip()
+    for part in connection_string.split(";"):
+        segment = part.strip()
+        if segment.lower().startswith("accountname="):
+            return segment.split("=", 1)[1].strip()
+    return str(values.get(_AZURE_BLOB_ACCOUNT_NAME_KEY) or "").strip()
+
+
+def _azure_blob_container_name(values: Dict[str, str]) -> str:
+    return str(values.get(_AZURE_BLOB_CONTAINER_KEY) or _AZURE_BLOB_DEFAULT_CONTAINER).strip() or _AZURE_BLOB_DEFAULT_CONTAINER
+
+
+def azure_blob_path_for_bag_review_metadata(set_num: str, bag: int) -> str:
+    safe_set = "".join(ch for ch in str(set_num or "").strip() if ch.isalnum() or ch in "-_") or "unknown"
+    return f"{safe_set}/bag{max(1, int(bag or 1))}/metadata.json"
+
+
+def azure_blob_url_for_path(blob_path: str, values: Dict[str, str]) -> str:
+    account_name = _azure_storage_account_name(values)
+    container_name = _azure_blob_container_name(values)
+    blob_path_text = str(blob_path or "").lstrip("/")
+    if not account_name or not container_name or not blob_path_text:
+        return ""
+    return f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_path_text}"
+
+
+def upload_file_to_azure_blob(
+    local_path: str,
+    blob_path: str,
+    *,
+    dry_run: bool = True,
+    content_type: str = "application/json",
+) -> Dict[str, Any]:
+    path = Path(str(local_path or "").strip())
+    blob_path_text = str(blob_path or "").lstrip("/")
+    config = _load_azure_blob_config()
+    values = dict(config.get("values") or {})
+    container_name = _azure_blob_container_name(values)
+    blob_url = azure_blob_url_for_path(blob_path_text, values)
+    summary = _azure_blob_config_summary(config)
+
+    base = {
+        "ok": True,
+        "uploaded": False,
+        "dry_run": bool(dry_run),
+        "would_upload": True,
+        "container": container_name,
+        "blob_path": blob_path_text,
+        "blob_url": blob_url,
+        "local_path": str(path),
+        "azure_blob_config": summary,
+        "error": None,
+    }
+
+    if not path.is_file():
+        return {
+            **base,
+            "ok": False,
+            "would_upload": False,
+            "error": "local_file_missing",
+        }
+
+    if dry_run:
+        return base
+
+    if not _azure_blob_config_complete(values):
+        return {
+            **base,
+            "ok": True,
+            "dry_run": True,
+            "error": "missing_azure_blob_config",
+        }
+
+    try:
+        from azure.storage.blob import BlobServiceClient  # type: ignore
+    except Exception:
+        return {
+            **base,
+            "ok": False,
+            "would_upload": False,
+            "dry_run": False,
+            "error": "azure_storage_blob_unavailable",
+        }
+
+    connection_string = str(values.get(_AZURE_BLOB_CONNECTION_KEY) or "").strip()
+    account_name = str(values.get(_AZURE_BLOB_ACCOUNT_NAME_KEY) or "").strip()
+    account_key = str(values.get(_AZURE_BLOB_ACCOUNT_KEY_KEY) or "").strip()
+    try:
+        if connection_string:
+            client = BlobServiceClient.from_connection_string(connection_string)
+        else:
+            client = BlobServiceClient(
+                account_url=f"https://{account_name}.blob.core.windows.net",
+                credential=account_key,
+            )
+        blob_client = client.get_blob_client(container=container_name, blob=blob_path_text)
+        with path.open("rb") as handle:
+            blob_client.upload_blob(handle, overwrite=True, content_type=content_type)
+    except Exception as exc:
+        return {
+            **base,
+            "ok": False,
+            "would_upload": False,
+            "dry_run": False,
+            "error": type(exc).__name__,
+        }
+
+    return {
+        **base,
+        "ok": True,
+        "uploaded": True,
+        "would_upload": False,
+        "dry_run": False,
+    }
