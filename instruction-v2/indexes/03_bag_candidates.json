@@ -8,7 +8,7 @@
   "candidates": [
     {
       "page": 4,
-      "image_path": "pages/70618_01/page_004.png",
+      "image_path": "pages/70618_bag5/page_004.png",
       "score": 1,
       "is_candidate": true,
       "signals": {
@@ -163,7 +163,7 @@
     },
     {
       "page": 265,
-      "image_path": "pages/70618_01/page_265.png",
+      "image_path": "pages/70618_bag5/page_265.png",
       "score": 1,
       "is_candidate": true,
       "signals": {
@@ -309,7 +309,7 @@
     },
     {
       "page": 306,
-      "image_path": "pages/70618_01/page_306.png",
+      "image_path": "pages/70618_bag5/page_306.png",
       "score": 1,
       "is_candidate": true,
       "signals": {
@@ -513,7 +513,7 @@
     },
     {
       "page": 305,
-      "image_path": "pages/70618_01/page_305.png",
+      "image_path": "pages/70618_bag5/page_305.png",
       "score": 0.9818,
       "is_candidate": true,
       "signals": {
@@ -779,7 +779,7 @@
     },
     {
       "page": 39,
-      "image_path": "pages/70618_01/page_039.png",
+      "image_path": "pages/70618_bag5/page_039.png",
       "score": 0.9753,
       "is_candidate": true,
       "signals": {
@@ -916,7 +916,7 @@
     },
     {
       "page": 5,
-      "image_path": "pages/70618_01/page_005.png",
+      "image_path": "pages/70618_bag5/page_005.png",
       "score": 0.8797,
       "is_candidate": true,
       "signals": {
@@ -1067,7 +1067,7 @@
     },
     {
       "page": 44,
-      "image_path": "pages/70618_01/page_044.png",
+      "image_path": "pages/70618_bag5/page_044.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1182,7 +1182,7 @@
     },
     {
       "page": 46,
-      "image_path": "pages/70618_01/page_046.png",
+      "image_path": "pages/70618_bag5/page_046.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1315,7 +1315,7 @@
     },
     {
       "page": 59,
-      "image_path": "pages/70618_01/page_059.png",
+      "image_path": "pages/70618_bag5/page_059.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1398,7 +1398,7 @@
     },
     {
       "page": 164,
-      "image_path": "pages/70618_01/page_164.png",
+      "image_path": "pages/70618_bag5/page_164.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1513,7 +1513,7 @@
     },
     {
       "page": 228,
-      "image_path": "pages/70618_01/page_228.png",
+      "image_path": "pages/70618_bag5/page_228.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1605,7 +1605,7 @@
     },
     {
       "page": 232,
-      "image_path": "pages/70618_01/page_232.png",
+      "image_path": "pages/70618_bag5/page_232.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1729,7 +1729,7 @@
     },
     {
       "page": 238,
-      "image_path": "pages/70618_01/page_238.png",
+      "image_path": "pages/70618_bag5/page_238.png",
       "score": 0.7733,
       "is_candidate": true,
       "signals": {
@@ -1885,7 +1885,7 @@
     },
     {
       "page": 58,
-      "image_path": "pages/70618_01/page_058.png",
+      "image_path": "pages/70618_bag5/page_058.png",
       "score": 0.7627,
       "is_candidate": true,
       "signals": {
@@ -2005,7 +2005,7 @@
     },
     {
       "page": 213,
-      "image_path": "pages/70618_01/page_213.png",
+      "image_path": "pages/70618_bag5/page_213.png",
       "score": 0.7511,
       "is_candidate": true,
       "signals": {
@@ -2116,7 +2116,7 @@
     },
     {
       "page": 300,
-      "image_path": "pages/70618_01/page_300.png",
+      "image_path": "pages/70618_bag5/page_300.png",
       "score": 0.7239,
       "is_candidate": true,
       "signals": {
@@ -2230,7 +2230,7 @@
     },
     {
       "page": 2,
-      "image_path": "pages/70618_01/page_002.png",
+      "image_path": "pages/70618_bag5/page_002.png",
       "score": 0.7213,
       "is_candidate": true,
       "signals": {
@@ -2354,7 +2354,7 @@
     },
     {
       "page": 302,
-      "image_path": "pages/70618_01/page_302.png",
+      "image_path": "pages/70618_bag5/page_302.png",
       "score": 0.7213,
       "is_candidate": true,
       "signals": {
@@ -2451,7 +2451,7 @@
     },
     {
       "page": 3,
-      "image_path": "pages/70618_01/page_003.png",
+      "image_path": "pages/70618_bag5/page_003.png",
       "score": 0.7031,
       "is_candidate": true,
       "signals": {
@@ -2544,7 +2544,7 @@
     },
     {
       "page": 53,
-      "image_path": "pages/70618_01/page_053.png",
+      "image_path": "pages/70618_bag5/page_053.png",
       "score": 0.6573,
       "is_candidate": true,
       "signals": {
@@ -2672,7 +2672,7 @@
     },
     {
       "page": 14,
-      "image_path": "pages/70618_01/page_014.png",
+      "image_path": "pages/70618_bag5/page_014.png",
       "score": 0.6243,
       "is_candidate": true,
       "signals": {
@@ -2769,7 +2769,7 @@
     },
     {
       "page": 1,
-      "image_path": "pages/70618_01/page_001.png",
+      "image_path": "pages/70618_bag5/page_001.png",
       "score": 0.6115,
       "is_candidate": true,
       "signals": {
@@ -2972,7 +2972,7 @@
     },
     {
       "page": 104,
-      "image_path": "pages/70618_01/page_104.png",
+      "image_path": "pages/70618_bag5/page_104.png",
       "score": 0.6112,
       "is_candidate": true,
       "signals": {
@@ -3126,7 +3126,7 @@
     },
     {
       "page": 12,
-      "image_path": "pages/70618_01/page_012.png",
+      "image_path": "pages/70618_bag5/page_012.png",
       "score": 0.6041,
       "is_candidate": true,
       "signals": {
@@ -3214,7 +3214,7 @@
     },
     {
       "page": 194,
-      "image_path": "pages/70618_01/page_194.png",
+      "image_path": "pages/70618_bag5/page_194.png",
       "score": 0.6017,
       "is_candidate": true,
       "signals": {
@@ -3337,7 +3337,7 @@
     },
     {
       "page": 169,
-      "image_path": "pages/70618_01/page_169.png",
+      "image_path": "pages/70618_bag5/page_169.png",
       "score": 0.5922,
       "is_candidate": true,
       "signals": {
@@ -3384,7 +3384,7 @@
     },
     {
       "page": 303,
-      "image_path": "pages/70618_01/page_303.png",
+      "image_path": "pages/70618_bag5/page_303.png",
       "score": 0.5845,
       "is_candidate": true,
       "signals": {
@@ -3463,7 +3463,7 @@
     },
     {
       "page": 296,
-      "image_path": "pages/70618_01/page_296.png",
+      "image_path": "pages/70618_bag5/page_296.png",
       "score": 0.5811,
       "is_candidate": true,
       "signals": {
@@ -3510,7 +3510,7 @@
     },
     {
       "page": 237,
-      "image_path": "pages/70618_01/page_237.png",
+      "image_path": "pages/70618_bag5/page_237.png",
       "score": 0.5244,
       "is_candidate": true,
       "signals": {
@@ -3629,7 +3629,7 @@
     },
     {
       "page": 266,
-      "image_path": "pages/70618_01/page_266.png",
+      "image_path": "pages/70618_bag5/page_266.png",
       "score": 0.5136,
       "is_candidate": true,
       "signals": {
@@ -3753,7 +3753,7 @@
     },
     {
       "page": 100,
-      "image_path": "pages/70618_01/page_100.png",
+      "image_path": "pages/70618_bag5/page_100.png",
       "score": 0.5006,
       "is_candidate": true,
       "signals": {
@@ -3809,7 +3809,7 @@
     },
     {
       "page": 20,
-      "image_path": "pages/70618_01/page_020.png",
+      "image_path": "pages/70618_bag5/page_020.png",
       "score": 0.4858,
       "is_candidate": true,
       "signals": {
@@ -3888,7 +3888,7 @@
     },
     {
       "page": 22,
-      "image_path": "pages/70618_01/page_022.png",
+      "image_path": "pages/70618_bag5/page_022.png",
       "score": 0.4845,
       "is_candidate": true,
       "signals": {

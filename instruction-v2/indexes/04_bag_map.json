@@ -165,7 +165,7 @@
           "page": 6,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_006.png",
+          "debug_image_path": "pages/70618_bag5/page_006.png",
           "v1_source": "detector",
           "created_at": "2026-04-27T21:19:53.326671+00:00",
           "updated_at": "2026-04-27T21:19:53.326671+00:00"
@@ -189,7 +189,7 @@
           "page": 22,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_022.png",
+          "debug_image_path": "pages/70618_bag5/page_022.png",
           "v1_source": "detector",
           "created_at": "2026-04-27T10:15:31.548694+00:00",
           "updated_at": "2026-04-27T10:15:31.548694+00:00"
@@ -213,7 +213,7 @@
           "page": 39,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_039.png",
+          "debug_image_path": "pages/70618_bag5/page_039.png",
           "v1_source": "detector",
           "created_at": "2026-04-27T10:41:16.639040+00:00",
           "updated_at": "2026-04-27T10:41:16.639040+00:00"
@@ -237,7 +237,7 @@
           "page": 58,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_058.png",
+          "debug_image_path": "pages/70618_bag5/page_058.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T06:31:41.142715+00:00",
           "updated_at": "2026-04-28T06:31:41.142715+00:00"
@@ -261,7 +261,7 @@
           "page": 81,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_081.png",
+          "debug_image_path": "pages/70618_bag5/page_081.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T05:51:08.566453+00:00",
           "updated_at": "2026-04-28T05:51:08.566453+00:00"
@@ -285,7 +285,7 @@
           "page": 104,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_104.png",
+          "debug_image_path": "pages/70618_bag5/page_104.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T11:37:32.772241+00:00",
           "updated_at": "2026-04-28T11:37:32.772241+00:00"
@@ -309,7 +309,7 @@
           "page": 131,
           "score": -0.15,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_131.png",
+          "debug_image_path": "pages/70618_bag5/page_131.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T15:19:18.913531+00:00",
           "updated_at": "2026-04-28T15:19:18.913531+00:00"
@@ -333,7 +333,7 @@
           "page": 148,
           "score": -0.15,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_148.png",
+          "debug_image_path": "pages/70618_bag5/page_148.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T18:13:07.287952+00:00",
           "updated_at": "2026-04-28T18:13:07.287952+00:00"
@@ -357,7 +357,7 @@
           "page": 164,
           "score": -0.15,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_164.png",
+          "debug_image_path": "pages/70618_bag5/page_164.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T18:14:07.017024+00:00",
           "updated_at": "2026-04-28T18:14:07.017024+00:00"
@@ -381,7 +381,7 @@
           "page": 179,
           "score": -0.15,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_179.png",
+          "debug_image_path": "pages/70618_bag5/page_179.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T19:04:53.640075+00:00",
           "updated_at": "2026-04-28T19:04:53.640075+00:00"
@@ -405,7 +405,7 @@
           "page": 194,
           "score": 0.65,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_194.png",
+          "debug_image_path": "pages/70618_bag5/page_194.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T19:05:20.635123+00:00",
           "updated_at": "2026-04-28T19:05:20.635123+00:00"
@@ -429,7 +429,7 @@
           "page": 213,
           "score": -0.15,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_213.png",
+          "debug_image_path": "pages/70618_bag5/page_213.png",
           "v1_source": "detector",
           "created_at": "2026-04-28T19:05:35.577583+00:00",
           "updated_at": "2026-04-28T19:05:35.577583+00:00"
@@ -453,7 +453,7 @@
           "page": 237,
           "score": 0.998,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_237.png",
+          "debug_image_path": "pages/70618_bag5/page_237.png",
           "v1_source": "manual",
           "created_at": "2026-04-29 05:50:53",
           "updated_at": "2026-04-29 05:50:53"
@@ -477,7 +477,7 @@
           "page": 266,
           "score": 0.998,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_266.png",
+          "debug_image_path": "pages/70618_bag5/page_266.png",
           "v1_source": "manual",
           "created_at": "2026-04-29 05:50:53",
           "updated_at": "2026-04-29 05:50:53"
@@ -501,7 +501,7 @@
           "page": 274,
           "score": 0.998,
           "source": "v1_bag_truth_db",
-          "debug_image_path": "pages/70618_01/page_274.png",
+          "debug_image_path": "pages/70618_bag5/page_274.png",
           "v1_source": "manual",
           "created_at": "2026-04-28 20:59:25",
           "updated_at": "2026-04-28 20:59:25"

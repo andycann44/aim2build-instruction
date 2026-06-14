@@ -1,7 +1,8 @@
+import argparse
 import json
 import subprocess
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from paths import INDEXES_DIR, ROOT_DIR
 
@@ -19,7 +20,7 @@ NODE_BIN = Path("/Users/andy/.cache/codex-runtimes/codex-primary-runtime/depende
 NODE_MODULES = Path("/Users/andy/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules")
 
 
-def build_callout_crop_box_map() -> Dict[str, Any]:
+def build_callout_crop_box_map(*, bag_only: Optional[int] = None) -> Dict[str, Any]:
     if not PAGE_INDEX_PATH.exists():
         raise RuntimeError(f"Missing page index: {PAGE_INDEX_PATH}")
     if not STEP_MAP_PATH.exists():
@@ -30,25 +31,29 @@ def build_callout_crop_box_map() -> Dict[str, Any]:
     INDEXES_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
+    cmd = [
+        str(NODE_BIN),
+        str(ROOT_DIR / "callout_crop_box_scan.mjs"),
+        "--page-index",
+        str(PAGE_INDEX_PATH),
+        "--step-map",
+        str(STEP_MAP_PATH),
+        "--repo-root",
+        str(ROOT_DIR),
+        "--out",
+        str(OUT_PATH),
+        "--debug-dir",
+        str(DEBUG_DIR),
+        "--node-modules",
+        str(NODE_MODULES),
+        "--v1-crop-cache",
+        str(V1_CROP_CACHE_PATH),
+    ]
+    if bag_only is not None:
+        cmd.extend(["--bag-only", str(int(bag_only))])
+
     subprocess.run(
-        [
-            str(NODE_BIN),
-            str(ROOT_DIR / "callout_crop_box_scan.mjs"),
-            "--page-index",
-            str(PAGE_INDEX_PATH),
-            "--step-map",
-            str(STEP_MAP_PATH),
-            "--repo-root",
-            str(ROOT_DIR),
-            "--out",
-            str(OUT_PATH),
-            "--debug-dir",
-            str(DEBUG_DIR),
-            "--node-modules",
-            str(NODE_MODULES),
-            "--v1-crop-cache",
-            str(V1_CROP_CACHE_PATH),
-        ],
+        cmd,
         check=True,
         capture_output=True,
         text=True,
@@ -58,7 +63,10 @@ def build_callout_crop_box_map() -> Dict[str, Any]:
 
 
 def main() -> None:
-    payload = build_callout_crop_box_map()
+    parser = argparse.ArgumentParser(description="Build Stage 5 callout crop box map.")
+    parser.add_argument("--bag-only", type=int, default=None, help="Regenerate one bag and merge into existing manifest.")
+    args = parser.parse_args()
+    payload = build_callout_crop_box_map(bag_only=args.bag_only)
     print(
         json.dumps(
             {
