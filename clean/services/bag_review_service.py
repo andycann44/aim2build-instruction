@@ -4,12 +4,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote as _url_quote
 
+from clean.services.full_crop_mask_paths import (
+    ensure_island_slot_cutout_path,
+    ensure_island_slot_mask_path,
+    filter_significant_islands,
+    find_full_mask_stem,
+    master_islands_from_mask,
+    raw_master_mask_path,
+    sort_islands_for_slots,
+    MAX_AUTO_ISLAND_SLOTS,
+)
+from clean.services.island_binding import order_island_label, significant_islands_for_stem
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TRAINING_LABEL_DIR = _REPO_ROOT / "debug" / "training_labels"
 _CROP_CACHE_DIR = _REPO_ROOT / "debug" / "crop_cache"
 _STEP_SEG_DIR = _REPO_ROOT / "debug" / "ai_training" / "step_segmented_cutouts"
 _PART_CUTOUT_DIR = _REPO_ROOT / "debug" / "ai_training" / "part_cutouts"
+_SLOT_WINDOW_OVERLAY_DIR = _REPO_ROOT / "debug" / "ai_training" / "slot_window_overlays"
 
 
 def _iso_now() -> str:
@@ -146,18 +159,180 @@ def _artifact_url(path_text: str) -> str:
     return "/debug/ai-snap-artifact?path=" + _url_quote(str(path), safe="")
 
 
-def _slot_assets(set_num: str, bag: int, crop_id: str, slot_index: int) -> Dict[str, str]:
+def _slot_assets(
+    set_num: str,
+    bag: int,
+    crop_id: str,
+    slot_index: int,
+    *,
+    crop_source: Optional[Dict[str, Any]] = None,
+    island_label: Optional[int] = None,
+) -> Dict[str, str]:
     step_masked_path = _STEP_SEG_DIR / f"{set_num}_bag{int(bag)}_{crop_id}_slot{int(slot_index)}_masked.png"
     part_cutout_hits = sorted(
         _PART_CUTOUT_DIR.glob(f"{set_num}_bag{int(bag)}_{crop_id}_slot{int(slot_index)}_*_cutout.png")
     )
     part_cutout_path = part_cutout_hits[-1] if part_cutout_hits else None
+    overlay_hits = sorted(
+        _SLOT_WINDOW_OVERLAY_DIR.glob(
+            f"{set_num}_bag{int(bag)}_{crop_id}_slot{int(slot_index)}_*_slot_window_overlay.png"
+        )
+    )
+    slot_window_overlay_path = overlay_hits[-1] if overlay_hits else None
+
+    island_cutout_path_str = ""
+    island_slot_mask_path_str = ""
+    crop_source = crop_source or {}
+    raw_box = list(crop_source.get("crop_box") or [])
+    crop_box = [int(raw_box[i] or 0) for i in range(4)] if len(raw_box) >= 4 else []
+    crop_image_path = str(crop_source.get("crop_image_path") or "").strip()
+    if island_label is not None and len(crop_box) >= 4 and crop_image_path:
+        stem = find_full_mask_stem(str(set_num), int(bag), str(crop_id))
+        if stem:
+            island_path = ensure_island_slot_cutout_path(
+                stem=stem,
+                slot_index=int(slot_index),
+                crop_image_path=crop_image_path,
+                crop_box=crop_box,
+                island_label=island_label,
+            )
+            if island_path is not None and island_path.is_file():
+                island_cutout_path_str = str(island_path)
+            mask_path = ensure_island_slot_mask_path(
+                stem=stem,
+                slot_index=int(slot_index),
+                crop_image_path=crop_image_path,
+                crop_box=crop_box,
+                island_label=island_label,
+            )
+            if mask_path is not None and mask_path.is_file():
+                island_slot_mask_path_str = str(mask_path)
+
+    step_masked_resolved = str(step_masked_path) if step_masked_path.is_file() else ""
+    if not step_masked_resolved and island_slot_mask_path_str:
+        step_masked_resolved = island_slot_mask_path_str
+
     return {
-        "step_masked_path": str(step_masked_path) if step_masked_path.is_file() else "",
-        "step_masked_url": _artifact_url(str(step_masked_path)) if step_masked_path.is_file() else "",
+        "step_masked_path": step_masked_resolved,
+        "step_masked_url": _artifact_url(step_masked_resolved) if step_masked_resolved else "",
         "part_cutout_path": str(part_cutout_path) if part_cutout_path and part_cutout_path.is_file() else "",
         "part_cutout_url": _artifact_url(str(part_cutout_path)) if part_cutout_path and part_cutout_path.is_file() else "",
+        "island_cutout_path": island_cutout_path_str,
+        "island_cutout_url": _artifact_url(island_cutout_path_str) if island_cutout_path_str else "",
+        "island_slot_mask_path": island_slot_mask_path_str,
+        "island_slot_mask_url": _artifact_url(island_slot_mask_path_str) if island_slot_mask_path_str else "",
+        "slot_window_overlay_path": (
+            str(slot_window_overlay_path) if slot_window_overlay_path and slot_window_overlay_path.is_file() else ""
+        ),
+        "slot_window_overlay_url": (
+            _artifact_url(str(slot_window_overlay_path))
+            if slot_window_overlay_path and slot_window_overlay_path.is_file()
+            else ""
+        ),
     }
+
+
+def _crop_has_reviewed_labels(saved_crop: Dict[str, Any]) -> bool:
+    if not isinstance(saved_crop, dict):
+        return False
+    for part in list(saved_crop.get("parts") or []):
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("part_num") or "").strip():
+            return True
+    if list(saved_crop.get("unknown_slots") or []):
+        return True
+    if list(saved_crop.get("ignored_slots") or []):
+        return True
+    return False
+
+
+def _build_saved_label_slot_sequence(saved_crop: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Preserve existing reviewed slot indices when qty OCR is absent."""
+    slot_indices: set[int] = set()
+    for part_index, part in enumerate(list(saved_crop.get("parts") or [])):
+        if not isinstance(part, dict):
+            continue
+        if not str(part.get("part_num") or "").strip():
+            continue
+        explicit_slot = _coerce_int(part.get("selected_slot_index"))
+        resolved_slot = explicit_slot if explicit_slot is not None else int(part_index)
+        if resolved_slot is not None and int(resolved_slot) >= 0:
+            slot_indices.add(int(resolved_slot))
+    for raw_index in list(saved_crop.get("unknown_slots") or []):
+        parsed = _coerce_int(raw_index)
+        if parsed is not None and int(parsed) >= 0:
+            slot_indices.add(int(parsed))
+    for raw_index in list(saved_crop.get("ignored_slots") or []):
+        parsed = _coerce_int(raw_index)
+        if parsed is not None and int(parsed) >= 0:
+            slot_indices.add(int(parsed))
+    if not slot_indices:
+        return []
+    count = max(slot_indices) + 1
+    return [
+        {"qty": None, "qty_text": "", "slot_source": "saved_label"}
+        for _ in range(count)
+    ]
+
+
+def _build_island_fallback_slot_sequence(
+    set_num: str,
+    bag: int,
+    crop_id: str,
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Build review slots from significant raw_master_mask CCs when qty OCR is absent."""
+    stem = find_full_mask_stem(str(set_num), int(bag), str(crop_id))
+    if not stem:
+        return [], "no_full_crop_mask"
+    raw_path = raw_master_mask_path(stem)
+    if not raw_path.is_file():
+        return [], "no_raw_master_mask"
+    raw_islands = sort_islands_for_slots(master_islands_from_mask(str(raw_path)))
+    if not raw_islands:
+        return [], "no_mask_islands"
+    islands = filter_significant_islands(raw_islands)
+    if not islands:
+        return [], "no_significant_islands"
+    if len(islands) > MAX_AUTO_ISLAND_SLOTS:
+        return [], f"too_many_islands:{len(islands)}>{MAX_AUTO_ISLAND_SLOTS}"
+    return [
+        {
+            "qty": None,
+            "qty_text": "",
+            "slot_source": "island_fallback",
+            "island_label": int(island.get("label") or (index + 1)),
+        }
+        for index, island in enumerate(islands)
+    ], None
+
+
+def _supplement_slot_sequence_with_islands(
+    set_num: str,
+    bag: int,
+    crop_id: str,
+    slot_sequence: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Append island-backed slots when mask geometry exceeds primary slot count.
+
+    Primary qty/saved-label slots are preserved in order; supplemental slots use
+    island_fallback geometry for indices beyond the primary sequence length.
+    """
+    if not slot_sequence:
+        return slot_sequence
+    island_slot_sequence, _island_audit_reason = _build_island_fallback_slot_sequence(
+        set_num, int(bag), str(crop_id)
+    )
+    if not island_slot_sequence:
+        return slot_sequence
+    primary_count = len(slot_sequence)
+    island_count = len(island_slot_sequence)
+    if island_count <= primary_count or island_count > MAX_AUTO_ISLAND_SLOTS:
+        return slot_sequence
+    supplemented = list(slot_sequence)
+    for index in range(primary_count, island_count):
+        supplemented.append(dict(island_slot_sequence[index]))
+    return supplemented
 
 
 def _slot_display_text(slot_index: int, slot: Dict[str, Any]) -> str:
@@ -169,6 +344,11 @@ def _slot_display_text(slot_index: int, slot: Dict[str, Any]) -> str:
         return f"Slot {slot_index + 1}: UNKNOWN"
     if bool(slot.get("ignored")):
         return f"Slot {slot_index + 1}: IGNORED"
+    if str(slot.get("slot_source") or "") == "island_fallback":
+        island_label = slot.get("island_label")
+        if island_label is not None:
+            return f"Slot {slot_index + 1}: island {int(island_label)}"
+        return f"Slot {slot_index + 1}: island"
     return f"Slot {slot_index + 1}: needs review"
 
 
@@ -254,6 +434,27 @@ def build_review_model(set_num: str, bag: int) -> Dict[str, Any]:
             )
         )
         slot_sequence = _build_qty_sequence(crop_qty, crop_qty_text)
+        crop_slot_source = "qty"
+        slot_audit_required = False
+        slot_audit_reason = ""
+        if not slot_sequence:
+            if _crop_has_reviewed_labels(saved_crop):
+                slot_sequence = _build_saved_label_slot_sequence(saved_crop)
+                crop_slot_source = "saved_label"
+            else:
+                island_slot_sequence, island_audit_reason = _build_island_fallback_slot_sequence(
+                    set_num, int(bag), crop_id
+                )
+                if island_slot_sequence:
+                    slot_sequence = island_slot_sequence
+                    crop_slot_source = "island_fallback"
+                elif island_audit_reason:
+                    slot_audit_required = True
+                    slot_audit_reason = str(island_audit_reason)
+        if slot_sequence:
+            slot_sequence = _supplement_slot_sequence_with_islands(
+                set_num, int(bag), crop_id, slot_sequence
+            )
 
         saved_by_slot: Dict[int, Dict[str, Any]] = {}
         for part_index, saved_part in enumerate(list(saved_crop.get("parts", []) or [])):
@@ -284,15 +485,30 @@ def build_review_model(set_num: str, bag: int) -> Dict[str, Any]:
         )
 
         slot_details: List[Dict[str, Any]] = []
+        mask_stem = find_full_mask_stem(str(set_num), int(bag), crop_id)
+        significant_islands = (
+            significant_islands_for_stem(mask_stem) if mask_stem else []
+        )
         for idx, slot in enumerate(slot_sequence):
+            display_island_label = order_island_label(significant_islands, int(idx))
             slot_detail = {
                 "slot_index": int(idx),
                 "qty": slot.get("qty"),
                 "qty_text": str(slot.get("qty_text") or slot.get("qty") or ""),
+                "slot_source": str(slot.get("slot_source") or crop_slot_source),
+                "island_label": display_island_label,
+                "debug_island_label": display_island_label,
                 "saved_label": saved_by_slot.get(int(idx)),
                 "unknown": int(idx) in set(unknown_slots),
                 "ignored": int(idx) in set(ignored_slots),
-                **_slot_assets(set_num, int(bag), crop_id, int(idx)),
+                **_slot_assets(
+                    set_num,
+                    int(bag),
+                    crop_id,
+                    int(idx),
+                    crop_source=crop,
+                    island_label=display_island_label,
+                ),
             }
             slot_detail["display_text"] = _slot_display_text(int(idx), slot_detail)
             slot_details.append(slot_detail)
@@ -309,7 +525,10 @@ def build_review_model(set_num: str, bag: int) -> Dict[str, Any]:
                 "crop_image_path": str(crop.get("crop_image_path") or saved_crop.get("crop_image_path") or ""),
                 "original_data_uri": str(crop.get("data_uri") or ""),
                 "qty_label": ", ".join(crop_qty_text) if crop_qty_text else "none",
+                "slot_source": crop_slot_source,
                 "slot_sequence": slot_sequence,
+                "slot_audit_required": bool(slot_audit_required),
+                "slot_audit_reason": str(slot_audit_reason or ""),
                 "filled_slots": len([slot for slot in slot_details if slot.get("saved_label")]),
                 "slots": slot_details,
                 "unknown_slots": unknown_slots,
@@ -349,6 +568,99 @@ def build_review_model(set_num: str, bag: int) -> Dict[str, Any]:
         "progress": progress,
         "assigned_qty_by_key": assigned_qty_by_key,
     }
+
+
+def _slot_needs_review(slot: Dict[str, Any]) -> bool:
+    return not slot.get("saved_label") and not slot.get("unknown") and not slot.get("ignored")
+
+
+def find_next_unreviewed_slot(
+    set_num: str,
+    bag: int,
+    *,
+    from_crop_id: str = "",
+    from_slot_index: Optional[int] = None,
+    include_current: bool = False,
+) -> Dict[str, Any]:
+    """Return the next slot needing review using fresh label state from disk."""
+    model = build_review_model(str(set_num), int(bag))
+    flat: List[Dict[str, Any]] = []
+    for crop in list(model.get("crops") or []):
+        crop_id = str(crop.get("crop_id") or "")
+        for slot in list(crop.get("slots") or []):
+            flat.append(
+                {
+                    "crop_id": crop_id,
+                    "slot_index": int(slot.get("slot_index", 0) or 0),
+                    "slot": slot,
+                }
+            )
+
+    if not flat:
+        return {"found": False, "crop_id": None, "slot_index": None}
+
+    crop_id_text = str(from_crop_id or "").strip()
+    if crop_id_text:
+        crop_items = [
+            item for item in flat if str(item.get("crop_id") or "") == crop_id_text
+        ]
+        crop_start = -1
+        if from_slot_index is not None:
+            for index, item in enumerate(crop_items):
+                if int(item.get("slot_index", -1)) == int(from_slot_index):
+                    crop_start = index
+                    break
+        if include_current and crop_start >= 0:
+            current = crop_items[crop_start]
+            if _slot_needs_review(current.get("slot") or {}):
+                return {
+                    "found": True,
+                    "crop_id": current.get("crop_id"),
+                    "slot_index": current.get("slot_index"),
+                }
+        for step in range(1, len(crop_items) + 1):
+            index = (
+                (crop_start + step) % len(crop_items)
+                if crop_start >= 0
+                else (step - 1) % len(crop_items)
+            )
+            item = crop_items[index]
+            if _slot_needs_review(item.get("slot") or {}):
+                return {
+                    "found": True,
+                    "crop_id": item.get("crop_id"),
+                    "slot_index": item.get("slot_index"),
+                }
+
+    start = -1
+    if from_crop_id or from_slot_index is not None:
+        for index, item in enumerate(flat):
+            if str(item.get("crop_id") or "") == str(from_crop_id or "") and (
+                from_slot_index is None or int(item.get("slot_index", -1)) == int(from_slot_index)
+            ):
+                start = index
+                break
+
+    if include_current and start >= 0:
+        current = flat[start]
+        if _slot_needs_review(current.get("slot") or {}):
+            return {
+                "found": True,
+                "crop_id": current.get("crop_id"),
+                "slot_index": current.get("slot_index"),
+            }
+
+    for step in range(1, len(flat) + 1):
+        index = (start + step) % len(flat) if start >= 0 else (step - 1) % len(flat)
+        item = flat[index]
+        if _slot_needs_review(item.get("slot") or {}):
+            return {
+                "found": True,
+                "crop_id": item.get("crop_id"),
+                "slot_index": item.get("slot_index"),
+            }
+
+    return {"found": False, "crop_id": None, "slot_index": None}
 
 
 def mark_slot_unknown(set_num: str, bag: int, crop_id: str, slot_index: int) -> Dict[str, Any]:

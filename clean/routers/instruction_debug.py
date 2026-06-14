@@ -85,8 +85,13 @@ from clean.services.ai_snap_crop_service import (
 from clean.services.part_candidate_service import get_part_candidates_for_crop
 from clean.services.part_crop_normalize_service import normalize_part_crop, normalize_slot_crop_from_qty
 from clean.services.instruction_buildability_source import load_instruction_set_parts
+from clean.services.bag_review_export_service import (
+    build_review_progress_from_review_crops,
+    export_bag_review,
+)
 from clean.services.bag_review_service import (
     build_review_model,
+    find_next_unreviewed_slot,
     mark_slot_ignored as bag_review_mark_slot_ignored,
     mark_slot_unknown as bag_review_mark_slot_unknown,
     save_slot_label as bag_review_save_slot_label,
@@ -3564,34 +3569,9 @@ def _direct_qty_ocr_boxes_from_crop_image(image_path: Any) -> List[Dict[str, Any
 
 
 def _master_islands_from_mask(mask_path: str) -> List[Dict[str, Any]]:
-    mask_file = Path(str(mask_path or "").strip())
-    if not mask_file.exists():
-        return []
-    mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
-    if mask is None or getattr(mask, "size", 0) == 0:
-        return []
-    labels_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(
-        (mask > 0).astype(np.uint8),
-        8,
-    )
-    islands: List[Dict[str, Any]] = []
-    for label in range(1, labels_count):
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        w = int(stats[label, cv2.CC_STAT_WIDTH])
-        h = int(stats[label, cv2.CC_STAT_HEIGHT])
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        fill = float(area) / float(max(1, w * h))
-        islands.append(
-            {
-                "label": int(label),
-                "bbox": [x, y, w, h],
-                "area": area,
-                "fill": round(fill, 4),
-                "centroid": [round(float(centroids[label][0]), 2), round(float(centroids[label][1]), 2)],
-            }
-        )
-    return islands
+    from clean.services.full_crop_mask_paths import master_islands_from_mask
+
+    return master_islands_from_mask(mask_path)
 
 
 def _mock_rank_slot_candidates(
@@ -4409,15 +4389,124 @@ def _build_manual_crop_pages(set_num: str, bag: int) -> List[Dict[str, Any]]:
     return pages
 
 
+def _crop_preview_data_uri(crop: Dict[str, Any]) -> str:
+    """Resolve a crop thumbnail data-uri from cache fields (same source as mask-review)."""
+    data_uri = str(crop.get("data_uri") or crop.get("original_data_uri") or "").strip()
+    if data_uri:
+        return data_uri
+    crop_box = _coerce_box_list(crop.get("crop_box"))
+    crop_image_path = str(crop.get("crop_image_path") or "").strip()
+    if crop_box is None or not crop_image_path:
+        return ""
+    img = cv2.imread(crop_image_path)
+    if img is None or getattr(img, "size", 0) == 0:
+        return ""
+    return str(_encode_contact_sheet_crop(img, crop_box, max_edge=420) or "")
+
+
 def _build_crop_image_html(crop: Dict[str, Any]) -> str:
-    data_uri = str(crop.get("data_uri") or "").strip()
     crop_id = str(crop.get("crop_id") or "").strip()
+    data_uri = _crop_preview_data_uri(crop)
     if not data_uri:
         return '<div class="crop-missing">Crop unavailable</div>'
     return (
         f'<img src="{escape(data_uri)}" data-src="{escape(data_uri)}" '
         f'data-crop-id="{escape(crop_id)}" alt="{escape(crop_id)}" loading="lazy" '
         'onclick="openCropZoomFromEl(event, this)" />'
+    )
+
+
+def _build_manual_review_slot_thumb_html(
+    src: str,
+    *,
+    alt: str,
+    caption: str,
+    extra_class: str = "",
+) -> str:
+    url = str(src or "").strip()
+    if not url:
+        return ""
+    class_name = "slot-slot-thumb" + (f" {extra_class}" if extra_class else "")
+    return (
+        f'<span class="{class_name.strip()}">'
+        f'<img src="{escape(url)}" data-src="{escape(url)}" data-caption="{escape(caption)}" '
+        f'alt="{escape(alt)}" loading="lazy" onclick="openCropZoomFromEl(event, this)" />'
+        f"</span>"
+    )
+
+
+def _slot_cutout_display_url(slot: Dict[str, Any]) -> str:
+    return str(slot.get("island_cutout_url") or slot.get("part_cutout_url") or "").strip()
+
+
+def _slot_cutout_display_path(slot: Dict[str, Any]) -> str:
+    return str(slot.get("island_cutout_path") or slot.get("part_cutout_path") or "").strip()
+
+
+def _slot_qty_badge_text(slot: Dict[str, Any]) -> str:
+    """OCR qty badge for manual-match-review slot rows; empty for island geometry slots."""
+    if str(slot.get("slot_source") or "") == "island_fallback":
+        return ""
+    qty_text = str(slot.get("qty_text") or "").strip()
+    if qty_text:
+        return qty_text
+    qty = _coerce_int(slot.get("qty"))
+    if qty is not None:
+        return f"{qty}x"
+    return ""
+
+
+def _build_manual_review_slot_label_html(slot: Dict[str, Any], slot_index: int) -> str:
+    slot_number = int(slot_index) + 1
+    display_text = escape(str(slot.get("display_text") or f"Slot {slot_number}: needs review"))
+    qty_badge = _slot_qty_badge_text(slot)
+    if not qty_badge:
+        return f'<span class="slot-btn-label"><span class="slot-btn-caption">{display_text}</span></span>'
+    return (
+        f'<span class="slot-btn-label">'
+        f'<span class="slot-btn-qty">{escape(qty_badge)}</span>'
+        f'<span class="slot-btn-caption">{display_text}</span>'
+        f"</span>"
+    )
+
+
+def _build_manual_review_slot_button_html(crop_id: str, slot: Dict[str, Any], slot_index: int) -> str:
+    classes = ["slot-btn"]
+    if slot.get("saved_label"):
+        classes.append("assigned")
+    if slot.get("unknown"):
+        classes.append("unknown")
+    if slot.get("ignored"):
+        classes.append("ignored")
+    crop_id_text = str(crop_id or "")
+    slot_number = int(slot_index) + 1
+    caption_base = f"Crop: {crop_id_text} | slot {slot_number}"
+    cutout_url = _slot_cutout_display_url(slot)
+    cutout_html = _build_manual_review_slot_thumb_html(
+        cutout_url,
+        alt=f"slot {slot_number} cutout",
+        caption=f"{caption_base} slot cutout",
+        extra_class="slot-cutout-thumb",
+    )
+    overlay_html = _build_manual_review_slot_thumb_html(
+        str(slot.get("slot_window_overlay_url") or ""),
+        alt=f"slot {slot_number} window overlay",
+        caption=f"{caption_base} window overlay",
+        extra_class="slot-overlay-thumb",
+    )
+    thumbs = cutout_html + overlay_html
+    if not thumbs:
+        thumbs = '<span class="slot-slot-thumb slot-thumb-missing">no cutout</span>'
+    label_html = _build_manual_review_slot_label_html(slot, int(slot_index))
+    return (
+        f'<button type="button" class="{" ".join(classes)}" data-crop-slot '
+        f'data-crop-id="{escape(crop_id_text)}" data-slot-index="{int(slot_index)}" '
+        f'data-slot-assigned="{str(bool(slot.get("saved_label"))).lower()}" '
+        f'data-slot-unknown="{str(bool(slot.get("unknown"))).lower()}" '
+        f'data-slot-ignored="{str(bool(slot.get("ignored"))).lower()}">'
+        f'<span class="slot-slot-thumbs">{thumbs}</span>'
+        f"{label_html}"
+        f"</button>"
     )
 
 
@@ -8867,6 +8956,53 @@ def _clip_embed_image(img_path: str):
         feat = _clip_model.encode_image(tensor.to(device))
         feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.cpu().float().numpy()[0]  # (512,)
+
+
+def _clip_embed_cutout_path(img_path: str):
+    """Embed a slot cutout, flattening RGBA onto white so CLIP sees the part not transparency."""
+    from PIL import Image as _Pil
+    import torch
+    import numpy as np
+
+    img = _Pil.open(img_path)
+    if img.mode in ("RGBA", "LA") or ("A" in img.getbands()):
+        rgba = img.convert("RGBA")
+        bg = _Pil.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[3])
+        rgb = bg
+    else:
+        rgb = img.convert("RGB")
+    tensor = _clip_preprocess(rgb).unsqueeze(0)
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    with torch.no_grad():
+        feat = _clip_model.encode_image(tensor.to(device))
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+    return feat.cpu().float().numpy()[0]
+
+
+def _resolve_slot_rank_input_path(
+    *,
+    temp_crop_path: Optional[Path],
+    step_masked_path: str = "",
+    part_cutout_path: str = "",
+    island_slot_cutout_path: str = "",
+    selected_qty_box: Optional[Dict[str, Any]] = None,
+) -> tuple[str, str]:
+    """Pick the best on-disk query image for slot CLIP ranking."""
+    if step_masked_path and Path(step_masked_path).is_file():
+        return step_masked_path, "step_masked_path"
+    if part_cutout_path and Path(part_cutout_path).is_file():
+        return part_cutout_path, "part_cutout_path"
+    if island_slot_cutout_path and Path(island_slot_cutout_path).is_file():
+        return island_slot_cutout_path, "island_slot_cutout_path"
+    if temp_crop_path is not None and selected_qty_box is not None:
+        normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), selected_qty_box)
+        normalized_path = str(normalized_result.get("normalized_path") or "").strip()
+        if bool(normalized_result.get("ok")) and normalized_path and Path(normalized_path).is_file():
+            return normalized_path, "qty_normalized_crop"
+    if temp_crop_path is not None and temp_crop_path.is_file():
+        return str(temp_crop_path), "full_crop_fallback"
+    return "", "unavailable"
 
 
 def _extract_fg_median_rgb(path: str) -> Optional[Tuple[int, int, int]]:
@@ -14078,6 +14214,9 @@ async def buildability_clip_suggest(req: Request):
     slot_index = _coerce_int(data.get("slot_index"))
     bcs_step_masked_path  = str(data.get("step_masked_path") or "").strip()
     bcs_part_cutout_path  = str(data.get("part_cutout_path") or "").strip()
+    bcs_island_cutout_path = str(
+        data.get("island_slot_cutout_path") or data.get("island_cutout_path") or ""
+    ).strip()
     if not crop_id:
         raise HTTPException(status_code=400, detail="crop_id is required")
     if slot_index is None or slot_index < 0:
@@ -14121,25 +14260,20 @@ async def buildability_clip_suggest(req: Request):
         if temp_crop_path is None:
             raise HTTPException(status_code=400, detail="crop image unavailable")
 
-        rank_input_path = str(temp_crop_path)
-        if bcs_step_masked_path and Path(bcs_step_masked_path).is_file():
-            rank_input_path = bcs_step_masked_path
+        rank_input_path, rank_source = _resolve_slot_rank_input_path(
+            temp_crop_path=temp_crop_path,
+            step_masked_path=bcs_step_masked_path,
+            part_cutout_path=bcs_part_cutout_path,
+            island_slot_cutout_path=bcs_island_cutout_path,
+            selected_qty_box=selected_qty_box,
+        )
+        if rank_input_path:
             print(
-                "[buildability-clip-suggest] using step_masked_path as query image crop_id=%s slot_index=%s query_image_path=%s"
-                % (str(crop_id), str(slot_index), bcs_step_masked_path)
+                "[buildability-clip-suggest] using %s as query image crop_id=%s slot_index=%s query_image_path=%s"
+                % (rank_source, str(crop_id), str(slot_index), rank_input_path)
             )
-        elif bcs_part_cutout_path and Path(bcs_part_cutout_path).is_file():
-            rank_input_path = bcs_part_cutout_path
-            print(
-                "[buildability-clip-suggest] using part_cutout_path as query image crop_id=%s slot_index=%s query_image_path=%s"
-                % (str(crop_id), str(slot_index), bcs_part_cutout_path)
-            )
-        elif selected_qty_box is not None:
-            normalized_result = normalize_slot_crop_from_qty(str(temp_crop_path), selected_qty_box)
-            if bool(normalized_result.get("ok")) and str(normalized_result.get("normalized_path") or "").strip():
-                rank_input_path = str(normalized_result.get("normalized_path") or "").strip()
 
-        if not Path(rank_input_path).is_file():
+        if not rank_input_path or not Path(rank_input_path).is_file():
             raise HTTPException(status_code=400, detail="normalized crop unavailable")
 
         # ── Colour-aware ranking helpers ──────────────────────────────────────
@@ -14188,7 +14322,8 @@ async def buildability_clip_suggest(req: Request):
             return {"ok": False, "mode": "clip-unavailable", "error": clip_err, "ranked_candidates": []}
 
         try:
-            query_vec = _clip_embed_image(rank_input_path)  # (512,) L2-normalised
+            embed_fn = _clip_embed_cutout_path if rank_source in ("part_cutout_path", "island_slot_cutout_path") else _clip_embed_image
+            query_vec = embed_fn(rank_input_path)  # (512,) L2-normalised
         except Exception as _qe:
             return {"ok": False, "mode": "clip-unavailable", "error": f"query embed failed: {_qe}", "ranked_candidates": []}
 
@@ -14909,6 +15044,49 @@ async def next_unfilled_crop_endpoint(req: Request):
             return {"found": True, "crop_id": crop_id}
 
     return {"found": False, "crop_id": None}
+
+
+@router.post("/debug/next-unreviewed-slot")
+async def next_unreviewed_slot_endpoint(req: Request):
+    """Return the next slot needing review after the current selection.
+
+    Uses build_review_model() so the result reflects authoritative label state
+    from disk (confirmed, unknown, and ignored slots are skipped).
+    """
+    data = await req.json()
+    set_num = str(data.get("set_num") or "70618").strip() or "70618"
+    try:
+        bag = int(data.get("bag") or 1)
+    except Exception:
+        bag = 1
+    from_crop_id = str(data.get("from_crop_id") or "").strip()
+    from_slot_index = _coerce_int(data.get("from_slot_index"))
+    include_current = bool(data.get("include_current"))
+    return find_next_unreviewed_slot(
+        set_num,
+        int(bag),
+        from_crop_id=from_crop_id,
+        from_slot_index=from_slot_index,
+        include_current=include_current,
+    )
+
+
+@router.post("/debug/bag-review/export")
+def bag_review_export_endpoint(
+    set_num: str = Query("70618"),
+    bag: int = Query(4, ge=1),
+    upload_r2: str = Query("0"),
+    upload_azure: str = Query("0"),
+    dry_run: str = Query("1"),
+):
+    result = export_bag_review(
+        str(set_num or "70618").strip() or "70618",
+        int(bag),
+        upload_r2=_request_bool(upload_r2, False),
+        upload_azure=_request_bool(upload_azure, False),
+        dry_run=_dry_run_enabled(dry_run),
+    )
+    return JSONResponse(result)
 
 
 @router.get("/debug/export-training-data")
@@ -20461,13 +20639,26 @@ def manual_match_review(
     review_model = build_review_model(str(set_num), bag_number)
     review_crops: List[Dict[str, Any]] = list(review_model.get("crops") or [])
     assigned_qty_by_key: Dict[str, int] = dict(review_model.get("assigned_qty_by_key") or {})
+    for crop in review_crops:
+        preview_uri = _crop_preview_data_uri(crop)
+        if preview_uri:
+            crop["original_data_uri"] = preview_uri
+            crop["data_uri"] = preview_uri
     crop_tiles: List[str] = []
     for crop in review_crops:
         slot_buttons = "".join(
-            f'<button type="button" class="slot-btn{" assigned" if slot.get("saved_label") else ""}{" unknown" if slot.get("unknown") else ""}{" ignored" if slot.get("ignored") else ""}" data-crop-slot data-crop-id="{escape(str(crop.get("crop_id") or ""))}" data-slot-index="{int(slot.get("slot_index", idx) or 0)}" data-slot-assigned="{str(bool(slot.get("saved_label"))).lower()}" data-slot-unknown="{str(bool(slot.get("unknown"))).lower()}" data-slot-ignored="{str(bool(slot.get("ignored"))).lower()}">{escape(str(slot.get("display_text") or ("Slot " + str(idx + 1) + ": needs review")))}</button>'
+            _build_manual_review_slot_button_html(
+                str(crop.get("crop_id") or ""),
+                slot,
+                int(slot.get("slot_index", idx) or idx),
+            )
             for idx, slot in enumerate(list(crop.get("slots") or []))
-        ) or '<div class="slot-empty">No qty slots</div>'
-        thumb = _build_crop_image_html({"data_uri": crop.get("original_data_uri")})
+        ) or (
+            f'<div class="slot-empty">Manual slot audit required: {escape(str(crop.get("slot_audit_reason") or "ambiguous islands"))}</div>'
+            if crop.get("slot_audit_required")
+            else '<div class="slot-empty">No qty slots</div>'
+        )
+        thumb = _build_crop_image_html(crop)
         crop_tiles.append(
             f"""
             <div class="crop-tile" data-crop-tile data-crop-id="{escape(str(crop.get('crop_id') or ''))}">
@@ -20509,6 +20700,8 @@ def manual_match_review(
             """
         )
     review_crops_json = json.dumps(review_crops)
+    review_progress = build_review_progress_from_review_crops(review_crops)
+    review_progress_json = json.dumps(review_progress)
     review_parts_json = json.dumps(review_parts)
     html = f"""
     <!doctype html>
@@ -20524,12 +20717,12 @@ def manual_match_review(
         .manual-review-left {{ display: block; }}
         .manual-review-right {{ display: block; }}
         .manual-review-panel {{ display: block; }}
-        .crop-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }}
+        .crop-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; margin-top: 16px; }}
         .crop-grid-wrap {{ padding-top: 12px; }}
         .crop-tile {{ border: 1px solid #d6dee8; border-radius: 12px; background: #fff; padding: 10px; text-align: left; cursor: pointer; }}
         .crop-tile.selected, .part-tile-review.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
         .crop-thumb {{ min-height: 110px; display: flex; align-items: center; justify-content: center; background: #f4f7fb; border: 1px solid #d6dee8; border-radius: 10px; overflow: hidden; }}
-        .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; }}
+        .crop-thumb img {{ max-width: 100%; max-height: 110px; display: block; cursor: zoom-in; }}
         .progress-summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-top: 14px; }}
         .progress-stat {{ border: 1px solid #d6dee8; border-radius: 8px; background: #f8fbff; padding: 10px; font-size: 12px; }}
         .progress-stat strong {{ display: block; font-size: 18px; color: #1f2d3d; margin-bottom: 2px; }}
@@ -20540,7 +20733,14 @@ def manual_match_review(
         .part-thumb-review img {{ max-width: 100%; max-height: 96px; display: block; }}
         .crop-meta {{ margin-top: 8px; font-size: 12px; line-height: 1.35; }}
         .slot-list {{ margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
-        .slot-btn {{ border: 1px solid #d6dee8; border-radius: 8px; background: #f8fbff; padding: 6px 8px; text-align: left; cursor: pointer; font-size: 12px; }}
+        .slot-btn {{ border: 1px solid #d6dee8; border-radius: 8px; background: #f8fbff; padding: 6px 8px; text-align: left; cursor: pointer; font-size: 12px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: center; width: 100%; }}
+        .slot-btn-label {{ min-width: 0; line-height: 1.35; display: flex; flex-direction: column; gap: 2px; }}
+        .slot-btn-qty {{ font-size: 18px; font-weight: 900; line-height: 1; }}
+        .slot-btn-caption {{ font-size: 12px; line-height: 1.35; }}
+        .slot-slot-thumbs {{ display: flex; gap: 4px; flex-shrink: 0; align-items: center; }}
+        .slot-slot-thumb {{ display: inline-flex; align-items: center; justify-content: center; }}
+        .slot-slot-thumb img {{ width: 46px; height: 46px; object-fit: contain; border: 1px solid #d6dee8; border-radius: 8px; background-color: #fff; background-image: linear-gradient(45deg, #edf1f5 25%, transparent 25%), linear-gradient(-45deg, #edf1f5 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #edf1f5 75%), linear-gradient(-45deg, transparent 75%, #edf1f5 75%); background-size: 12px 12px; background-position: 0 0, 0 6px, 6px -6px, -6px 0; cursor: zoom-in; display: block; }}
+        .slot-thumb-missing {{ width: 46px; height: 46px; border: 1px dashed #cbd6e2; border-radius: 8px; background: #f4f7fb; color: #8a98a8; font-size: 9px; line-height: 1.15; display: inline-flex; align-items: center; justify-content: center; text-align: center; padding: 4px; box-sizing: border-box; }}
         .slot-btn.selected {{ border-color: #cf1f1f; background: #fff1f1; }}
         .slot-btn.assigned {{ background: #eef6ef; border-color: #7db28a; color: #2f6c41; cursor: pointer; }}
         .slot-btn.unknown {{ background: #fff8df; border-color: #e1c36a; color: #725b10; }}
@@ -20553,7 +20753,7 @@ def manual_match_review(
         .slot-preview-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }}
         .slot-preview-tile {{ border: 1px solid #d6dee8; border-radius: 8px; overflow: hidden; background: #f8fbff; }}
         .slot-preview-frame {{ min-height: 116px; display: flex; align-items: center; justify-content: center; padding: 8px; background: #fff; }}
-        .slot-preview-frame img {{ max-width: 100%; max-height: 150px; display: block; object-fit: contain; }}
+        .slot-preview-frame img {{ max-width: 100%; max-height: 150px; display: block; object-fit: contain; cursor: zoom-in; }}
         .slot-preview-tile figcaption {{ padding: 7px 8px; font-size: 11px; color: #627283; border-top: 1px solid #d6dee8; }}
         .saved-label-box {{ margin-top: 12px; border: 1px solid #d6dee8; border-radius: 8px; padding: 10px; font-size: 13px; background: #f8fbff; }}
         .candidate-suggestions {{ display: grid; gap: 8px; margin-top: 10px; }}
@@ -20582,7 +20782,7 @@ def manual_match_review(
         .manual-crop-preview-close {{ border: 0; border-radius: 999px; width: 30px; height: 30px; background: #ffffff; color: #7d1d1d; font-size: 18px; line-height: 1; cursor: pointer; box-shadow: 0 2px 8px rgba(31, 45, 61, 0.12); }}
         .manual-crop-preview-body {{ display: flex; flex-direction: column; max-height: calc(min(56vh, 540px) - 56px); overflow-y: auto; }}
         .manual-crop-preview-frame {{ height: clamp(220px, 26vh, 280px); min-height: 220px; max-height: 280px; display: flex; align-items: center; justify-content: center; padding: 12px 14px; background: #f4f7fb; overflow: hidden; }}
-        .manual-crop-preview-frame img {{ width: 100%; height: 100%; max-width: 100%; max-height: 100%; display: block; object-fit: contain; }}
+        .manual-crop-preview-frame img {{ width: 100%; height: 100%; max-width: 100%; max-height: 100%; display: block; object-fit: contain; cursor: zoom-in; }}
         .manual-crop-preview-frame.picker-active, .manual-crop-preview-frame.picker-active img {{ cursor: crosshair; }}
         .manual-crop-preview-meta {{ padding: 10px 14px 12px; font-size: 12px; line-height: 1.45; color: #4d6175; }}
         .manual-crop-preview-slot-list {{ display: flex; flex-direction: column; gap: 6px; padding: 0 14px 12px; }}
@@ -20590,6 +20790,56 @@ def manual_match_review(
         .secondary-btn {{ border: 1px solid #cbd6e2; border-radius: 10px; background: #fff; color: #32465a; padding: 9px 12px; font-weight: 700; cursor: pointer; }}
         .assign-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
         .secondary-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+        .auto-mask-status {{ font-size: 12px; color: #627283; }}
+        .zoom-modal {{
+          position: fixed;
+          inset: 0;
+          display: none;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+          background: rgba(12, 19, 26, 0.78);
+          z-index: 1000;
+        }}
+        .zoom-modal.open {{
+          display: flex;
+        }}
+        .zoom-modal-panel {{
+          position: relative;
+          max-width: min(92vw, 1100px);
+          max-height: 90vh;
+          padding: 18px;
+          background: #fff;
+          border-radius: 18px;
+          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+        }}
+        .zoom-modal-close {{
+          position: absolute;
+          top: 10px;
+          right: 10px;
+          border: 0;
+          width: 36px;
+          height: 36px;
+          border-radius: 999px;
+          background: rgba(23, 33, 43, 0.08);
+          font-size: 20px;
+          line-height: 1;
+          cursor: pointer;
+        }}
+        .zoom-modal-image {{
+          max-width: 100%;
+          max-height: calc(90vh - 72px);
+          width: auto;
+          height: auto;
+          object-fit: contain;
+          display: block;
+        }}
+        .zoom-modal-caption {{
+          margin-top: 10px;
+          color: #4f6070;
+          font-size: 14px;
+          text-align: center;
+        }}
         @media (max-width: 980px) {{
           .layout {{ grid-template-columns: 1fr; }}
           .slot-preview-grid {{ grid-template-columns: 1fr; }}
@@ -20603,15 +20853,18 @@ def manual_match_review(
           <p>set_num: {escape(str(set_num))}</p>
           <p>bag: {bag_number}</p>
           <div class="progress-summary" id="review-progress-summary">
-            <div class="progress-stat"><strong id="progress-total">0</strong>total slots</div>
-            <div class="progress-stat"><strong id="progress-confirmed">0</strong>confirmed</div>
-            <div class="progress-stat"><strong id="progress-unknown">0</strong>unknown</div>
-            <div class="progress-stat"><strong id="progress-needs">0</strong>needs review</div>
-            <div class="progress-stat"><strong id="progress-percent">0%</strong>complete</div>
+            <div class="progress-stat"><strong id="progress-total">{int(review_progress.get("total_slots", 0) or 0)}</strong>total slots</div>
+            <div class="progress-stat"><strong id="progress-confirmed">{int(review_progress.get("confirmed_only", 0) or 0)}</strong>confirmed</div>
+            <div class="progress-stat"><strong id="progress-ignored">{int(review_progress.get("ignored_only", 0) or 0)}</strong>ignored</div>
+            <div class="progress-stat"><strong id="progress-unknown">{int(review_progress.get("unknown_only", 0) or 0)}</strong>unknown</div>
+            <div class="progress-stat"><strong id="progress-needs">{int(review_progress.get("unresolved_only", 0) or 0)}</strong>needs review</div>
+            <div class="progress-stat"><strong id="progress-percent">{int(review_progress.get("percent_complete", 0) or 0)}%</strong>complete</div>
           </div>
           <div class="progress-actions">
             <button type="button" class="secondary-btn" id="next-unreviewed-btn">Next unreviewed slot</button>
+            <button type="button" class="secondary-btn" id="auto-mask-slots-btn" disabled>Auto Mask Slots</button>
             <span class="slot-empty" id="next-unreviewed-label"></span>
+            <span class="auto-mask-status" id="auto-mask-status"></span>
           </div>
           <div class="status-bar">
             <span id="manual-match-status">Selected crop: none | Selected part: none</span>
@@ -20678,8 +20931,16 @@ def manual_match_review(
           </div>
         </div>
       </div>
+      <div id="crop-zoom-modal" class="zoom-modal" onclick="closeCropZoom()">
+        <div class="zoom-modal-panel" onclick="event.stopPropagation()">
+          <button type="button" class="zoom-modal-close" onclick="closeCropZoom()" aria-label="Close crop zoom">&times;</button>
+          <img id="crop-zoom-image" class="zoom-modal-image" alt="Zoomed preview" />
+          <div id="crop-zoom-caption" class="zoom-modal-caption"></div>
+        </div>
+      </div>
       <script>
         const reviewCrops = {review_crops_json};
+        const reviewProgress = {review_progress_json};
         const reviewParts = {review_parts_json};
         window.legoColors = {lego_colors_json};
         const cropReviewMap = new Map(reviewCrops.map((item) => [String(item.crop_id || ""), item]));
@@ -20727,6 +20988,151 @@ def manual_match_review(
         let selectedSuggestion = null;
         let topCandidates = [];
         let candidateRequestSerial = 0;
+        let autoMaskLoading = false;
+        let nextUnreviewedRequestSerial = 0;
+        function artifactUrl(pathValue, cacheKey) {{
+          const text = String(pathValue || "").trim();
+          if (!text) {{
+            return "";
+          }}
+          let url = "/debug/ai-snap-artifact?path=" + encodeURIComponent(text);
+          if (cacheKey) {{
+            url += "&v=" + encodeURIComponent(String(cacheKey));
+          }}
+          return url;
+        }}
+        function slotCutoutUrl(slot) {{
+          if (!slot) {{
+            return "";
+          }}
+          return String(slot.island_cutout_url || slot.part_cutout_url || "").trim();
+        }}
+        function slotCutoutPath(slot) {{
+          if (!slot) {{
+            return "";
+          }}
+          return String(slot.part_cutout_path || slot.island_cutout_path || "").trim();
+        }}
+        function slotIslandCutoutPath(slot) {{
+          if (!slot) {{
+            return "";
+          }}
+          return String(slot.island_cutout_path || "").trim();
+        }}
+        function slotMaskPreviewUrl(slot) {{
+          if (!slot) {{
+            return "";
+          }}
+          return String(slot.step_masked_url || slot.island_slot_mask_url || "").trim();
+        }}
+        function renderSlotThumbHtml(src, alt, caption, extraClass) {{
+          const url = String(src || "").trim();
+          if (!url) {{
+            return "";
+          }}
+          const className = "slot-slot-thumb" + (extraClass ? (" " + extraClass) : "");
+          return (
+            '<span class="' + className + '">'
+            + '<img src="' + escapeHtml(url) + '" data-src="' + escapeHtml(url) + '" data-caption="' + escapeHtml(caption) + '" '
+            + 'alt="' + escapeHtml(alt) + '" loading="lazy" onclick="openCropZoomFromEl(event, this)" />'
+            + "</span>"
+          );
+        }}
+        function renderSlotButtonHtml(crop, slot) {{
+          if (!crop || !slot) {{
+            return "";
+          }}
+          const cropId = String(crop.crop_id || "");
+          const slotIndex = Number(slot.slot_index);
+          const slotNumber = Number.isFinite(slotIndex) ? slotIndex + 1 : "?";
+          const classes = ["slot-btn"];
+          if (slotConfirmed(slot)) {{
+            classes.push("assigned");
+          }}
+          if (slotUnknown(slot)) {{
+            classes.push("unknown");
+          }}
+          if (slotIgnored(slot)) {{
+            classes.push("ignored");
+          }}
+          if (cropId === selectedCropId && slotIndex === Number(selectedSlotIndex)) {{
+            classes.push("selected");
+          }}
+          const captionBase = "Crop: " + cropId + " | slot " + String(slotNumber);
+          const cutoutHtml = renderSlotThumbHtml(
+            slotCutoutUrl(slot),
+            "slot " + String(slotNumber) + " cutout",
+            captionBase + " slot cutout",
+            "slot-cutout-thumb"
+          );
+          const overlayHtml = renderSlotThumbHtml(
+            slot.slot_window_overlay_url || "",
+            "slot " + String(slotNumber) + " window overlay",
+            captionBase + " window overlay",
+            "slot-overlay-thumb"
+          );
+          const thumbs = cutoutHtml + overlayHtml;
+          const thumbsHtml = thumbs
+            ? ('<span class="slot-slot-thumbs">' + thumbs + "</span>")
+            : ('<span class="slot-slot-thumbs"><span class="slot-slot-thumb slot-thumb-missing">no cutout</span></span>');
+          const labelHtml = renderSlotLabelHtml(slot);
+          return (
+            '<button type="button" class="' + classes.join(" ") + '" data-crop-slot '
+            + 'data-crop-id="' + escapeHtml(cropId) + '" data-slot-index="' + escapeHtml(String(slotIndex)) + '" '
+            + 'data-slot-assigned="' + (slotConfirmed(slot) ? "true" : "false") + '" '
+            + 'data-slot-unknown="' + (slotUnknown(slot) ? "true" : "false") + '" '
+            + 'data-slot-ignored="' + (slotIgnored(slot) ? "true" : "false") + '">'
+            + thumbsHtml
+            + labelHtml
+            + "</button>"
+          );
+        }}
+        function renderCropSlotList(crop) {{
+          if (!crop) {{
+            return;
+          }}
+          const list = document.getElementById("slot-list-" + String(crop.crop_id || ""));
+          if (!list) {{
+            return;
+          }}
+          const slots = Array.isArray(crop.slots) ? crop.slots : [];
+          list.innerHTML = slots.length
+            ? slots.map((slot) => renderSlotButtonHtml(crop, slot)).join("")
+            : (crop.slot_audit_required
+              ? ('<div class="slot-empty">Manual slot audit required: ' + escapeHtml(String(crop.slot_audit_reason || "ambiguous islands")) + "</div>")
+              : '<div class="slot-empty">No qty slots</div>');
+        }}
+        function openCropZoomFromEl(event, el) {{
+          if (!el || !el.dataset) {{
+            return;
+          }}
+          openCropZoom(event, el.dataset.src || el.getAttribute("src") || "", el.dataset.caption || el.dataset.cropId || "");
+        }}
+        function openCropZoom(event, imageSrc, captionText) {{
+          if (event) {{
+            event.stopPropagation();
+          }}
+          const modal = document.getElementById("crop-zoom-modal");
+          const image = document.getElementById("crop-zoom-image");
+          const caption = document.getElementById("crop-zoom-caption");
+          if (!modal || !image || !caption || !imageSrc) {{
+            return;
+          }}
+          image.src = imageSrc;
+          caption.textContent = captionText ? String(captionText) : "";
+          modal.classList.add("open");
+        }}
+        function closeCropZoom() {{
+          const modal = document.getElementById("crop-zoom-modal");
+          const image = document.getElementById("crop-zoom-image");
+          const caption = document.getElementById("crop-zoom-caption");
+          if (!modal || !image || !caption) {{
+            return;
+          }}
+          modal.classList.remove("open");
+          image.removeAttribute("src");
+          caption.textContent = "";
+        }}
         function escapeHtml(value) {{
           return String(value == null ? "" : value)
             .replace(/&/g, "&amp;")
@@ -20755,67 +21161,137 @@ def manual_match_review(
         function slotIgnored(slot) {{
           return !!(slot && slot.ignored);
         }}
+        function slotQtyBadgeText(slot) {{
+          if (!slot || String(slot.slot_source || "") === "island_fallback") {{
+            return "";
+          }}
+          const qtyText = String(slot.qty_text || "").trim();
+          if (qtyText) {{
+            return qtyText;
+          }}
+          const qty = Number(slot.qty);
+          if (Number.isFinite(qty) && qty > 0) {{
+            return String(qty) + "x";
+          }}
+          return "";
+        }}
+        function renderSlotLabelHtml(slot) {{
+          const caption = escapeHtml(slotDisplayText(slot));
+          const qtyBadge = slotQtyBadgeText(slot);
+          if (!qtyBadge) {{
+            return '<span class="slot-btn-label"><span class="slot-btn-caption">' + caption + "</span></span>";
+          }}
+          return (
+            '<span class="slot-btn-label">'
+            + '<span class="slot-btn-qty">' + escapeHtml(qtyBadge) + "</span>"
+            + '<span class="slot-btn-caption">' + caption + "</span>"
+            + "</span>"
+          );
+        }}
+        function slotDisplayText(slot) {{
+          if (!slot) {{
+            return "needs review";
+          }}
+          const slotIndex = Number(slot.slot_index);
+          const slotNumber = Number.isFinite(slotIndex) ? slotIndex + 1 : "?";
+          if (slotConfirmed(slot)) {{
+            const label = slot.saved_label || {{}};
+            const qty = String(label.qty_text || slot.qty_text || "").trim();
+            return (
+              "Slot " + String(slotNumber) + ": "
+              + String(label.part_num || "") + " / " + String(label.color_id || "")
+              + (qty ? " " + qty : "")
+            ).trim();
+          }}
+          if (slotUnknown(slot)) {{
+            return "Slot " + String(slotNumber) + ": UNKNOWN";
+          }}
+          if (slotIgnored(slot)) {{
+            return "Slot " + String(slotNumber) + ": IGNORED";
+          }}
+          return String(slot.display_text || ("Slot " + String(slotNumber) + ": needs review"));
+        }}
+        function slotReviewStatus(slot) {{
+          if (slotIgnored(slot)) {{
+            return "ignored";
+          }}
+          if (slotUnknown(slot)) {{
+            return "unknown";
+          }}
+          if (slotConfirmed(slot)) {{
+            return "confirmed";
+          }}
+          return "needs_review";
+        }}
         function computeProgress() {{
-          let total = 0;
-          let confirmed = 0;
-          let unknown = 0;
-          let ignored = 0;
+          const counts = {{
+            confirmed: 0,
+            ignored: 0,
+            unknown: 0,
+            needs_review: 0,
+          }};
           reviewCrops.forEach((crop) => {{
             (Array.isArray(crop.slots) ? crop.slots : []).forEach((slot) => {{
-              total += 1;
-              if (slotConfirmed(slot)) {{
-                confirmed += 1;
-              }} else if (slotUnknown(slot)) {{
-                unknown += 1;
-              }} else if (slotIgnored(slot)) {{
-                ignored += 1;
+              const status = slotReviewStatus(slot);
+              if (Object.prototype.hasOwnProperty.call(counts, status)) {{
+                counts[status] += 1;
+              }} else {{
+                counts.needs_review += 1;
               }}
             }});
           }});
-          const complete = confirmed + unknown + ignored;
-          const needs = Math.max(0, total - complete);
-          return {{ total, confirmed, unknown, ignored, needs, complete, percent: total ? Math.round((complete / total) * 100) : 0 }};
+          const total_slots = counts.confirmed + counts.ignored + counts.unknown + counts.needs_review;
+          const complete = total_slots - counts.needs_review;
+          return {{
+            total_slots,
+            confirmed_only: counts.confirmed,
+            ignored_only: counts.ignored,
+            unknown_only: counts.unknown,
+            unresolved_only: counts.needs_review,
+            percent_complete: total_slots ? Math.round((complete / total_slots) * 100) : 0,
+          }};
         }}
-        function findNextUnreviewed(fromCropId, fromSlotIndex, includeCurrent) {{
-          const flat = [];
-          reviewCrops.forEach((crop) => {{
-            (Array.isArray(crop.slots) ? crop.slots : []).forEach((slot) => {{
-              flat.push({{ crop, slot }});
+        async function fetchNextUnreviewed(fromCropId, fromSlotIndex, includeCurrent) {{
+          const requestId = ++nextUnreviewedRequestSerial;
+          try {{
+            const res = await fetch("/debug/next-unreviewed-slot", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{
+                set_num: {json.dumps(str(set_num))},
+                bag: {bag_number},
+                from_crop_id: String(fromCropId || ""),
+                from_slot_index: fromSlotIndex === null || fromSlotIndex === undefined ? null : Number(fromSlotIndex),
+                include_current: !!includeCurrent,
+              }}),
             }});
-          }});
-          if (!flat.length) {{
+            if (requestId !== nextUnreviewedRequestSerial) {{
+              return null;
+            }}
+            if (!res.ok) {{
+              return null;
+            }}
+            const data = await res.json();
+            if (!data || !data.found) {{
+              return null;
+            }}
+            return {{
+              crop_id: String(data.crop_id || ""),
+              slot_index: Number(data.slot_index),
+            }};
+          }} catch (_error) {{
             return null;
           }}
-          let start = flat.findIndex((item) => String(item.crop.crop_id || "") === String(fromCropId || "") && Number(item.slot.slot_index) === Number(fromSlotIndex));
-          if (start < 0) {{
-            start = -1;
-          }}
-          const firstOffset = includeCurrent ? 0 : 1;
-          for (let offset = firstOffset; offset <= flat.length; offset += 1) {{
-            const item = flat[(start + offset + flat.length) % flat.length];
-            if (item && !slotConfirmed(item.slot) && !slotUnknown(item.slot)) {{
-              return item;
-            }}
-          }}
-          return null;
         }}
-        function renderProgress() {{
-          const progress = computeProgress();
-          const setters = [
-            ["progress-total", progress.total],
-            ["progress-confirmed", progress.confirmed],
-            ["progress-unknown", progress.unknown],
-            ["progress-needs", progress.needs],
-            ["progress-percent", progress.percent + "%"],
-          ];
-          setters.forEach(([id, value]) => {{
-            const el = document.getElementById(id);
-            if (el) {{
-              el.textContent = String(value);
-            }}
-          }});
-          const next = findNextUnreviewed(selectedCropId, selectedSlotIndex === null ? -1 : selectedSlotIndex, false)
-            || findNextUnreviewed("", -1, true);
+        async function refreshNextUnreviewedLabel() {{
+          let next = await fetchNextUnreviewed(
+            selectedCropId,
+            selectedSlotIndex === null ? null : selectedSlotIndex,
+            false
+          );
+          if (!next) {{
+            next = await fetchNextUnreviewed("", null, true);
+          }}
           const nextButton = document.getElementById("next-unreviewed-btn");
           const nextLabel = document.getElementById("next-unreviewed-label");
           if (nextButton) {{
@@ -20823,14 +21299,128 @@ def manual_match_review(
           }}
           if (nextLabel) {{
             nextLabel.textContent = next
-              ? ("next: " + String(next.crop.crop_id || "") + " slot " + String(Number(next.slot.slot_index) + 1))
+              ? ("next: " + String(next.crop_id || "") + " slot " + String(Number(next.slot_index) + 1))
               : "all slots reviewed";
+          }}
+          return next;
+        }}
+        function renderProgress() {{
+          const progress = computeProgress();
+          const setters = [
+            ["progress-total", progress.total_slots],
+            ["progress-confirmed", progress.confirmed_only],
+            ["progress-ignored", progress.ignored_only],
+            ["progress-unknown", progress.unknown_only],
+            ["progress-needs", progress.unresolved_only],
+            ["progress-percent", progress.percent_complete + "%"],
+          ];
+          setters.forEach(([id, value]) => {{
+            const el = document.getElementById(id);
+            if (el) {{
+              el.textContent = String(value);
+            }}
+          }});
+          refreshNextUnreviewedLabel();
+        }}
+        async function selectNextUnreviewed(includeCurrent) {{
+          let next = await fetchNextUnreviewed(
+            selectedCropId,
+            selectedSlotIndex === null ? null : selectedSlotIndex,
+            !!includeCurrent
+          );
+          if (!next && !includeCurrent) {{
+            next = await fetchNextUnreviewed("", null, true);
+          }}
+          if (next) {{
+            selectSlot(next.crop_id, next.slot_index);
+          }}
+        }}
+        function updateAutoMaskButton() {{
+          const button = document.getElementById("auto-mask-slots-btn");
+          if (!button) {{
+            return;
+          }}
+          button.disabled = autoMaskLoading || !selectedCropId;
+          button.textContent = autoMaskLoading ? "Auto masking..." : "Auto Mask Slots";
+        }}
+        function applyAutoMaskSlotsToCrop(crop, maskSlots, generatedAt) {{
+          if (!crop || !Array.isArray(maskSlots)) {{
+            return;
+          }}
+          const slots = Array.isArray(crop.slots) ? crop.slots : [];
+          maskSlots.forEach((maskSlot) => {{
+            const slotIndex = Number(maskSlot && maskSlot.slot_index);
+            const slot = slots.find((item) => Number(item.slot_index) === slotIndex);
+            if (!slot) {{
+              return;
+            }}
+            slot.part_cutout_path = String(maskSlot.part_cutout_path || "");
+            slot.step_masked_path = String(maskSlot.step_masked_path || "");
+            slot.slot_window_overlay_path = String(maskSlot.slot_window_overlay_path || "");
+            slot.part_cutout_url = artifactUrl(slot.part_cutout_path, generatedAt);
+            slot.step_masked_url = artifactUrl(slot.step_masked_path, generatedAt);
+            slot.slot_window_overlay_url = artifactUrl(slot.slot_window_overlay_path, generatedAt);
+          }});
+        }}
+        async function runAutoMaskSlots() {{
+          const crop = selectedCrop();
+          if (!crop || autoMaskLoading) {{
+            return;
+          }}
+          autoMaskLoading = true;
+          updateAutoMaskButton();
+          const status = document.getElementById("auto-mask-status");
+          if (status) {{
+            status.textContent = "Auto masking " + String(crop.crop_id || "") + "...";
+          }}
+          try {{
+            const res = await fetch("/debug/auto-mask-slots", {{
+              method: "POST",
+              headers: {{"Content-Type": "application/json"}},
+              body: JSON.stringify({{
+                set_num: {json.dumps(str(set_num))},
+                bag: {bag_number},
+                crop_id: crop.crop_id,
+              }}),
+            }});
+            if (!res.ok) {{
+              let detail = "Auto mask failed";
+              try {{
+                const errorPayload = await res.json();
+                detail = errorPayload.detail || detail;
+              }} catch (_error) {{}}
+              if (status) {{
+                status.textContent = detail;
+              }}
+              return;
+            }}
+            const result = await res.json();
+            const maskSlots = Array.isArray(result && result.slots) ? result.slots : [];
+            const generatedAt = String(result && result.generated_at || "");
+            applyAutoMaskSlotsToCrop(crop, maskSlots, generatedAt);
+            const maskedCount = maskSlots.filter((slot) => String(slot && slot.status || "") === "masked").length;
+            if (status) {{
+              status.textContent = "Auto masked " + maskedCount + " / " + maskSlots.length + " slots for " + String(crop.crop_id || "");
+            }}
+            renderCropSlotList(crop);
+            renderSlotReviewPanel();
+            if (selectedSlotIndex !== null) {{
+              await loadTopCandidates();
+            }}
+          }} catch (error) {{
+            if (status) {{
+              status.textContent = "Auto mask failed: " + String(error);
+            }}
+          }} finally {{
+            autoMaskLoading = false;
+            updateAutoMaskButton();
           }}
         }}
         function selectSlot(cropId, slotIndex) {{
           selectedCropId = String(cropId || "");
           selectedSlotIndex = slotIndex === null ? null : Number(slotIndex);
           selectedSuggestion = null;
+          selectedPartKey = "";
           topCandidates = [];
           refreshSlotUI();
           updateManualMatchStatus();
@@ -20838,12 +21428,7 @@ def manual_match_review(
           if (selectedSlotIndex !== null) {{
             loadTopCandidates();
           }}
-        }}
-        function selectNextUnreviewed(includeCurrent) {{
-          const next = findNextUnreviewed(selectedCropId, selectedSlotIndex === null ? -1 : selectedSlotIndex, !!includeCurrent);
-          if (next) {{
-            selectSlot(next.crop.crop_id, next.slot.slot_index);
-          }}
+          updateAutoMaskButton();
         }}
         function imageSrcForLocalPath(path) {{
           const text = String(path || "");
@@ -20859,10 +21444,11 @@ def manual_match_review(
           }}
           return imageSrcForLocalPath((candidate && candidate.image_path) || "");
         }}
-        function renderImageTile(title, src, emptyText) {{
+        function renderImageTile(title, src, emptyText, zoomCaption) {{
+          const caption = zoomCaption || title;
           return `
             <figure class="slot-preview-tile">
-              <div class="slot-preview-frame">${{src ? `<img src="${{escapeHtml(src)}}" alt="${{escapeHtml(title)}}" />` : `<span class="slot-empty">${{escapeHtml(emptyText || "unavailable")}}</span>`}}</div>
+              <div class="slot-preview-frame">${{src ? `<img src="${{escapeHtml(src)}}" alt="${{escapeHtml(title)}}" data-src="${{escapeHtml(src)}}" data-caption="${{escapeHtml(caption)}}" onclick="openCropZoomFromEl(event, this)" />` : `<span class="slot-empty">${{escapeHtml(emptyText || "unavailable")}}</span>`}}</div>
               <figcaption>${{escapeHtml(title)}}</figcaption>
             </figure>
           `;
@@ -20893,10 +21479,12 @@ def manual_match_review(
             meta.textContent = "crop_id: " + String(crop.crop_id || "") + " | slot_index: " + String(slot.slot_index) + " | page " + String(crop.page || "?") + " | step " + String(crop.step || "?");
           }}
           if (grid) {{
+            const cropCaption = "Crop: " + String(crop.crop_id || "");
+            const slotCaption = cropCaption + " | slot " + String(Number(slot.slot_index) + 1);
             grid.innerHTML = [
-              renderImageTile("original crop", crop.original_data_uri || "", "original unavailable"),
-              renderImageTile("step segmented cutout", slot.step_masked_url || "", "no step mask"),
-              renderImageTile("part cutout", slot.part_cutout_url || "", "no part cutout"),
+              renderImageTile("original crop", crop.original_data_uri || "", "original unavailable", cropCaption),
+              renderImageTile("slot mask", slotMaskPreviewUrl(slot), "no slot mask", slotCaption + " slot mask"),
+              renderImageTile("slot cutout", slotCutoutUrl(slot), "no slot cutout", slotCaption + " slot cutout"),
             ].join("");
           }}
           if (savedBox) {{
@@ -20971,7 +21559,8 @@ def manual_match_review(
               crop_id: crop.crop_id,
               slot_index: slot.slot_index,
               step_masked_path: slot.step_masked_path || "",
-              part_cutout_path: slot.part_cutout_path || "",
+              part_cutout_path: String(slot.part_cutout_path || "").trim(),
+              island_slot_cutout_path: slotIslandCutoutPath(slot),
             }};
             const res = await fetch("/debug/buildability-clip-suggest", {{
               method: "POST",
@@ -21093,7 +21682,7 @@ def manual_match_review(
           renderProgress();
           renderSlotReviewPanel();
           if (moveNext) {{
-            selectNextUnreviewed(false);
+            await selectNextUnreviewed(false);
           }}
           return true;
         }}
@@ -21133,7 +21722,7 @@ def manual_match_review(
           refreshSlotUI();
           renderProgress();
           renderSlotReviewPanel();
-          selectNextUnreviewed(false);
+          await selectNextUnreviewed(false);
         }}
         async function ignoreCurrentSlot() {{
           const crop = selectedCrop();
@@ -21171,7 +21760,7 @@ def manual_match_review(
           refreshSlotUI();
           renderProgress();
           renderSlotReviewPanel();
-          selectNextUnreviewed(false);
+          await selectNextUnreviewed(false);
         }}
         function isMetallicStyleColorName(colorName) {{
           const normalized = String(colorName || "").toLowerCase();
@@ -21305,6 +21894,15 @@ def manual_match_review(
         function setCropPickerActive(isActive) {{
           cropPickerActive = !!isActive;
           syncCropPickerUI();
+          const frame = document.getElementById("manual-crop-preview-frame");
+          const image = frame ? frame.querySelector("img") : null;
+          if (image) {{
+            if (cropPickerActive) {{
+              image.removeAttribute("onclick");
+            }} else {{
+              image.setAttribute("onclick", "openCropZoomFromEl(event, this)");
+            }}
+          }}
         }}
         function sampleNearestCandidateColourFromPreview(event) {{
           if (!cropPickerActive) {{
@@ -21386,20 +21984,7 @@ def manual_match_review(
         }}
         function refreshSlotUI() {{
           reviewCrops.forEach((crop) => {{
-            document.querySelectorAll('[data-crop-slot][data-crop-id="' + crop.crop_id + '"]').forEach((node) => {{
-              const idx = Number(node.dataset.slotIndex || -1);
-              const slot = (Array.isArray(crop.slots) ? crop.slots : []).find((item) => Number(item.slot_index) === idx);
-              const assigned = slotConfirmed(slot);
-              const unknown = slotUnknown(slot);
-              const ignored = slotIgnored(slot);
-              node.dataset.slotAssigned = assigned ? "true" : "false";
-              node.dataset.slotUnknown = unknown ? "true" : "false";
-              node.dataset.slotIgnored = ignored ? "true" : "false";
-              node.classList.toggle("assigned", assigned);
-              node.classList.toggle("unknown", unknown);
-              node.classList.toggle("ignored", ignored);
-              node.classList.toggle("selected", crop.crop_id === selectedCropId && idx === selectedSlotIndex);
-            }});
+            renderCropSlotList(crop);
             const cropTile = document.querySelector('[data-crop-tile][data-crop-id="' + crop.crop_id + '"]');
             if (cropTile) {{
               cropTile.classList.toggle("selected", crop.crop_id === selectedCropId);
@@ -21432,9 +22017,15 @@ def manual_match_review(
           frame.innerHTML = "";
           if (sourceImage) {{
             const previewImage = sourceImage.cloneNode(true);
-            previewImage.removeAttribute("onclick");
             previewImage.removeAttribute("loading");
-            previewImage.removeAttribute("data-src");
+            previewImage.dataset.src = sourceImage.dataset.src || sourceImage.getAttribute("src") || "";
+            previewImage.dataset.caption = "Crop: " + String(crop.crop_id || "");
+            previewImage.dataset.cropId = String(crop.crop_id || "");
+            if (cropPickerActive) {{
+              previewImage.removeAttribute("onclick");
+            }} else {{
+              previewImage.setAttribute("onclick", "openCropZoomFromEl(event, this)");
+            }}
             frame.appendChild(previewImage);
           }} else {{
             frame.textContent = "Crop preview unavailable";
@@ -21448,19 +22039,20 @@ def manual_match_review(
           const sequence = Array.isArray(crop.slot_sequence) ? crop.slot_sequence : [];
           const detailSlots = Array.isArray(crop.slots) ? crop.slots : [];
           slots.innerHTML = sequence.length
-            ? sequence.map((slot, idx) => `
-                <button
-                  type="button"
-                  class="slot-btn${{slotConfirmed(detailSlots.find((item) => Number(item.slot_index) === idx)) ? " assigned" : ""}}${{slotUnknown(detailSlots.find((item) => Number(item.slot_index) === idx)) ? " unknown" : ""}}${{slotIgnored(detailSlots.find((item) => Number(item.slot_index) === idx)) ? " ignored" : ""}}${{idx === Number(selectedSlotIndex) ? " selected" : ""}}"
-                  data-preview-slot-index="${{idx}}"
-                >
-                  Slot ${{idx + 1}}: ${{slot && (slot.qty_text || slot.qty || "none")}}
-                </button>
-              `).join("")
+            ? sequence.map((slot, idx) => {{
+                const detailSlot = detailSlots.find((item) => Number(item.slot_index) === idx) || {{
+                  slot_index: idx,
+                  slot_source: String((slot && slot.slot_source) || crop.slot_source || ""),
+                  qty_text: slot && slot.qty_text ? slot.qty_text : "",
+                  qty: slot && slot.qty != null ? slot.qty : null,
+                  display_text: "Slot " + String(idx + 1) + ": " + String((slot && (slot.qty_text || slot.qty)) || "none"),
+                }};
+                return renderSlotButtonHtml(crop, detailSlot);
+              }}).join("")
             : '<div class="slot-empty">No qty slots</div>';
-          slots.querySelectorAll("[data-preview-slot-index]").forEach((button) => {{
+          slots.querySelectorAll("[data-crop-slot]").forEach((button) => {{
             button.addEventListener("click", () => {{
-              selectSlot(String(crop.crop_id || ""), Number(button.dataset.previewSlotIndex || 0));
+              selectSlot(String(crop.crop_id || ""), Number(button.dataset.slotIndex || 0));
             }});
           }});
           syncCropPickerUI();
@@ -21488,25 +22080,24 @@ def manual_match_review(
           refreshSlotUI();
           updateManualMatchStatus();
         }}
-        document.querySelectorAll("[data-crop-slot]").forEach((el) => {{
-          el.addEventListener("click", () => {{
-            selectSlot(String(el.dataset.cropId || ""), Number(el.dataset.slotIndex || 0));
-          }});
-        }});
-        document.querySelectorAll("[data-crop-tile]").forEach((el) => {{
-          el.addEventListener("click", (event) => {{
-            if (event.target.closest("[data-crop-slot]")) {{
-              return;
-            }}
-            selectedCropId = String(el.dataset.cropId || "");
-            selectedSlotIndex = null;
-            selectedSuggestion = null;
-            topCandidates = [];
-            refreshSlotUI();
-            updateManualMatchStatus();
-            renderSlotReviewPanel();
-            renderCandidateSuggestions("Select a slot to fetch suggestions.");
-          }});
+        document.getElementById("manual-crop-grid-wrap")?.addEventListener("click", (event) => {{
+          const slotBtn = event.target.closest("[data-crop-slot]");
+          if (slotBtn && slotBtn.closest("#manual-crop-grid-wrap")) {{
+            selectSlot(String(slotBtn.dataset.cropId || ""), Number(slotBtn.dataset.slotIndex || 0));
+            return;
+          }}
+          const tile = event.target.closest("[data-crop-tile]");
+          if (!tile || event.target.closest("[data-crop-slot]")) {{
+            return;
+          }}
+          selectedCropId = String(tile.dataset.cropId || "");
+          selectedSlotIndex = null;
+          selectedSuggestion = null;
+          topCandidates = [];
+          refreshSlotUI();
+          updateManualMatchStatus();
+          renderSlotReviewPanel();
+          renderCandidateSuggestions("Select a slot to fetch suggestions.");
         }});
         document.getElementById("manual-crop-preview-close")?.addEventListener("click", () => {{
           previewDismissed = true;
@@ -21568,9 +22159,18 @@ def manual_match_review(
         document.getElementById("reload-candidates-btn")?.addEventListener("click", async () => {{
           await loadTopCandidates();
         }});
-        document.getElementById("next-unreviewed-btn")?.addEventListener("click", () => {{
-          selectNextUnreviewed(false);
+        document.getElementById("next-unreviewed-btn")?.addEventListener("click", async () => {{
+          await selectNextUnreviewed(false);
         }});
+        document.getElementById("auto-mask-slots-btn")?.addEventListener("click", async () => {{
+          await runAutoMaskSlots();
+        }});
+        document.addEventListener("keydown", (event) => {{
+          if (event.key === "Escape") {{
+            closeCropZoom();
+          }}
+        }});
+        updateAutoMaskButton();
         renderCandidateFilterControls();
         applyActiveColourFilter();
         refreshSlotUI();
