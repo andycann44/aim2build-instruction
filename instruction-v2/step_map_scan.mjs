@@ -242,9 +242,9 @@ async function readPrintedStepNumber(sharp, imagePath, box, width, height, tmpDi
       rejectedReads.push({ raw_text: text, value, source: variant.name, reason: "invalid_step_number_1000_or_more" });
       continue;
     }
-    // V1: reject implausible step values for this instruction set
-    if (value > 200) {
-      rejectedReads.push({ raw_text: text, value, source: variant.name, reason: "implausible_step_value_exceeds_200" });
+    // V1 parity: keep anchors in 0 < step_number < 1000 (instruction_debug anchor filter)
+    if (value >= 1000) {
+      rejectedReads.push({ raw_text: text, value, source: variant.name, reason: "invalid_step_number_1000_or_more" });
       continue;
     }
     const componentCount = Number(box.components || 0);
@@ -320,9 +320,9 @@ function filterInvalidStepNumber(value) {
   if (parsed >= 1000) {
     return { step_number: null, rejection_reason: "invalid_step_number_1000_or_more" };
   }
-  // V1: implausible step values rejected before entering candidate pool
-  if (parsed > 200) {
-    return { step_number: null, rejection_reason: "implausible_step_value_exceeds_200" };
+  // V1 parity: 0 < step_number < 1000
+  if (parsed >= 1000) {
+    return { step_number: null, rejection_reason: "invalid_step_number_1000_or_more" };
   }
   return { step_number: parsed, rejection_reason: null };
 }
@@ -414,6 +414,94 @@ function groupPassesStepShape(box, width, height) {
 }
 
 
+function boxOverlapRatio(a, b) {
+  const xOverlap = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const yOverlap = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  if (xOverlap <= 0 || yOverlap <= 0) return 0;
+  const intersection = xOverlap * yOverlap;
+  const minArea = Math.min(a.w * a.h, b.w * b.h);
+  return intersection / Math.max(1, minArea);
+}
+
+
+function boxesVisuallyMatch(a, b) {
+  if (boxOverlapRatio(a, b) >= 0.55) return true;
+  return (
+    Math.abs(Number(a.x) - Number(b.x)) <= 3
+    && Math.abs(Number(a.y) - Number(b.y)) <= 3
+    && Math.abs(Number(a.w) - Number(b.w)) <= 4
+    && Math.abs(Number(a.h) - Number(b.h)) <= 4
+  );
+}
+
+
+function mergeNeighboringGroups(groups) {
+  let merged = groups.map((group) => ({ ...group }));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const next = [];
+    for (const group of sortComponentsForGrouping(merged)) {
+      let matched = null;
+      for (const existing of next) {
+        const yOverlap = Math.min(group.y + group.h, existing.y + existing.h) - Math.max(group.y, existing.y);
+        const minHeight = Math.max(1, Math.min(group.h, existing.h));
+        const gap = group.x - (existing.x + existing.w);
+        if (yOverlap / minHeight >= 0.75 && gap >= -2 && gap <= 8) {
+          matched = existing;
+          break;
+        }
+      }
+      if (matched) {
+        const x2 = Math.max(matched.x + matched.w, group.x + group.w);
+        const y2 = Math.max(matched.y + matched.h, group.y + group.h);
+        matched.x = Math.min(matched.x, group.x);
+        matched.y = Math.min(matched.y, group.y);
+        matched.w = x2 - matched.x;
+        matched.h = y2 - matched.y;
+        matched.components = Number(matched.components || 1) + Number(group.components || 1);
+        matched.pixels = Number(matched.pixels || 0) + Number(group.pixels || 0);
+        changed = true;
+      } else {
+        next.push({ ...group });
+      }
+    }
+    merged = next;
+  }
+  return merged;
+}
+
+
+function correctSamePageSequentialOcr(steps) {
+  const valid = steps
+    .filter((step) => Number(step.step_number) > 0 && step.step_box)
+    .sort((a, b) => Number(a.step_box.y) - Number(b.step_box.y) || Number(a.step_box.x) - Number(b.step_box.x));
+  for (let idx = 1; idx < valid.length; idx += 1) {
+    const previous = valid[idx - 1];
+    const current = valid[idx];
+    const expected = Number(previous.step_number) + 1;
+    const currentValue = Number(current.step_number);
+    if (!Number.isFinite(expected) || !Number.isFinite(currentValue) || currentValue === expected) continue;
+    const currentText = String(currentValue);
+    const expectedText = String(expected);
+    if (currentText.length !== expectedText.length) continue;
+    let diffCount = 0;
+    for (let pos = 0; pos < currentText.length; pos += 1) {
+      if (currentText[pos] !== expectedText[pos]) diffCount += 1;
+    }
+    if (diffCount === 1) {
+      current.step_number = expected;
+      current.signals = {
+        ...(current.signals || {}),
+        step_number_sequence_corrected: true,
+        step_number_before_sequence_correction: currentValue,
+        step_number_expected_from_previous: expected,
+      };
+    }
+  }
+}
+
+
 function collectStepGroups(dark, width, height, fullPage = false) {
   const seen = new Uint8Array(dark.length);
   const components = [];
@@ -427,8 +515,10 @@ function collectStepGroups(dark, width, height, fullPage = false) {
     }
   }
 
-  return groupComponents(components)
-    .filter((box) => groupPassesStepShape(box, width, height))
+  return mergeNeighboringGroups(
+    groupComponents(components)
+      .filter((box) => groupPassesStepShape(box, width, height))
+  )
     .map((box) => ({ ...box, confidence: fullPage ? auditBoxScore(box, width, height) : boxScore(box, width, height) }))
     .filter((box) => box.confidence >= (fullPage ? 0.72 : 0.78))
     .sort((a, b) => b.confidence - a.confidence || a.y - b.y)
@@ -521,18 +611,24 @@ async function analyzePage(sharp, repoRoot, pageEntry, bagNumber, debugDir, tmpD
   for (let idx = 0; idx < groups.length; idx += 1) {
     const box = groups[idx];
     const stepIndex = idx + 1;
-    const fullPageMatch = fullPageGroups.find((candidate) => (
-      Math.abs(Number(candidate.x) - Number(box.x)) <= 3
-      && Math.abs(Number(candidate.y) - Number(box.y)) <= 3
-      && Math.abs(Number(candidate.w) - Number(box.w)) <= 4
-      && Math.abs(Number(candidate.h) - Number(box.h)) <= 4
-    ));
-    box.step_number = fullPageMatch ? fullPageMatch.step_number : null;
-    box.step_number_rejection_reason = fullPageMatch ? fullPageMatch.step_number_rejection_reason : null;
-    box.step_number_confidence = fullPageMatch ? fullPageMatch.step_number_confidence : 0;
-    box.step_number_source = fullPageMatch ? fullPageMatch.step_number_source : "full_page_audit_no_matching_read";
-    box.step_number_raw_text = fullPageMatch ? fullPageMatch.step_number_raw_text : "";
-    box.step_number_rejected_reads = fullPageMatch ? fullPageMatch.step_number_rejected_reads : [];
+    const fullPageMatch = fullPageGroups.find((candidate) => boxesVisuallyMatch(candidate, box));
+    if (fullPageMatch) {
+      box.step_number = fullPageMatch.step_number;
+      box.step_number_rejection_reason = fullPageMatch.step_number_rejection_reason;
+      box.step_number_confidence = fullPageMatch.step_number_confidence;
+      box.step_number_source = fullPageMatch.step_number_source;
+      box.step_number_raw_text = fullPageMatch.step_number_raw_text;
+      box.step_number_rejected_reads = fullPageMatch.step_number_rejected_reads;
+    } else {
+      const read = await readPrintedStepNumber(sharp, imagePath, box, width, height, tmpDir, pageEntry.page, stepIndex);
+      const filteredStep = filterInvalidStepNumber(read.value);
+      box.step_number = filteredStep.step_number;
+      box.step_number_rejection_reason = filteredStep.rejection_reason || read.rejection_reason || null;
+      box.step_number_confidence = read.confidence;
+      box.step_number_source = read.source;
+      box.step_number_raw_text = read.raw_text;
+      box.step_number_rejected_reads = read.rejected_reads || [];
+    }
     box.step_index = stepIndex;
     const stepLabel = box.step_number === null || box.step_number === undefined ? "?" : String(box.step_number);
     overlayRects.push(`<rect x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" fill="none" stroke="#ffcc00" stroke-width="5"/><rect x="${box.x}" y="${Math.max(0, box.y - 32)}" width="210" height="30" fill="black" opacity="0.82"/><text x="${box.x + 6}" y="${Math.max(20, box.y - 10)}" font-family="Arial" font-size="18" fill="#ffcc00">page ${pageEntry.page} · step ${stepLabel}</text>`);
@@ -563,6 +659,7 @@ async function analyzePage(sharp, repoRoot, pageEntry, bagNumber, debugDir, tmpD
       step_number_rejected_reads: box.step_number_rejected_reads,
     },
   }));
+  correctSamePageSequentialOcr(steps);
 
   // V1: audit candidates without a readable step number cannot participate in sequence gap recovery
   const audit_candidates = fullPageGroups.filter((box) => box.step_number !== null && box.step_number !== undefined).map((box) => ({
