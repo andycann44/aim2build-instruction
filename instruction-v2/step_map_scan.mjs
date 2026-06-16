@@ -46,9 +46,36 @@ function componentBox(pixels, width, height, startX, startY, seen) {
 }
 
 
+function componentsOnSameBaseline(a, b) {
+  const yOverlap = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  const minHeight = Math.max(1, Math.min(a.h, b.h));
+  return yOverlap / minHeight >= 0.80;
+}
+
+
+function sortComponentsForGrouping(components) {
+  const sorted = [...components].sort((a, b) => a.y - b.y || a.x - b.x);
+  const rows = [];
+  for (const component of sorted) {
+    let row = null;
+    for (const candidate of rows) {
+      if (componentsOnSameBaseline(component, candidate[0])) {
+        row = candidate;
+        break;
+      }
+    }
+    if (row) row.push(component);
+    else rows.push([component]);
+  }
+  return rows
+    .sort((a, b) => Math.min(...a.map((c) => c.y)) - Math.min(...b.map((c) => c.y)))
+    .flatMap((row) => row.sort((a, b) => a.x - b.x));
+}
+
+
 function groupComponents(components) {
   const groups = [];
-  for (const component of components.sort((a, b) => a.y - b.y || a.x - b.x)) {
+  for (const component of sortComponentsForGrouping(components)) {
     let matched = null;
     for (const group of groups) {
       const yOverlap = Math.min(component.y + component.h, group.y + group.h) - Math.max(component.y, group.y);
