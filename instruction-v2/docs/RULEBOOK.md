@@ -19,6 +19,9 @@ Documentation only. Rules listed here are **extracted from existing parity docum
 | `BAG3_STEP_NUMBER_STATISTICS_AUDIT.md` | Bag 3 visual size cluster audit |
 | `BAG4_PARITY_SIGNOFF.md` | Bag 4 in-progress checks, human-review exceptions |
 | `BEHAVIOUR_AUDIT.md` | V2 stage weaknesses and review authority notes |
+| `reports/STEP_SEQUENCE_AUDIT.md` | Global step sequence coherence audit (Bags 1–15) |
+| `reports/STEP_PARITY_REVIEW_PACK.md` | Visual review pack — Bags 10, 13, 14 sequence failures |
+| `reports/STEP_ANCHOR_FAILURES.md` | Step anchor failure catalogue from parity investigation |
 
 **Not used:** `docs/parity/BAG4_PARITY_SIGNOFF.md` (empty file).
 
@@ -79,6 +82,8 @@ Documentation only. Rules listed here are **extracted from existing parity docum
 
 ### Sequence plausibility
 
+See also **§ Sequence Plausibility Rules** (SP1–SP6, `PARITY_RULE`, proven 2026-06-15).
+
 | Rule | Purpose | Source | V2 status | Evidence |
 |---|---|---|---|---|
 | **No synthetic numbering** | Never invent step numbers from index or gap fill | `V1_BEHAVIOUR_CONTRACTS.md` §2; `V1_RECOVERY_PORT_PLAN.md` | Partial | "No synthetic numbering is allowed." |
@@ -121,6 +126,100 @@ Documentation only. Rules listed here are **extracted from existing parity docum
 | **V1 crop cache import before regenerate** | Persisted V1 crop truth is authoritative for proven pages | `V1_STEP_SOURCE_AUDIT.md` §Recommendation; `V1_RECOVERY_PORT_PLAN.md` | Yes Bags 1–3 | "Do not port raw step detection as the next recovery item"; import `debug/crop_cache/{set_num}_bag{bag}.json` first. |
 | **Page 81 is bag start, not step proof** | Bag-start pages are out of step-detection scope | `V1_STEP_SOURCE_AUDIT.md` §Page 81 | N/A | "Page 81 is a bag start, not a step/crop proof page." |
 | **V1 step guardrails to port** | Named functions for printed-number recovery | `V1_CURRENT_VS_OLD_GUARDRAIL_AUDIT.md` §Step Guardrails | Not exact parity | `_detect_page_step_number_boxes`, `_detect_step_number_below_panel` — "port now". |
+
+---
+
+## Sequence Plausibility Rules
+
+**Status:** PROVEN BY PARITY INVESTIGATION  
+**Date:** 2026-06-15  
+**Classification:** `PARITY_RULE` (not `AUDIT_HYPOTHESIS`)
+
+**Sources:**
+
+| Report | Role |
+|---|---|
+| `reports/STEP_SEQUENCE_AUDIT.md` | Per-bag sequence coherence; main-chain analysis; backwards jumps and large gaps |
+| `reports/STEP_PARITY_REVIEW_PACK.md` | Visual evidence for Bags 10, 13, 14 failures (OCR swaps, bag-label noise) |
+| `reports/STEP_ANCHOR_FAILURES.md` | Catalogue of step anchor acceptance failures |
+| `BAG3_PARITY_SIGNOFF.md` | Sequence-gap full-page audit rule (gap recovery scope) |
+
+These rules codify findings from the Step Map parity investigation. They describe **required acceptance behaviour** for Stage 4 (`step_map_scan.mjs`). Runtime does not yet enforce all of them — see SP3.
+
+---
+
+### SP1 — Global steps are sequential
+
+| Field | Value |
+|---|---|
+| **ID** | SP1 |
+| **Classification** | `PARITY_RULE` |
+| **Rule** | Global build steps are expected to increase by **+1**. |
+| **Example** | 323 → 324 → 325 → 326 → 327 |
+| **Evidence** | `STEP_SEQUENCE_AUDIT.md` — dominant main chain 1→527 when spurious lows filtered |
+
+Large jumps require evidence (see SP2, SP3).
+
+---
+
+### SP2 — Large jumps are suspicious
+
+| Field | Value |
+|---|---|
+| **ID** | SP2 |
+| **Classification** | `PARITY_RULE` |
+| **Rule** | A step number must not be accepted merely because it is larger than the previous global step. |
+| **Examples** | 324 → 345 (printed 325; OCR 2↔4 swap). 423 → 474 (printed 424; OCR 4↔7 swap). |
+| **Threshold** | Jump greater than the existing gap-recovery threshold (**6**) requires supporting evidence. |
+| **Evidence** | `STEP_PARITY_REVIEW_PACK.md` — Bag 10 p186, Bag 13 p237 |
+
+---
+
+### SP3 — Gap recovery and gap rejection are separate
+
+| Field | Value |
+|---|---|
+| **ID** | SP3 |
+| **Classification** | `PARITY_RULE` |
+| **Existing behaviour** | Gap recovery exists — `promoteSequenceGapCandidates()` in `step_map_scan.mjs` fills missing steps when adjacent-page gap is **1–6** and full-page audit candidates match (`BAG3_PARITY_SIGNOFF.md`). |
+| **Missing behaviour** | Gap **rejection** — a large jump with no recovered intermediate steps is suspicious and must be rejected or flagged. |
+| **Evidence** | `STEP_SEQUENCE_AUDIT.md`; `STEP_ANCHOR_FAILURES.md`; parity investigation of `step_map_scan.mjs` |
+
+---
+
+### SP4 — Backwards transitions are suspicious
+
+| Field | Value |
+|---|---|
+| **ID** | SP4 |
+| **Classification** | `PARITY_RULE` |
+| **Rule** | A detected step less than the previous accepted global step on a later page must be treated as OCR noise, local digits, or false anchors unless independently verified. |
+| **Examples** | 470 → 44 (printed 472; fragment read). 423 → 16 (bag-tail local digits). |
+| **Evidence** | `STEP_PARITY_REVIEW_PACK.md` — Bag 14 p271; `STEP_SEQUENCE_AUDIT.md` — 31 backwards jumps in raw accepted set |
+
+---
+
+### SP5 — Cross-bag continuity matters
+
+| Field | Value |
+|---|---|
+| **ID** | SP5 |
+| **Classification** | `PARITY_RULE` |
+| **Rule** | The first global step in Bag **N** must be plausible relative to the final global step in Bag **N−1**. Bag boundaries do not reset the global build sequence. |
+| **Example** | Bag 12 ends at step 423; Bag 13 must not open with step 474 when printed step is 424. |
+| **Evidence** | `STEP_SEQUENCE_AUDIT.md` — main-chain cross-bag handoffs; `STEP_PARITY_REVIEW_PACK.md` — Bag 12→13 transition |
+
+---
+
+### SP6 — OCR is evidence, not truth
+
+| Field | Value |
+|---|---|
+| **ID** | SP6 |
+| **Classification** | `PARITY_RULE` |
+| **Rule** | OCR output alone is insufficient for step acceptance. Sequence plausibility, visual badge evidence, and neighbouring steps are also evidence. |
+| **Examples** | OCR `345` on printed `325`; OCR `474` on printed `424`; bag-label `14` accepted as global step on p266. |
+| **Evidence** | `STEP_PARITY_REVIEW_PACK.md`; `BAG3_PARITY_SIGNOFF.md` — OCR correction against V1 truth (page 57: `18`→`78`) |
 
 ---
 
